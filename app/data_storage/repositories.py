@@ -338,6 +338,43 @@ class Repositories:
             )
         return dict(row) if row else None
 
+    async def fetch_latest_signal_judgment(
+        self, symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        轻量读取指定 symbol 最近一条信号的"判断字段"
+        ---------------------------------------------------------------
+        说明：
+            - 与 ``fetch_latest_signal`` 的区别：**故意不读取 factors 列**。
+              factors 是 JSONB，单条几十 KB；LLM 节流判定每 30 秒会查一次，
+              没必要把因子快照也拉过来反序列化，浪费带宽与 CPU。
+            - 该方法专供 LLMAgent 的"DB 节流"使用：
+                1) 拿 ts 判断距上次 LLM 分析是否 ≥ min_interval；
+                2) 命中节流时用 bias / confidence / reason / risk / suggestion
+                   重建 TradingSignal，连同 reasoning_content 一起返回给上层。
+            - 走的是 idx_signals_symbol_ts (symbol, ts DESC) 索引，单点查询，
+              成本远低于 LLM 调用，不会成为热路径瓶颈。
+        参数：
+            symbol: 合约代码
+        返回：
+            最新一条 signals 行的判断字段字典；不存在则返回 None。
+            字段：ts / bias / confidence / reason / risk / suggestion /
+                  reasoning_content。
+        """
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT ts, bias, confidence, reason, risk, suggestion,
+                       reasoning_content
+                FROM signals
+                WHERE symbol = $1
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                symbol,
+            )
+        return dict(row) if row else None
+
     # ------------------------------------------------------------------
     # 数据保留 / 清理
     # ------------------------------------------------------------------

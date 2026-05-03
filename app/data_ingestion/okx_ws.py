@@ -1,11 +1,15 @@
 """OKX V5 public WebSocket client.
 
-Channels subscribed: ``trades``, ``books5``, ``tickers``.
+Channels subscribed: ``trades``, ``books5``, ``tickers``,
+``funding-rate``, ``open-interest``.
 
-Funding rate / open interest are intentionally NOT subscribed on the WS:
-they update slowly (funding settles every 8 h, OI updates every few seconds
-with mostly identical values), so polling the REST endpoint once per minute
-is cheaper and avoids duplicate writes against the unique-keyed tables.
+Architectural note: funding-rate / open-interest are now consumed via the
+**WebSocket as the primary path** (push-based, no rate-limit cost). The REST
+client in :mod:`app.data_ingestion.okx_rest` is kept around as a *fallback*
+that the runner only invokes when WS data goes stale (cold start, long
+silence). This avoids the situation where a flaky REST egress (e.g. CN ->
+www.okx.com being throttled) leaves these two tables empty even though the
+WS endpoint at ``ws.okx.com`` is fine.
 
 Trade ``size`` and orderbook ``size`` come back from OKX in *contracts*
 (张) for SWAP / FUTURES. We multiply by ``ct_val`` (contract face value)
@@ -41,8 +45,10 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
     OKX V5 公共行情 WebSocket 客户端
     ---------------------------------------------------------------
     职责：
-        - 订阅 trades / books5 / tickers 三个频道，输出标准化事件流。
-        - 不订阅 funding-rate / open-interest，这两类数据由 REST 60s 轮询。
+        - 订阅 trades / books5 / tickers / funding-rate / open-interest
+          五个频道，输出统一格式的事件流。
+        - funding-rate / open-interest 走 WS 主路径（推送，无频控成本），
+          REST 仅作为 watchdog 兜底（参见 runner._run_rest_watchdog）。
         - 把交易所推送中的 sz（合约张数）按 contract_values[symbol]
           换算成基础币种数量（如 ETH），统一全链路单位。
     """
@@ -85,6 +91,21 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         """
         return self._contract_values.get(symbol, self._default_ct_val)
 
+    def update_contract_value(self, symbol: str, ct_val: float) -> None:
+        """
+        动态更新指定 symbol 的合约面值
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+            ct_val: 新的合约面值（每张合约对应多少基础币种）
+        说明：
+            - 容器在启动后会异步从 OKX instruments 接口拉取真实 ctVal，
+              拿到后通过本方法写回；写入后下一条 trade/book 推送即按真值
+              换算，无需重启 WS。
+            - dict 写入是原子的，不需要加锁。
+        """
+        self._contract_values[symbol] = float(ct_val)
+
     def subscribe_symbols(self) -> List[str]:
         return list(self.symbols)
 
@@ -93,7 +114,8 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         构造订阅参数列表
         ---------------------------------------------------------------
         说明：
-            funding-rate / open-interest 不再订阅，由 REST 轮询负责。
+            funding-rate / open-interest 也走 WS 主路径，REST 仅在
+            数据陈旧时由 runner 的 watchdog 兜底拉一次。
         """
         args: List[Dict[str, str]] = []
         books_channel = "books5" if self.depth <= 5 else "books"
@@ -101,6 +123,8 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
             args.append({"channel": "trades", "instId": sym})
             args.append({"channel": books_channel, "instId": sym})
             args.append({"channel": "tickers", "instId": sym})
+            args.append({"channel": "funding-rate", "instId": sym})
+            args.append({"channel": "open-interest", "instId": sym})
         return args
 
     async def stop(self) -> None:
@@ -117,7 +141,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                 raise
             except Exception as exc:  # noqa: BLE001 - top-level resilience
                 logger.warning(
-                    "OKX WS error: %s; reconnecting in %.1fs", exc, backoff
+                    "OKX WS 异常：%s；将在 %.1fs 后重连", exc, backoff
                 )
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
@@ -126,7 +150,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                 backoff = min(backoff * 2 + random.random(), 30.0)
 
     async def _stream_once(self) -> AsyncIterator[Dict[str, Any]]:
-        logger.info("Connecting OKX WS %s", self.ws_url)
+        logger.info("正在连接 OKX WebSocket %s", self.ws_url)
         async with websockets.connect(
             self.ws_url,
             ping_interval=None,
@@ -136,7 +160,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
             sub_msg = {"op": "subscribe", "args": self._build_subscribe_args()}
             await ws.send(json.dumps(sub_msg))
             logger.info(
-                "OKX WS subscribed: %d channels for symbols=%s",
+                "OKX WS 已订阅：%d 个频道，symbols=%s",
                 len(sub_msg["args"]),
                 self.symbols,
             )
@@ -154,7 +178,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                     async for ev in self._handle_message(msg):
                         yield ev
             except ConnectionClosed as exc:
-                logger.warning("OKX WS connection closed: %s", exc)
+                logger.warning("OKX WS 连接已断开：%s", exc)
                 raise
             finally:
                 ping_task.cancel()
@@ -167,15 +191,15 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
-            logger.debug("ping loop ended: %s", exc)
+            logger.debug("心跳循环已结束：%s", exc)
 
     async def _handle_message(self, msg: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         event_type = msg.get("event")
         if event_type:
             if event_type == "error":
-                logger.error("OKX WS server error: %s", msg)
+                logger.error("OKX WS 服务端错误：%s", msg)
             else:
-                logger.debug("OKX WS control: %s", msg)
+                logger.debug("OKX WS 控制消息：%s", msg)
             return
 
         arg = msg.get("arg") or {}
@@ -229,4 +253,36 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                     "bid": float(item.get("bidPx") or 0) or None,
                     "ask": float(item.get("askPx") or 0) or None,
                 }
-        # funding-rate / open-interest 故意不在 WS 消费，统一交给 REST 轮询。
+        elif channel == "funding-rate":
+            # OKX V5 funding-rate 频道：每 ~1 分钟推一次，是 funding 数据
+            # 的主路径；nextFundingTime 用 fundingTime 兜底，老返回字段较杂。
+            for item in data:
+                ts = (
+                    _ms_to_dt(item.get("ts"))
+                    or _ms_to_dt(item.get("fundingTime"))
+                    or datetime.now(timezone.utc)
+                )
+                next_funding_ts = _ms_to_dt(
+                    item.get("nextFundingTime") or item.get("fundingTime")
+                )
+                yield {
+                    "type": "funding_rate",
+                    "exchange": self.name,
+                    "symbol": symbol,
+                    "ts": ts,
+                    "funding_rate": float(item.get("fundingRate") or 0.0),
+                    "next_funding_ts": next_funding_ts,
+                }
+        elif channel == "open-interest":
+            # OKX V5 open-interest 频道：~3s 推一次，比 60s REST 信息密度高
+            # 一个量级。oi 单位是张数，oiCcy 是按基础币种折算后的数量。
+            for item in data:
+                ts = _ms_to_dt(item.get("ts")) or datetime.now(timezone.utc)
+                yield {
+                    "type": "open_interest",
+                    "exchange": self.name,
+                    "symbol": symbol,
+                    "ts": ts,
+                    "oi": float(item.get("oi") or 0.0),
+                    "oi_ccy": float(item.get("oiCcy") or 0) or None,
+                }

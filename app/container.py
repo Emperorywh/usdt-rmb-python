@@ -6,8 +6,9 @@ lifespan 中实例化一次并挂载到 ``app.state``；路由通过
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from app.config import Settings
 from app.data_ingestion.okx_rest import OKXRestClient
@@ -23,6 +24,9 @@ from app.signal_engine.rules import RuleEngine
 from app.signal_engine.service import SignalService
 
 logger = get_logger(__name__)
+
+# 启动时如果第一次 instruments 拉取失败，后台 refresh 任务的重试节奏
+_INSTRUMENT_REFRESH_INTERVAL_SECONDS = 5 * 60.0
 
 
 @dataclass
@@ -45,6 +49,8 @@ class AppContainer:
     llm_agent: LLMAgent
     signal_service: SignalService
     ingestion_runner: Optional[IngestionRunner] = field(default=None)
+    # 启动后台周期刷新合约面值的任务句柄；shutdown 时一并取消，避免泄漏
+    instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
@@ -72,26 +78,16 @@ class AppContainer:
         # 真实 provider 后只需替换这里的实现，下方 runner 不再注入它。
         onchain: Optional[MockOnchainProvider] = MockOnchainProvider()
 
-        # 启动时尝试拉一次 instruments 元数据，构造 ctVal 映射。
-        # 失败时回退到配置中的 default_contract_value，让服务仍然能跑起来。
-        contract_values: Dict[str, float] = {}
-        for sym in settings.symbols:
-            try:
-                meta = await okx_rest.fetch_instrument_meta(sym)
-                contract_values[sym] = float(meta["ct_val"])
-                logger.info(
-                    "Loaded instrument meta %s: ctVal=%s ctValCcy=%s",
-                    sym,
-                    meta["ct_val"],
-                    meta.get("ct_val_ccy"),
-                )
-            except Exception:  # noqa: BLE001
-                contract_values[sym] = settings.default_contract_value
-                logger.warning(
-                    "Falling back to default ctVal=%s for %s",
-                    settings.default_contract_value,
-                    sym,
-                )
+        # 合约面值（ctVal）启动策略：
+        # ----------------------------------------------------------------
+        # 之前是"启动时同步拉 instruments，最多重试 3 次"，在国内直连
+        # OKX 经常每次 ConnectTimeout，导致冷启动多花 ≈120s。
+        # 现在改成：先用 default_contract_value 占位让服务立刻起来，
+        # 同时启动一个后台任务异步拉真值并写回 OKXWebSocketClient。
+        # ctVal 默认 0.1（ETH-USDT-SWAP）即便取不到真值也不会偏离太多。
+        contract_values: Dict[str, float] = {
+            sym: settings.default_contract_value for sym in settings.symbols
+        }
 
         ws_clients = [
             OKXWebSocketClient(
@@ -102,6 +98,17 @@ class AppContainer:
                 default_contract_value=settings.default_contract_value,
             )
         ]
+        # 后台异步拉取真实 ctVal，能拿到就 hot-update 到 ws_client；
+        # 拿不到就周期重试，直到所有 symbol 都拿到为止（任务自然退出）。
+        instrument_refresh_task = asyncio.create_task(
+            cls._refresh_instruments_loop(
+                okx_rest=okx_rest,
+                symbols=list(settings.symbols),
+                ws_clients=ws_clients,
+                fallback_value=settings.default_contract_value,
+            ),
+            name="instrument-refresh",
+        )
         # 注意：故意不传 onchain，停用 mock 链上指标的定时写入。
         # 等接入真实链上数据源后再把 onchain=onchain 加回去。
         runner = IngestionRunner(
@@ -114,7 +121,7 @@ class AppContainer:
         # ---- Factor + signal ----
         factor_aggregator = FactorAggregator(repos=repos, settings=settings)
         rule_engine = RuleEngine(settings=settings)
-        llm_agent = LLMAgent(settings=settings)
+        llm_agent = LLMAgent(settings=settings, repos=repos)
         signal_service = SignalService(
             repos=repos,
             factor_aggregator=factor_aggregator,
@@ -133,9 +140,71 @@ class AppContainer:
             llm_agent=llm_agent,
             signal_service=signal_service,
             ingestion_runner=runner,
+            instrument_refresh_task=instrument_refresh_task,
         )
 
+    @staticmethod
+    async def _refresh_instruments_loop(
+        okx_rest: OKXRestClient,
+        symbols: List[str],
+        ws_clients: List[OKXWebSocketClient],
+        fallback_value: float,
+    ) -> None:
+        """
+        后台周期刷新合约面值的任务体
+        ---------------------------------------------------------------
+        参数：
+            okx_rest:       已经构造好的 REST 客户端（带熔断）
+            symbols:        需要刷新的 symbol 列表
+            ws_clients:     已经存在的 WS 客户端列表，成功拿到后会被热更新
+            fallback_value: 拉不到真值时使用的默认 ctVal（仅用于日志对比）
+        说明：
+            - 成功拿到的 symbol 从待办列表里移除，所有 symbol 都拿到后任务退出。
+            - 失败不打 warn（REST 客户端内部已经做了失败摘要日志）。
+            - 任何 sleep 都允许被取消（容器 shutdown 时一并清理）。
+        """
+        pending: List[str] = list(symbols)
+        # 第一次立即试一次，避免冷启动后 5 分钟才有真值
+        first_pass = True
+        while pending:
+            if not first_pass:
+                try:
+                    await asyncio.sleep(_INSTRUMENT_REFRESH_INTERVAL_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+            first_pass = False
+            still_pending: List[str] = []
+            for sym in pending:
+                try:
+                    meta = await okx_rest.fetch_instrument_meta(sym)
+                except Exception:  # noqa: BLE001
+                    still_pending.append(sym)
+                    logger.debug(
+                        "合约元数据拉取失败 %s（仍使用 ctVal=%s 占位，将在 %ds 后重试）",
+                        sym,
+                        fallback_value,
+                        int(_INSTRUMENT_REFRESH_INTERVAL_SECONDS),
+                    )
+                    continue
+                ct_val = float(meta["ct_val"])
+                for ws in ws_clients:
+                    ws.update_contract_value(sym, ct_val)
+                logger.info(
+                    "已加载合约元数据 %s：ctVal=%s ctValCcy=%s",
+                    sym,
+                    ct_val,
+                    meta.get("ct_val_ccy"),
+                )
+            pending = still_pending
+        logger.info("合约元数据已全部加载，停止后台刷新任务")
+
     async def shutdown(self) -> None:
+        if self.instrument_refresh_task is not None and not self.instrument_refresh_task.done():
+            self.instrument_refresh_task.cancel()
+            try:
+                await self.instrument_refresh_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if self.ingestion_runner is not None:
             await self.ingestion_runner.stop()
         await self.okx_rest.close()

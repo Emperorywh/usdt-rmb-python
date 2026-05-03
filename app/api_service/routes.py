@@ -27,6 +27,51 @@ async def health(container: AppContainer = Depends(get_container)) -> Dict[str, 
     }
 
 
+@router.get("/healthz", tags=["meta"])
+async def healthz(container: AppContainer = Depends(get_container)) -> Dict[str, Any]:
+    """
+    采集通道详细健康度
+    -------------------------------------------------------------------
+    返回字段：
+        - status:  'ok' / 'degraded'，是否所有 WS 频道都在新鲜窗口内
+        - ws:      {symbol: {kind: {age_seconds, last_event_at}}}
+                   每个 (symbol, kind) 的 WS 推送年龄；kind ∈
+                   {trade, orderbook, ticker, funding_rate, open_interest}
+        - rest:    {op_name: {state, consecutive_failures,
+                              cooldown_remaining, last_error,
+                              last_success_at, success_count, failure_count}}
+                   每个 REST endpoint 的熔断状态
+    用途：
+        - 运维监控 / 仪表盘判断"WS 是否在推" / "REST 是否被熔断"
+        - 信号引擎可读取本接口在数据陈旧时主动降级
+    """
+    ws_snapshot = (
+        container.ingestion_runner.ws_health_snapshot()
+        if container.ingestion_runner is not None
+        else {}
+    )
+    rest_snapshot = container.okx_rest.health_snapshot()
+
+    # status 判定：只要有任意 (symbol, funding_rate/open_interest) 通道
+    # 在 staleness 阈值之上即视为 degraded；trade/orderbook 静默 60s 也算异常。
+    degraded = False
+    for symbol_view in ws_snapshot.values():
+        for kind, info in symbol_view.items():
+            age = float(info.get("age_seconds") or 0.0)
+            if kind == "funding_rate" and age > 5 * 60:
+                degraded = True
+            elif kind == "open_interest" and age > 60:
+                degraded = True
+            elif kind in ("trade", "orderbook") and age > 60:
+                degraded = True
+
+    return {
+        "status": "degraded" if degraded else "ok",
+        "ws": ws_snapshot,
+        "rest": rest_snapshot,
+    }
+
+
 def _resolve_symbol(symbol: Optional[str], container: AppContainer) -> str:
     if symbol:
         return symbol

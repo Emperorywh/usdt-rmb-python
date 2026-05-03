@@ -39,7 +39,7 @@ class Database:
     async def connect(self) -> None:
         if self._pool is not None:
             return
-        logger.info("Connecting to PostgreSQL pool=%d-%d", self._min_size, self._max_size)
+        logger.info("正在连接 PostgreSQL 连接池 大小=%d-%d", self._min_size, self._max_size)
         self._pool = await asyncpg.create_pool(
             dsn=self._dsn,
             min_size=self._min_size,
@@ -47,13 +47,13 @@ class Database:
             init=_init_connection,
             command_timeout=30,
         )
-        logger.info("PostgreSQL pool ready")
+        logger.info("PostgreSQL 连接池就绪")
 
     async def disconnect(self) -> None:
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
-            logger.info("PostgreSQL pool closed")
+            logger.info("PostgreSQL 连接池已关闭")
 
     @property
     def pool(self) -> asyncpg.Pool:

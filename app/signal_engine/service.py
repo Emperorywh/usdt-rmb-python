@@ -49,17 +49,31 @@ class SignalService:
         if llm_result is not None:
             final: TradingSignal = llm_result.signal
             reasoning_content: Optional[str] = llm_result.reasoning_content
-            source = "rules+llm"
+            # 区分两种 source：
+            # - "rules+llm"        ：本次真正触发了一次 LLM API 调用
+            # - "rules+llm(cache)" ：本次命中了 LLM 节流缓存（默认 15 分钟），
+            #                       并未实际调用 LLM。它只用于响应/日志展示，
+            #                       不会落库（参见下方 should_persist 判断）。
+            source = "rules+llm(cache)" if llm_result.from_cache else "rules+llm"
         else:
             final = rule_signal
             reasoning_content = None
             source = "rules"
 
-        # 仅当 LLM 实际完成分析时才入库，避免在 LLM 未触发 / 调用失败时
-        # 将纯规则引擎结果写入 signals 表，造成大量低价值脏数据。
-        # 此时仍正常返回规则引擎的实时计算结果用于接口响应与日志观察。
+        # 入库策略：
+        # 1) llm_result 为 None（LLM 未启用 / 调用失败 / schema 校验失败）：不入库。
+        #    避免把纯规则引擎结果当成 LLM 结论写库，造成大量低价值脏数据。
+        # 2) llm_result.from_cache 为 True：本次只是复用 15 分钟内的 LLM 缓存，
+        #    并未真正发起新的 LLM 推理；如果继续入库，会出现每 30s 一条
+        #    reason/risk/suggestion 完全相同、只有 factors 不同的伪 LLM 记录，
+        #    既污染 signals 表，也会让下游分析误以为 LLM 在反复确认同一判断。
+        # 3) 只有"真正发起了一次 LLM 调用并成功解析"时（即 from_cache=False），
+        #    才把这条结果落库。这样入库节奏就严格对齐 LLM_MIN_INTERVAL_SECONDS
+        #    （默认 15 分钟一条），与成本预算一致。
+        # 不入库时仍正常返回规则引擎 / 缓存中的判断用于接口响应与日志观察。
+        should_persist = llm_result is not None and not llm_result.from_cache
         signal_id: Optional[int] = None
-        if llm_result is not None:
+        if should_persist:
             # signals.factors 只保存"原始因子快照 + 规则引擎打分细节"。
             # rule_signal 本身（bias/confidence/reason）可以由 rule_score 重算得到，
             # 不再冗余写入，避免 JSON 体积膨胀。
@@ -82,9 +96,11 @@ class SignalService:
             )
         else:
             logger.debug(
-                "Skip persisting signal for %s: LLM analysis not performed (source=%s)",
+                "跳过信号入库 %s：source=%s（llm_present=%s，from_cache=%s）",
                 symbol,
                 source,
+                llm_result is not None,
+                llm_result.from_cache if llm_result is not None else None,
             )
 
         return {
@@ -135,14 +151,14 @@ class SignalService:
             try:
                 result = await self.generate(symbol)
                 logger.info(
-                    "Signal[%s] %s confidence=%.2f source=%s",
+                    "信号[%s] %s confidence=%.2f source=%s",
                     symbol,
                     result["signal"]["bias"],
                     result["signal"]["confidence"],
                     result["source"],
                 )
             except Exception:
-                logger.exception("Signal generation failed for %s", symbol)
+                logger.exception("信号生成失败 %s", symbol)
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=interval)
             except asyncio.TimeoutError:

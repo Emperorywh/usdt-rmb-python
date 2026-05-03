@@ -1,12 +1,16 @@
 """异步采集编排器。
 
-每个进程下并发运行 3 个 worker：
+每个进程下并发运行下列 worker：
 
 1. WebSocket 消费者：每个 ``ExchangeWebSocketClient`` 一个任务，把
-   ``trade`` / ``orderbook`` 事件落库。
+   ``trade`` / ``orderbook`` / ``funding_rate`` / ``open_interest``
+   事件落库。
 2. 成交批量 flusher：把内存里的成交缓冲区每秒清空一次。
-3. REST 轮询器：funding_rates 与 open_interest 的唯一写入入口，
-   默认 60 秒一次。
+3. REST watchdog：funding-rate 与 open-interest 的兜底写入入口，
+   仅在 WS 长时间没有推送对应频道时才发一次 REST，并且对每个 symbol
+   并发发起；正常情况下完全不发请求，避免在 ``www.okx.com`` 网络抖动
+   时把控制台刷成失败日志。
+4. 数据保留清理任务（可选）。
 
 订单簿写入按 symbol 通过 ``settings.orderbook_min_interval_seconds``
 节流，避免 books5 推送把数据库打爆。
@@ -19,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.config import Settings
 from app.data_ingestion.base import (
@@ -27,6 +31,7 @@ from app.data_ingestion.base import (
     ExchangeWebSocketClient,
     OnchainProvider,
 )
+from app.data_ingestion.okx_rest import CircuitOpenError
 from app.data_storage.repositories import Repositories
 from app.logging_config import get_logger
 
@@ -74,6 +79,12 @@ class IngestionRunner:
         self._stopping = asyncio.Event()
         # 订单簿节流用：记录每个 symbol 最近一次成功落库的单调时钟时间戳
         self._last_orderbook_write: Dict[str, float] = {}
+        # WS 通道健康度：记录每个 (symbol, kind) 最近一次成功收到推送的
+        # 单调时钟时间戳；REST watchdog 用它判断是否需要兜底拉一次。
+        # kind 取值：'trade' / 'orderbook' / 'funding_rate' / 'open_interest'
+        self._last_ws_event_at: Dict[Tuple[str, str], float] = {}
+        # /healthz 等外部观测用：以 ISO 时间字符串形式暴露最近一次推送时刻
+        self._last_ws_event_iso: Dict[Tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -90,13 +101,15 @@ class IngestionRunner:
         if self._tasks:
             return
         logger.info(
-            "Starting ingestion: %d ws-clients / rest poller (onchain poller disabled)",
+            "启动数据采集：%d 个 WS 客户端 / REST 轮询器（链上轮询已停用）",
             len(self.ws_clients),
         )
         for client in self.ws_clients:
             self._tasks.append(asyncio.create_task(self._run_ws(client), name=f"ws-{client.name}"))
         self._tasks.append(asyncio.create_task(self._run_trade_flusher(), name="trade-flusher"))
-        self._tasks.append(asyncio.create_task(self._run_rest_poller(), name="rest-poller"))
+        # REST 不再无脑 60s 轮询，改成 stale-watchdog：仅当 WS 长时间没有
+        # 推送对应频道时才发一次 REST 兜底，降低对外网请求频率。
+        self._tasks.append(asyncio.create_task(self._run_rest_watchdog(), name="rest-watchdog"))
         # 数据保留清理任务：retention_run_interval_seconds <= 0 时彻底关闭。
         # 不启动该任务时高频表会无限增长，仅在外部已有清理脚本时才允许关闭。
         if int(getattr(self.settings, "retention_run_interval_seconds", 0) or 0) > 0:
@@ -105,14 +118,14 @@ class IngestionRunner:
             )
         else:
             logger.warning(
-                "Retention cleaner disabled (retention_run_interval_seconds<=0); "
-                "high-frequency tables will grow unbounded"
+                "数据保留清理任务已禁用（retention_run_interval_seconds<=0）；"
+                "高频表将无限增长"
             )
 
     async def stop(self) -> None:
         if not self._tasks:
             return
-        logger.info("Stopping ingestion runner")
+        logger.info("正在停止数据采集任务")
         self._stopping.set()
         for client in self.ws_clients:
             stop = getattr(client, "stop", None)
@@ -130,7 +143,7 @@ class IngestionRunner:
                 pass
         self._tasks.clear()
         await self._flush_trades(force=True)
-        logger.info("Ingestion runner stopped")
+        logger.info("数据采集任务已停止")
 
     # ------------------------------------------------------------------
     # workers
@@ -142,7 +155,7 @@ class IngestionRunner:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("WS client %s crashed", client.name)
+            logger.exception("WebSocket 客户端 %s 异常崩溃", client.name)
 
     async def _dispatch(self, event: Dict[str, Any]) -> None:
         """
@@ -153,14 +166,21 @@ class IngestionRunner:
             - orderbook 事件按 symbol 做节流：距离上次写入不足
               ``orderbook_min_interval_seconds`` 时直接丢弃，避免高频
               快照打爆 DB。
-            - funding_rate / open_interest 不再从 WS 写入（已退订）。
+            - funding_rate / open_interest 走 WS 主路径直接落库（表上有
+              ON CONFLICT DO NOTHING，与 watchdog 兜底写入幂等共存）。
             - tickers 仅用作行情参考，不入库。
+            - 任何事件成功被处理后都会刷新 _last_ws_event_at[(symbol, kind)]，
+              REST watchdog 据此判断是否需要兜底。
         """
         etype = event.get("type")
+        symbol = event.get("symbol")
         try:
             if etype == "trade":
                 await self._buffer_trade(event)
+                self._mark_ws_event(symbol, "trade")
             elif etype == "orderbook":
+                # 即便被节流丢弃，也要标记"通道是活的"，避免 watchdog 误判
+                self._mark_ws_event(symbol, "orderbook")
                 if not self._should_write_orderbook(event["symbol"]):
                     return
                 await self.repos.insert_orderbook(
@@ -170,8 +190,65 @@ class IngestionRunner:
                     bids=event["bids"],
                     asks=event["asks"],
                 )
+            elif etype == "funding_rate":
+                await self.repos.insert_funding_rate(
+                    exchange=event["exchange"],
+                    symbol=event["symbol"],
+                    ts=event["ts"],
+                    funding_rate=event["funding_rate"],
+                    next_funding_ts=event.get("next_funding_ts"),
+                )
+                self._mark_ws_event(symbol, "funding_rate")
+            elif etype == "open_interest":
+                await self.repos.insert_open_interest(
+                    exchange=event["exchange"],
+                    symbol=event["symbol"],
+                    ts=event["ts"],
+                    oi=event["oi"],
+                    oi_ccy=event.get("oi_ccy"),
+                )
+                self._mark_ws_event(symbol, "open_interest")
+            elif etype == "ticker":
+                # ticker 不入库，但记录心跳供 watchdog 参考
+                self._mark_ws_event(symbol, "ticker")
         except Exception:
-            logger.exception("Failed to persist event type=%s", etype)
+            logger.exception("事件持久化失败 type=%s", etype)
+
+    def _mark_ws_event(self, symbol: Optional[str], kind: str) -> None:
+        """
+        刷新指定 (symbol, kind) 的最近 WS 推送时间
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约代码；None 时直接忽略（异常推送）
+            kind:   'trade' / 'orderbook' / 'funding_rate' /
+                    'open_interest' / 'ticker'
+        说明：
+            REST watchdog 与 /healthz 都依赖这两个字典；用单调时钟做
+            staleness 判断，用 UTC ISO 串供外部观测。
+        """
+        if not symbol:
+            return
+        key = (symbol, kind)
+        self._last_ws_event_at[key] = time.monotonic()
+        self._last_ws_event_iso[key] = datetime.now(timezone.utc).isoformat()
+
+    def ws_health_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """
+        导出 WS 通道健康度，供 /healthz 路由读取
+        ---------------------------------------------------------------
+        返回：
+            {symbol: {kind: {age_seconds, last_event_at}}}
+        说明：
+            age_seconds 为相对调用时刻的单调时钟差（取整到 0.1s）。
+        """
+        now = time.monotonic()
+        out: Dict[str, Dict[str, Any]] = {}
+        for (symbol, kind), ts in self._last_ws_event_at.items():
+            out.setdefault(symbol, {})[kind] = {
+                "age_seconds": round(now - ts, 1),
+                "last_event_at": self._last_ws_event_iso.get((symbol, kind)),
+            }
+        return out
 
     def _should_write_orderbook(self, symbol: str) -> bool:
         """
@@ -225,64 +302,154 @@ class IngestionRunner:
             self._trade_buffer = []
         try:
             await self.repos.insert_trades(batch)
-            logger.debug("Flushed %d trades", len(batch))
+            logger.debug("已批量落库 %d 条成交", len(batch))
         except Exception:
-            logger.exception("Trade flush failed (lost %d rows)", len(batch))
+            logger.exception("成交批量落库失败（丢失 %d 行）", len(batch))
 
-    async def _run_rest_poller(self) -> None:
+    # 各 WS 频道允许的最大静默时长（秒）；超过即触发一次 REST 兜底。
+    # funding-rate 推送约 1 分钟一次，给 5 分钟容忍；
+    # open-interest 推送 ~3s 一次，给 60s 容忍（避免 WS 抖动几秒就触发 REST）。
+    _WS_STALE_FUNDING_SECONDS = 5 * 60.0
+    _WS_STALE_OI_SECONDS = 60.0
+    # watchdog 自身的轮询节奏（秒）：每次循环检查所有 (symbol, kind) 是否陈旧
+    _WATCHDOG_TICK_SECONDS = 15.0
+    # 启动后等多久才开始触发兜底，给 WS 一个建立连接 + 推第一条的时间窗口
+    _WATCHDOG_GRACE_SECONDS = 30.0
+
+    async def _run_rest_watchdog(self) -> None:
         """
-        REST 轮询任务
+        REST 兜底看门狗
         ---------------------------------------------------------------
         说明：
-            funding_rates 和 open_interest 现在唯一的写入路径。
-            默认 60 秒一次，靠表上的唯一约束 + ON CONFLICT DO NOTHING
-            兜底，即使重启后短时间内 ts 撞库也不会产生脏数据。
+            - WS 是 funding-rate / open-interest 的主路径；本任务仅在
+              对应频道长时间没有推送时才发一次 REST 兜底，平时不出网。
+            - 每个 symbol 的 funding 与 OI 用 asyncio.gather 并发，
+              互不阻塞；REST 客户端内部带熔断，连续失败会自动 fail-fast。
+            - 写库走和 WS 路径完全相同的 repos 方法，依赖唯一约束 + ON
+              CONFLICT DO NOTHING 保证幂等。
         """
-        interval = self.settings.rest_poll_interval_seconds
+        # 启动宽限：避免冷启动瞬间 WS 还没握手就被 watchdog 触发兜底
+        try:
+            await asyncio.wait_for(
+                self._stopping.wait(), timeout=self._WATCHDOG_GRACE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            pass
+
         try:
             while not self._stopping.is_set():
+                tasks: List[Awaitable[Any]] = []
                 for symbol in self.settings.symbols:
-                    # funding / OI 轮询允许单次失败：OKX REST 客户端内部已经做了
-                    # 指数退避重试，这里只剩“彻底失败”的情况，打印精简 warning
-                    # 即可，不再刷满屏 traceback。
-                    try:
-                        fr = await self.rest_client.fetch_funding_rate(symbol)
-                        await self.repos.insert_funding_rate(
-                            exchange=fr["exchange"],
-                            symbol=fr["symbol"],
-                            ts=fr["ts"],
-                            funding_rate=fr["funding_rate"],
-                            next_funding_ts=fr.get("next_funding_ts"),
+                    if self._is_ws_stale(symbol, "funding_rate", self._WS_STALE_FUNDING_SECONDS):
+                        tasks.append(
+                            self._fallback_one(
+                                symbol,
+                                "funding_rate",
+                                self.rest_client.fetch_funding_rate,
+                                self._persist_funding_rate,
+                            )
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "REST funding poll failed for %s: %s: %s",
-                            symbol,
-                            exc.__class__.__name__,
-                            exc,
+                    if self._is_ws_stale(symbol, "open_interest", self._WS_STALE_OI_SECONDS):
+                        tasks.append(
+                            self._fallback_one(
+                                symbol,
+                                "open_interest",
+                                self.rest_client.fetch_open_interest,
+                                self._persist_open_interest,
+                            )
                         )
-                    try:
-                        oi = await self.rest_client.fetch_open_interest(symbol)
-                        await self.repos.insert_open_interest(
-                            exchange=oi["exchange"],
-                            symbol=oi["symbol"],
-                            ts=oi["ts"],
-                            oi=oi["oi"],
-                            oi_ccy=oi.get("oi_ccy"),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "REST OI poll failed for %s: %s: %s",
-                            symbol,
-                            exc.__class__.__name__,
-                            exc,
-                        )
+                if tasks:
+                    # return_exceptions=True：单个兜底失败不影响其他 symbol
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), timeout=interval)
+                    await asyncio.wait_for(
+                        self._stopping.wait(), timeout=self._WATCHDOG_TICK_SECONDS
+                    )
                 except asyncio.TimeoutError:
                     pass
         except asyncio.CancelledError:
             raise
+
+    def _is_ws_stale(self, symbol: str, kind: str, threshold_seconds: float) -> bool:
+        """
+        判断 (symbol, kind) 通道是否陈旧到需要 REST 兜底
+        ---------------------------------------------------------------
+        参数：
+            symbol:            合约代码
+            kind:              'funding_rate' / 'open_interest'
+            threshold_seconds: WS 静默多久即视为陈旧
+        返回：
+            True - 从未收到过 WS 推送 或 距上次推送超过 threshold；
+            False - 最近收到过推送，跳过本次兜底。
+        """
+        last = self._last_ws_event_at.get((symbol, kind))
+        if last is None:
+            return True
+        return (time.monotonic() - last) >= threshold_seconds
+
+    async def _fallback_one(
+        self,
+        symbol: str,
+        kind: str,
+        fetcher: Callable[[str], Awaitable[Dict[str, Any]]],
+        persister: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """
+        执行一次 REST 兜底拉取并落库
+        ---------------------------------------------------------------
+        参数：
+            symbol:    合约代码
+            kind:      'funding_rate' / 'open_interest'，仅用于日志
+            fetcher:   实际发起 REST 请求的协程，例如
+                       OKXRestClient.fetch_funding_rate
+            persister: 拿到 dict 后写库的协程，封装在本类中以便复用
+        说明：
+            - CircuitOpenError 不打 warn，已在 REST 客户端内打过摘要日志。
+            - 其他异常按 warn 输出（已经过 REST 客户端的失败摘要节流）。
+        """
+        try:
+            payload = await fetcher(symbol)
+            await persister(payload)
+            logger.info(
+                "REST 兜底成功：%s/%s（WS 已陈旧）",
+                symbol,
+                kind,
+            )
+        except CircuitOpenError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "REST 兜底失败 %s/%s：%s",
+                symbol,
+                kind,
+                exc.__class__.__name__,
+            )
+
+    async def _persist_funding_rate(self, payload: Dict[str, Any]) -> None:
+        """
+        把 REST 返回的 funding-rate dict 写入 funding_rates 表
+        ---------------------------------------------------------------
+        """
+        await self.repos.insert_funding_rate(
+            exchange=payload["exchange"],
+            symbol=payload["symbol"],
+            ts=payload["ts"],
+            funding_rate=payload["funding_rate"],
+            next_funding_ts=payload.get("next_funding_ts"),
+        )
+
+    async def _persist_open_interest(self, payload: Dict[str, Any]) -> None:
+        """
+        把 REST 返回的 open-interest dict 写入 open_interest 表
+        ---------------------------------------------------------------
+        """
+        await self.repos.insert_open_interest(
+            exchange=payload["exchange"],
+            symbol=payload["symbol"],
+            ts=payload["ts"],
+            oi=payload["oi"],
+            oi_ccy=payload.get("oi_ccy"),
+        )
 
     async def _run_retention_cleaner(self) -> None:
         """
@@ -301,7 +468,7 @@ class IngestionRunner:
               进程关闭时不会拖时间。
         """
         interval = int(self.settings.retention_run_interval_seconds)
-        logger.info("Retention cleaner started (every %ds)", interval)
+        logger.info("数据保留清理任务已启动（每 %ds 一次）", interval)
         try:
             # 启动后先等一个周期再开始清理
             try:
@@ -343,20 +510,20 @@ class IngestionRunner:
                 deleted = await deleter(cutoff)
                 if deleted:
                     logger.info(
-                        "Retention: deleted %d rows from %s (older than %s)",
-                        deleted,
+                        "数据保留：已从 %s 删除 %d 行（早于 %s）",
                         table,
+                        deleted,
                         cutoff.isoformat(timespec="seconds"),
                     )
                 else:
                     logger.debug(
-                        "Retention: %s nothing to delete (cutoff=%s)",
+                        "数据保留：%s 无需清理（截止时间=%s）",
                         table,
                         cutoff.isoformat(timespec="seconds"),
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Retention cleanup failed for %s: %s: %s",
+                    "数据保留清理失败 %s：%s：%s",
                     table,
                     exc.__class__.__name__,
                     exc,
@@ -374,7 +541,7 @@ class IngestionRunner:
               中的 ``create_task`` 调用即可。
         """
         if self.onchain is None:
-            logger.info("Onchain provider not configured, poller skipped")
+            logger.info("未配置链上数据源，跳过轮询")
             return
         try:
             while not self._stopping.is_set():
@@ -382,7 +549,7 @@ class IngestionRunner:
                     metrics = await self.onchain.fetch_metrics()
                     await self.repos.insert_onchain(metrics)
                 except Exception:
-                    logger.exception("Onchain poll failed")
+                    logger.exception("链上数据轮询失败")
                 try:
                     await asyncio.wait_for(self._stopping.wait(), timeout=60)
                 except asyncio.TimeoutError:

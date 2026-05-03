@@ -15,14 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.config import Settings
+from app.data_storage.repositories import Repositories
 from app.logging_config import get_logger
 from app.signal_engine.schemas import TradingSignal
 
@@ -39,6 +40,12 @@ class LLMAnalysisResult:
         reasoning_content  : DeepSeek 思考模式下的"思维链"原文文本；
                              未启用思考模式 / 模型未返回时为 None。
                              仅作审计用途，绝不参与下一轮提示词拼接。
+        from_cache         : 本次结果是否来自节流缓存（即并未真正发起 LLM
+                             API 调用）。外层 service 用它来决定是否落库——
+                             我们只想保留"真正由 LLM 产出"的那一条记录，
+                             cache 命中的请求不应再次写入 signals 表，
+                             否则 30s 一次的循环会产生大量 reason/risk/
+                             suggestion 完全相同、只有 factors 在变的脏数据。
     设计说明：
         之所以单独包一层，是为了不污染 TradingSignal 的 schema
         （它要直接 model_dump 给 API 调用方与数据库 reason/risk/suggestion
@@ -47,6 +54,7 @@ class LLMAnalysisResult:
 
     signal: TradingSignal
     reasoning_content: Optional[str] = None
+    from_cache: bool = False
 
 
 SYSTEM_PROMPT = """\
@@ -105,32 +113,41 @@ HUMAN_PROMPT = """\
 
 class LLMAgent:
     """
-    LangChain DeepSeek 调用封装（带按 symbol 的节流缓存）。
+    LangChain DeepSeek 调用封装（基于 signals 表的 DB 节流）。
     --------------------------------------------------------------
     设计目标：
     - DeepSeek API 是按 token 收费的，但规则引擎 / 信号循环每 30s
       就会触发一次 ``analyze``。如果每次都真打 LLM，一天会产生上千次
       调用，浪费且没必要——加密市场短期波动并没有这么快。
-    - 因此这里维护一份 ``symbol -> (timestamp, TradingSignal)`` 缓存：
-      在 ``settings.llm_min_interval_seconds`` 窗口内的请求，直接复用
-      上一次 LLM 返回的判断，外层 service 仍能拿到完整的 ``rules+llm``
-      结果落库，只是 LLM 部分是"最近 15 分钟内的判断"。
-    - 通过按 symbol 的 ``asyncio.Lock`` 防止并发首次调用打多次接口。
+    - 节流的"上一次判断时间"以 **signals 表里该 symbol 最后一条记录
+      的 ts 为准**，而不是进程内存。这样：
+        * 进程重启后状态不会丢失，不会出现"重启即重打 LLM"。
+        * 多副本横向部署时，所有实例共享同一份"上次调用时间"
+          （PostgreSQL 是唯一真源），节流不会被绕过。
+        * 调试时手动清空 signals 表，下一轮即触发新一次 LLM 调用。
+    - 在 ``settings.llm_min_interval_seconds`` 窗口内（默认 900 秒，
+      即 15 分钟），analyze 不会真正发起 LLM 请求；而是直接从
+      signals 表读出最近一条 LLM 判断，重建 ``LLMAnalysisResult``
+      返回给上层（带 ``from_cache=True`` 标记）。
+    - 上层 service 仅在 ``from_cache=False`` 时落库，从而保证：
+      入库节奏 = LLM 真实调用节奏 = ``LLM_MIN_INTERVAL_SECONDS`` 节奏。
+    - 通过按 symbol 的 ``asyncio.Lock`` 防止同一 symbol 在窗口刚到
+      时被并发调用打多次接口（DB 写入与读出之间存在窄竞态窗口）。
     - 设置 ``LLM_MIN_INTERVAL_SECONDS=0`` 可完全关闭节流（调试用）。
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, repos: Repositories):
         self.settings = settings
+        # repos：用于查询 signals 表里"最后一条 LLM 判断的时间戳"以执行
+        # DB 节流，以及在节流命中时把判断字段重建成 LLMAnalysisResult。
+        self.repos = repos
         self._chain = None  # build lazily
         # 标记当前 chain 是否走"思考模式"（即未使用 function_calling，
         # 模型直接吐 JSON 文本，需要在 analyze() 里手动 parse）。
         self._chain_thinking_mode: bool = False
-        # 缓存：symbol -> (单调时钟时间戳, 上一次 LLM 分析结果)
-        # 用 monotonic 而不是 time.time()，避免系统时钟跳变带来异常。
-        # 缓存 LLMAnalysisResult 而非裸 TradingSignal，是为了让窗口内
-        # 复用的请求也能拿到一致的 reasoning_content 用于审计回溯。
-        self._cache: Dict[str, Tuple[float, LLMAnalysisResult]] = {}
-        # 按 symbol 维度的并发锁，保证窗口内只会真正发起一次请求。
+        # 按 symbol 维度的并发锁，保证窗口刚到时不会被并发调用打多次接口。
+        # 注意：跨进程的并发还是要靠"以 DB 时间戳为准"的语义来保证，本锁
+        # 只防同一 worker 进程内的高并发竞争。
         self._locks: Dict[str, asyncio.Lock] = {}
 
     def _build_chain(self):
@@ -164,7 +181,7 @@ class LLMAgent:
 
         if not self.settings.deepseek_api_key:
             logger.warning(
-                "DEEPSEEK_API_KEY is empty - LLM analysis will be skipped at runtime"
+                "未配置 DEEPSEEK_API_KEY，运行时将跳过 LLM 分析"
             )
 
         thinking_enabled = bool(self.settings.deepseek_thinking_enabled)
@@ -181,13 +198,13 @@ class LLMAgent:
             effort = (self.settings.deepseek_reasoning_effort or "high").lower()
             if effort not in {"high", "max"}:
                 logger.warning(
-                    "Unknown reasoning_effort=%r, fallback to 'high'", effort
+                    "未知的 reasoning_effort=%r，回退为 'high'", effort
                 )
                 effort = "high"
             llm_kwargs["reasoning_effort"] = effort
             llm_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
             logger.info(
-                "DeepSeek thinking mode ENABLED (model=%s, effort=%s, json_via=prompt)",
+                "DeepSeek 思考模式已启用（model=%s，effort=%s，json_via=prompt）",
                 self.settings.deepseek_model,
                 effort,
             )
@@ -195,7 +212,7 @@ class LLMAgent:
             llm_kwargs["temperature"] = self.settings.llm_temperature
             llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             logger.info(
-                "DeepSeek thinking mode DISABLED (model=%s, temperature=%.2f, json_via=function_calling)",
+                "DeepSeek 思考模式已禁用（model=%s，temperature=%.2f，json_via=function_calling）",
                 self.settings.deepseek_model,
                 self.settings.llm_temperature,
             )
@@ -261,30 +278,85 @@ class LLMAgent:
             self._locks[symbol] = lock
         return lock
 
-    def _get_cached(self, symbol: str) -> Optional[LLMAnalysisResult]:
+    async def _load_recent_judgment(
+        self, symbol: str
+    ) -> Optional[LLMAnalysisResult]:
         """
-        若指定 symbol 在节流窗口内有可用缓存，则返回；否则返回 None。
+        若指定 symbol 在节流窗口内已有 LLM 判断（落在 signals 表里），
+        则把它重建成 LLMAnalysisResult 返回；否则返回 None 让上层调用 LLM。
         --------------------------------------------------------------
-        - 命中时打印日志，注明距离下次真实调用还有多久，方便排查成本。
-        - ``min_interval == 0`` 时直接视为不缓存（关闭节流）。
+        步骤：
+            1) ``min_interval <= 0``：节流关闭，直接返回 None（每次都真调）。
+            2) 查 signals 表里该 symbol 最近一条记录的 ts；
+               表为空则视为未节流，让上层去打 LLM。
+            3) 计算 ``now - ts``；
+               - ``< min_interval``：节流命中，把那一行的 bias / confidence
+                 / reason / risk / suggestion / reasoning_content 重建成
+                 LLMAnalysisResult，并把 ``from_cache`` 置 True 返回。
+                 service 层据此跳过本次入库，避免重复行。
+               - ``>= min_interval``：节流过期，返回 None。
+        异常处理：
+            DB 查询失败时（如连接被 reset），不应阻塞 LLM 调用；记一行
+            warning 后返回 None，让上层退化为"直接打 LLM"——成本上界仍是
+            min_interval，最差也只是少一次节流命中。
         """
         if self.min_interval <= 0:
             return None
-        cached = self._cache.get(symbol)
-        if cached is None:
-            return None
-        ts, result = cached
-        elapsed = time.monotonic() - ts
-        if elapsed < self.min_interval:
-            remaining = self.min_interval - elapsed
-            logger.info(
-                "LLM cache hit for %s (age=%.0fs, next call in %.0fs)",
+        try:
+            row = await self.repos.fetch_latest_signal_judgment(symbol)
+        except Exception:
+            logger.warning(
+                "查询 %s 最近一条信号时间戳失败；按未命中缓存处理",
                 symbol,
-                elapsed,
-                remaining,
+                exc_info=True,
             )
-            return result
-        return None
+            return None
+        if row is None:
+            return None
+
+        last_ts: Optional[datetime] = row.get("ts")
+        if last_ts is None:
+            return None
+        # 兼容部分驱动 / 历史数据返回 naive datetime 的情形：把它当作 UTC。
+        # signals.ts 的 schema 是 TIMESTAMPTZ，正常情况下 asyncpg 会带 tzinfo。
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+        elapsed = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        if elapsed >= self.min_interval:
+            return None
+
+        try:
+            cached_signal = TradingSignal(
+                bias=row["bias"],
+                confidence=float(row["confidence"]),
+                reason=row.get("reason") or "",
+                risk=row.get("risk") or "",
+                suggestion=row.get("suggestion") or "",
+            )
+        except Exception:
+            # 历史脏数据 / schema 不匹配时，不强行卡死节流通道；记日志后
+            # 当作没有缓存处理，让本轮去真打一次 LLM 重建判断。
+            logger.warning(
+                "无法从 signals 表行重建 %s 的 TradingSignal；"
+                "将按未命中缓存重新调用 LLM",
+                symbol,
+                exc_info=True,
+            )
+            return None
+
+        remaining = self.min_interval - elapsed
+        logger.info(
+            "LLM 数据库节流命中 %s（已过 %.0fs，下次调用还需 %.0fs）",
+            symbol,
+            elapsed,
+            remaining,
+        )
+        return LLMAnalysisResult(
+            signal=cached_signal,
+            reasoning_content=row.get("reasoning_content"),
+            from_cache=True,
+        )
 
     @staticmethod
     def _extract_reasoning(raw_message: Any) -> Optional[str]:
@@ -348,7 +420,7 @@ class LLMAgent:
             ]
             content = "\n".join(text_parts)
         if not isinstance(content, str) or not content.strip():
-            logger.error("LLM returned empty content for %s", symbol)
+            logger.error("LLM 为 %s 返回了空内容", symbol)
             return None
 
         text = content.strip()
@@ -373,7 +445,7 @@ class LLMAgent:
                 pass
 
         logger.error(
-            "LLM JSON parse failed for %s; raw content (first 500 chars): %s",
+            "LLM 输出 JSON 解析失败 %s；原始内容（前 500 字符）：%s",
             symbol,
             content[:500],
         )
@@ -401,23 +473,25 @@ class LLMAgent:
                                  （来自缓存时同样会带回首次调用的思维链原文）
             None               ：LLM 未启用 / 链构建失败 / 调用失败 / schema 校验失败
         节流策略：
-            同一 symbol 在 ``min_interval`` 秒内的请求会复用上一次 LLM
-            返回的结果，不会真正发起 API 调用。
+            "上一次判断时间"取自 signals 表里该 symbol 最后一条记录的 ts。
+            同一 symbol 在 ``min_interval`` 秒内的请求会直接把那条记录的
+            判断字段重建成 LLMAnalysisResult 返回（``from_cache=True``），
+            不会真正发起 API 调用，也不会再次落库。
         """
 
         if not self.enabled:
-            logger.info("LLM disabled (no DEEPSEEK_API_KEY); using rule-engine output")
+            logger.info("LLM 已禁用（未配置 DEEPSEEK_API_KEY），将使用规则引擎结果")
             return None
 
-        # 快速路径：先在锁外检查一次缓存，避免高频 await。
-        cached = self._get_cached(symbol)
+        # 快速路径：先在锁外查一次 DB，避免抢锁。
+        cached = await self._load_recent_judgment(symbol)
         if cached is not None:
             return cached
 
-        # 慢速路径：拿锁，再次检查缓存（double-checked locking），
-        # 防止多个并发请求在第一次调用尚未写回缓存前都进入到 LLM 调用。
+        # 慢速路径：拿锁后再查一次（double-checked locking），
+        # 防止同一 symbol 在节流刚过期的瞬间被并发调用打多次接口。
         async with self._get_lock(symbol):
-            cached = self._get_cached(symbol)
+            cached = await self._load_recent_judgment(symbol)
             if cached is not None:
                 return cached
 
@@ -425,12 +499,12 @@ class LLMAgent:
                 try:
                     self._chain = self._build_chain()
                 except Exception:
-                    logger.exception("Failed to build LangChain chain")
+                    logger.exception("构建 LangChain 调用链失败")
                     return None
 
             try:
                 logger.info(
-                    "LLM call -> %s (min_interval=%ss)", symbol, self.min_interval
+                    "LLM 发起调用 -> %s（最小间隔=%ss）", symbol, self.min_interval
                 )
                 result = await self._chain.ainvoke(
                     {
@@ -446,7 +520,7 @@ class LLMAgent:
                     }
                 )
             except Exception:
-                logger.exception("LangChain invocation failed; falling back to rule engine")
+                logger.exception("LangChain 调用失败，回退到规则引擎")
                 return None
 
             # 两条返回路径：
@@ -476,7 +550,7 @@ class LLMAgent:
 
             if parsing_error is not None:
                 logger.error(
-                    "LLM structured parsing error for %s: %s", symbol, parsing_error
+                    "LLM 结构化解析错误 %s：%s", symbol, parsing_error
                 )
                 return None
 
@@ -487,18 +561,18 @@ class LLMAgent:
                 try:
                     signal = TradingSignal.model_validate(parsed)
                 except Exception:
-                    logger.exception("LLM output failed schema validation")
+                    logger.exception("LLM 输出未通过 schema 校验")
                     return None
             else:
                 logger.error(
-                    "Unexpected LLM parsed type for %s: %r", symbol, type(parsed)
+                    "LLM 解析结果类型异常 %s：%r", symbol, type(parsed)
                 )
                 return None
 
             reasoning_content = self._extract_reasoning(raw_message)
             if reasoning_content:
                 logger.debug(
-                    "LLM reasoning_content captured for %s (%d chars)",
+                    "已捕获 LLM 思维链 %s（%d 字符）",
                     symbol,
                     len(reasoning_content),
                 )
@@ -506,16 +580,15 @@ class LLMAgent:
                 # 思考模式下仍未拿到 reasoning_content，多半是 LangChain
                 # 没把该字段透传过来；不致命，但记一行日志便于排查。
                 logger.debug(
-                    "Thinking mode is on but no reasoning_content was found in raw message for %s",
+                    "思考模式已启用，但 %s 的原始消息中未找到 reasoning_content",
                     symbol,
                 )
 
-            analysis = LLMAnalysisResult(
-                signal=signal, reasoning_content=reasoning_content
+            # from_cache=False 标记本次是真正发起了一次 LLM 调用，service
+            # 层会据此把这条结果写入 signals 表——这条 INSERT 同时也是下一
+            # 轮 _load_recent_judgment 的"上次调用时间戳"来源，构成隐式缓存。
+            return LLMAnalysisResult(
+                signal=signal,
+                reasoning_content=reasoning_content,
+                from_cache=False,
             )
-
-            # 仅在节流开启时写入缓存。这样调试场景（min_interval=0）
-            # 不会留下过期判断污染后续行为。
-            if self.min_interval > 0:
-                self._cache[symbol] = (time.monotonic(), analysis)
-            return analysis

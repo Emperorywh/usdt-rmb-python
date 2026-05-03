@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging(settings.log_level)
     logger = get_logger("app.main")
-    logger.info("Starting ETH Trading Analysis Platform")
+    logger.info("正在启动 ETH 行情分析平台")
 
     container = await AppContainer.create(settings)
     app.state.container = container
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        logger.info("Shutting down ETH Trading Analysis Platform")
+        logger.info("正在关闭 ETH 行情分析平台")
         await container.signal_service.stop()
         await container.shutdown()
 
