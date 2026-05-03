@@ -76,6 +76,10 @@ class IngestionRunner:
         self._tasks: List[asyncio.Task[Any]] = []
         self._trade_buffer: List[Dict[str, Any]] = []
         self._trade_lock = asyncio.Lock()
+        # 爆仓推送：低频 + 阵发性，与 trades 类似走批量缓冲，
+        # 由独立 flusher 1s 落库一次，避免单条频繁 IO。
+        self._liquidation_buffer: List[Dict[str, Any]] = []
+        self._liquidation_lock = asyncio.Lock()
         self._stopping = asyncio.Event()
         # 订单簿节流用：记录每个 symbol 最近一次成功落库的单调时钟时间戳
         self._last_orderbook_write: Dict[str, float] = {}
@@ -107,6 +111,11 @@ class IngestionRunner:
         for client in self.ws_clients:
             self._tasks.append(asyncio.create_task(self._run_ws(client), name=f"ws-{client.name}"))
         self._tasks.append(asyncio.create_task(self._run_trade_flusher(), name="trade-flusher"))
+        # 爆仓 flusher：单独的批量落库循环；与 trade flusher 解耦，
+        # 即便 liquidation 写库失败也不影响主行情链路。
+        self._tasks.append(
+            asyncio.create_task(self._run_liquidation_flusher(), name="liquidation-flusher")
+        )
         # REST 不再无脑 60s 轮询，改成 stale-watchdog：仅当 WS 长时间没有
         # 推送对应频道时才发一次 REST 兜底，降低对外网请求频率。
         self._tasks.append(asyncio.create_task(self._run_rest_watchdog(), name="rest-watchdog"))
@@ -143,6 +152,7 @@ class IngestionRunner:
                 pass
         self._tasks.clear()
         await self._flush_trades(force=True)
+        await self._flush_liquidations()
         logger.info("数据采集任务已停止")
 
     # ------------------------------------------------------------------
@@ -211,6 +221,13 @@ class IngestionRunner:
             elif etype == "ticker":
                 # ticker 不入库，但记录心跳供 watchdog 参考
                 self._mark_ws_event(symbol, "ticker")
+            elif etype == "liquidation":
+                # P0：爆仓事件先进缓冲，由 _run_liquidation_flusher 批量落库。
+                # 推送本身已在 okx_ws._emit_liquidations 里按 self.symbols 过滤，
+                # 这里只做一次防御性 None 检查。
+                if symbol:
+                    await self._buffer_liquidation(event)
+                    self._mark_ws_event(symbol, "liquidation")
         except Exception:
             logger.exception("事件持久化失败 type=%s", etype)
 
@@ -305,6 +322,59 @@ class IngestionRunner:
             logger.debug("已批量落库 %d 条成交", len(batch))
         except Exception:
             logger.exception("成交批量落库失败（丢失 %d 行）", len(batch))
+
+    # ------------------------------------------------------------------
+    # 爆仓事件批量入库（P0）
+    # ------------------------------------------------------------------
+    async def _buffer_liquidation(self, event: Dict[str, Any]) -> None:
+        """
+        把一条爆仓事件追加到内存缓冲区
+        ----------------------------------------------------------
+        参数：
+            event: okx_ws 里 type='liquidation' 的事件 dict
+        说明：
+            爆仓推送本身较稀疏，但出现"级联爆仓"时单秒可能涌入数十条；
+            与 trades 一样走 1s 批量节奏，避免每条都打开一次连接。
+        """
+        async with self._liquidation_lock:
+            self._liquidation_buffer.append(event)
+
+    async def _run_liquidation_flusher(self) -> None:
+        """
+        爆仓批量 flusher 循环
+        ----------------------------------------------------------
+        说明：
+            每 1 秒触发一次（与 trade flusher 同节奏），关闭事件触发时
+            立即退出。失败只 warn 不抛，避免阻塞主链路。
+        """
+        try:
+            while not self._stopping.is_set():
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                await self._flush_liquidations()
+        except asyncio.CancelledError:
+            raise
+
+    async def _flush_liquidations(self) -> None:
+        """
+        将爆仓缓冲区批量写入 liquidations 表
+        ----------------------------------------------------------
+        说明：
+            ON CONFLICT DO NOTHING 由 repos.insert_liquidations 内置，
+            重连重复推送可被静默吞掉。
+        """
+        async with self._liquidation_lock:
+            if not self._liquidation_buffer:
+                return
+            batch = self._liquidation_buffer
+            self._liquidation_buffer = []
+        try:
+            await self.repos.insert_liquidations(batch)
+            logger.debug("已批量落库 %d 条爆仓", len(batch))
+        except Exception:
+            logger.exception("爆仓批量落库失败（丢失 %d 行）", len(batch))
 
     # 各 WS 频道允许的最大静默时长（秒）；超过即触发一次 REST 兜底。
     # funding-rate 推送约 1 分钟一次，给 5 分钟容忍；

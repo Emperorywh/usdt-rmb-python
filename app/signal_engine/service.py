@@ -79,6 +79,10 @@ class SignalService:
             # 不再冗余写入，避免 JSON 体积膨胀。
             # reasoning_content 单独落到 signals.reasoning_content 列，仅作审计，
             # 不参与下游决策、也不会被回灌进下一轮 prompt。
+            # P0 升级：把结构化交易计划字段一并落库；neutral 时全部为 None / 空。
+            entry_zone_payload = (
+                list(final.entry_zone) if final.entry_zone is not None else None
+            )
             signal_id = await self.repos.insert_signal(
                 symbol=symbol,
                 bias=final.bias,
@@ -93,6 +97,21 @@ class SignalService:
                 },
                 source=source,
                 reasoning_content=reasoning_content,
+                entry_zone=entry_zone_payload,
+                stop_loss=final.stop_loss,
+                take_profit=list(final.take_profit) if final.take_profit else None,
+                risk_reward_ratio=final.risk_reward_ratio,
+                position_size_pct=final.position_size_pct,
+                timeframe_alignment=(
+                    dict(final.timeframe_alignment)
+                    if final.timeframe_alignment
+                    else None
+                ),
+                invalidation_conditions=(
+                    list(final.invalidation_conditions)
+                    if final.invalidation_conditions
+                    else None
+                ),
             )
         else:
             logger.debug(
@@ -141,9 +160,36 @@ class SignalService:
         self._loops.clear()
 
     async def _run_loop(self, symbol: str, interval: int) -> None:
-        # Wait a bit to let ingestion accumulate data on first start.
+        # ------------------------------------------------------------------
+        # 冷启动 warmup：等到一个完整 factor_window 攒满再触发首轮信号
+        # ------------------------------------------------------------------
+        # 背景：
+        #   原实现只 sleep min(interval, 15)=15s 就开跑，但 factor_window
+        #   默认 1800s（5min 也不够），首轮聚合时窗口里几乎没数据：
+        #   - market_structure 1 根 bar 都凑不齐 → trend=neutral；
+        #   - capital_flow 只反映几十秒成交，却被 LLM 当成 5min/30min 数据；
+        #   - derivatives 在 funding/OI 还没推第一帧时全为 None；
+        #   规则打分常因为 capital_flow 单边贡献越过 ±0.25 阈值生成伪信号，
+        #   还会把这条质量很差的判断写进 signals 表（LLM 真调用过一次）。
+        #
+        # 解决：
+        #   把 warmup 上限提高到与因子窗口等长，最低不少于 interval。
+        #   factor_window 之外还额外加一段 settle 余量，给 OKX funding-rate
+        #   / open-interest 频道首推留出窗口（funding 大约 1min 推一次）。
+        warmup_seconds = max(
+            interval,
+            int(self.factor_aggregator.settings.factor_window_seconds),
+        )
+        # 用配置而不是硬编码常量，方便单测把 factor_window 调小后能立刻
+        # 跑出第一条信号；这里至少额外多等 60s 让 funding-rate 首帧到位。
+        warmup_seconds += 60
+        logger.info(
+            "信号循环 %s 冷启动 warmup %ds（等待因子窗口攒满）",
+            symbol,
+            warmup_seconds,
+        )
         try:
-            await asyncio.wait_for(self._stopping.wait(), timeout=min(interval, 15))
+            await asyncio.wait_for(self._stopping.wait(), timeout=warmup_seconds)
         except asyncio.TimeoutError:
             pass
 

@@ -11,7 +11,7 @@ bias 仍然保持 long/short/neutral 英文枚举（与表 CHECK 约束对齐）
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from app.config import Settings
 from app.signal_engine.schemas import TradingSignal
@@ -43,12 +43,18 @@ class RuleEngine:
         基于因子 dict 评估信号
         ---------------------------------------------------------------
         参数：
-            factors: :class:`FactorAggregator.compute` 的输出。
+            factors: :class:`FactorAggregator.compute` 的输出（兼容多周期与老格式）。
         返回：
             ``(signal, score, contributions)``：
                 signal:        TradingSignal 实例（中文 reason/risk/suggestion）
                 score:         [-1, 1] 区间的加权打分
                 contributions: 每个因子组的原始贡献度（-1 / 0 / +1 / -0.5 等）
+        说明：
+            P0 升级后兼容两种输入：
+                1) 老格式（enable_mtf_factors=False）：单层 dict，含 capital_flow 等四类；
+                2) 新格式（enable_mtf_factors=True）：含 by_timeframe；规则引擎默认抽取
+                   15m 周期的因子作为代表（与原 30 分钟窗口的语义最接近），并把
+                   net_flow_usd 用作老 net_flow 的等价值。
         """
         # 阈值统一从 Settings 拉取
         net_flow_thr = self.settings.rule_net_flow_usd_threshold
@@ -56,15 +62,13 @@ class RuleEngine:
         oi_thr = self.settings.rule_oi_change_threshold
         funding_thr = self.settings.rule_funding_rate_threshold
 
-        cap = factors.get("capital_flow", {}) or {}
-        ob = factors.get("orderbook", {}) or {}
-        deriv = factors.get("derivatives", {}) or {}
-        struct = factors.get("market_structure", {}) or {}
+        cap, ob, deriv, struct = self._extract_layers(factors)
 
         contributions: Dict[str, float] = {}
 
         # ---- 资金流贡献度 ----
-        net_flow = float(cap.get("net_flow") or 0.0)
+        # 兼容：老格式用 net_flow（USD）；新格式用 net_flow_usd
+        net_flow = float(cap.get("net_flow_usd") or cap.get("net_flow") or 0.0)
         if net_flow > net_flow_thr:
             contributions["capital_flow"] = +1.0
         elif net_flow < -net_flow_thr:
@@ -82,7 +86,9 @@ class RuleEngine:
             contributions["orderbook"] = 0.0
 
         # ---- 衍生品贡献度（funding × OI 变动）----
-        funding = float(deriv.get("funding_rate") or 0.0)
+        funding = float(
+            deriv.get("funding_rate_now") or deriv.get("funding_rate") or 0.0
+        )
         oi_change = deriv.get("oi_change_pct")
         oi_signal = 0.0
         if oi_change is not None:
@@ -145,7 +151,8 @@ class RuleEngine:
         # ---- 中文 suggestion ----
         sup = struct.get("supports") or []
         res = struct.get("resistances") or []
-        entry = struct.get("last_price")
+        # 兼容新老 schema：market_structure 在新格式里用 last_close
+        entry = struct.get("last_price") or struct.get("last_close")
         if bias == "long":
             stop = sup[0] if sup else None
             target = res[0] if res else None
@@ -176,6 +183,46 @@ class RuleEngine:
             suggestion=suggestion,
         )
         return signal, score, contributions
+
+
+    @staticmethod
+    def _extract_layers(
+        factors: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """
+        从因子聚合结果中抽取四类因子层（兼容老 / 新格式）
+        ---------------------------------------------------------------
+        参数：
+            factors: 来自 FactorAggregator.compute 的输出
+        返回：
+            (capital_flow, orderbook, derivatives, market_structure)
+        说明：
+            - 老格式（无 by_timeframe）：直接返回顶层四个键。
+            - 新格式（多周期矩阵）：默认抽取 15m 周期作为规则引擎代表周期，
+              这与历史"30 分钟单一窗口"的语义最接近，最大化与旧阈值的兼容性。
+              如果 15m 不存在则按 5m → 1h 顺序回退。
+        """
+        if "by_timeframe" not in factors:
+            return (
+                factors.get("capital_flow", {}) or {},
+                factors.get("orderbook", {}) or {},
+                factors.get("derivatives", {}) or {},
+                factors.get("market_structure", {}) or {},
+            )
+        by_tf = factors.get("by_timeframe") or {}
+        chosen: Optional[Dict[str, Any]] = None
+        for tf in ("15m", "5m", "1h", "4h", "1d"):
+            block = by_tf.get(tf)
+            if block:
+                chosen = block
+                break
+        chosen = chosen or {}
+        return (
+            chosen.get("capital_flow", {}) or {},
+            chosen.get("orderbook", {}) or {},
+            chosen.get("derivatives", {}) or {},
+            chosen.get("market_structure", {}) or {},
+        )
 
 
 def _trend_zh(trend: str) -> str:

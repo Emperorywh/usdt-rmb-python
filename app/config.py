@@ -30,6 +30,21 @@ class Settings(BaseSettings):
     )
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
+    # 连接池空闲连接最大存活时间（秒）
+    # ----------------------------------------------------------------
+    # Windows / 跨网络环境下，OS 经常会在长空闲后悄悄断掉 TCP 半连接，
+    # 但连接池仍以为这条连接活着。下次 executemany 才会触发
+    # WinError 121 + ConnectionDoesNotExistError，整批数据丢失。
+    # 把空闲存活时间压到 60s，让连接池主动回收并新建，避开僵尸连接。
+    # asyncpg 默认 300s，对高频写入场景偏大。
+    db_max_inactive_connection_lifetime: float = 60.0
+    # 数据库写操作遇到瞬时连接错误时的最大重试次数（不含首次执行）
+    # ----------------------------------------------------------------
+    # 仅对幂等写入生效：所有走 ON CONFLICT DO NOTHING / UPDATE 的批量
+    # 写入即便部分行已写入再重试也不会产生脏数据。设为 0 可彻底关闭。
+    db_write_max_retries: int = 2
+    # 写操作首次重试前的等待秒数（之后按指数退避翻倍）
+    db_write_retry_backoff: float = 0.2
 
     # ===== OKX 行情 =====
     okx_ws_url: str = "wss://ws.okx.com:8443/ws/v5/public"
@@ -94,6 +109,32 @@ class Settings(BaseSettings):
     liquidity_wall_multiplier: float = 3.0
     rest_poll_interval_seconds: int = 60
 
+    # ===== P0 多周期 / 爆仓 / 结构化交易计划 =====
+    # 主功能开关：True 走多周期因子矩阵 + 结构化 TradingSignal；
+    #             False 一键回退到老的 30 分钟单层因子聚合器，
+    #             用于灰度回滚（老 LLM prompt + 老 schema 自动兼容）。
+    enable_mtf_factors: bool = True
+    # 多周期 K 线增量任务每个周期的轮询节奏（秒）
+    # 5m 桶分辨率 60s 已足够，做 1s/10s/60s 三档区分主要为了降总 CPU。
+    kline_tick_seconds_1m: float = 1.0
+    kline_tick_seconds_5m: float = 1.0
+    kline_tick_seconds_15m: float = 10.0
+    kline_tick_seconds_1h: float = 10.0
+    kline_tick_seconds_4h: float = 60.0
+    kline_tick_seconds_1d: float = 60.0
+    # market_structure 每个周期回看的 K 线根数（HH/HL pivot + ATR）
+    mtf_lookback_bars: int = 80
+    # capital_flow.volume_zscore 用的滚动均值长度
+    mtf_volume_zscore_window: int = 30
+    # cvd_price_divergence 用的"N 期新高"长度
+    mtf_divergence_lookback: int = 20
+    # 爆仓滚动窗口分钟数（cascade_signal 用）
+    liquidation_windows_minutes: List[int] = Field(default_factory=lambda: [5, 15, 60])
+    # cascade_signal 阈值：当前 1m 爆仓 size > 过去 1h 均值 × N 即视为级联
+    liquidation_cascade_multiplier: float = 5.0
+    # 风险预算占比（用于 LLM 计算 position_size_pct 的提示，本身不强制注入）
+    account_risk_budget_pct: float = 0.01
+
     # ===== 规则引擎阈值 =====
     # 资金净流入绝对值（USD），超过此值才认为有方向性
     rule_net_flow_usd_threshold: float = 50_000.0
@@ -136,6 +177,21 @@ class Settings(BaseSettings):
     def _split_csv(cls, v):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("liquidation_windows_minutes", mode="before")
+    @classmethod
+    def _split_int_csv(cls, v):
+        """
+        允许从环境变量传入逗号分隔的整数串（如 "5,15,60"）
+        ----------------------------------------------------------
+        参数：
+            v: 原始值，可能是字符串、列表或 None
+        返回：
+            int 列表
+        """
+        if isinstance(v, str):
+            return [int(item.strip()) for item in v.split(",") if item.strip()]
         return v
 
 

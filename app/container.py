@@ -18,6 +18,7 @@ from app.data_ingestion.runner import IngestionRunner
 from app.data_storage.database import Database
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
+from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
 from app.signal_engine.llm_agent import LLMAgent
 from app.signal_engine.rules import RuleEngine
@@ -51,6 +52,8 @@ class AppContainer:
     ingestion_runner: Optional[IngestionRunner] = field(default=None)
     # 启动后台周期刷新合约面值的任务句柄；shutdown 时一并取消，避免泄漏
     instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
+    # P0：多周期 K 线增量聚合器；enable_mtf_factors=False 时不创建（None）
+    kline_aggregator: Optional[KlineAggregator] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
@@ -59,6 +62,9 @@ class AppContainer:
             dsn=settings.database_url,
             min_size=settings.db_pool_min_size,
             max_size=settings.db_pool_max_size,
+            max_inactive_connection_lifetime=settings.db_max_inactive_connection_lifetime,
+            write_max_retries=settings.db_write_max_retries,
+            write_retry_backoff=settings.db_write_retry_backoff,
         )
         await db.connect()
         repos = Repositories(db)
@@ -129,6 +135,17 @@ class AppContainer:
             llm_agent=llm_agent,
         )
 
+        # ---- P0：多周期 K 线增量聚合器 ----
+        # 仅当开关打开时创建实例并启动；关闭时维持 None，跳过所有 K 线写入，
+        # FactorAggregator 自己会回退到老的 30 分钟单一窗口路径。
+        kline_aggregator: Optional[KlineAggregator] = None
+        if bool(getattr(settings, "enable_mtf_factors", False)):
+            kline_aggregator = KlineAggregator(
+                repos=repos,
+                settings=settings,
+                exchange="okx",
+            )
+
         return cls(
             settings=settings,
             db=db,
@@ -141,6 +158,7 @@ class AppContainer:
             signal_service=signal_service,
             ingestion_runner=runner,
             instrument_refresh_task=instrument_refresh_task,
+            kline_aggregator=kline_aggregator,
         )
 
     @staticmethod
@@ -205,6 +223,10 @@ class AppContainer:
                 await self.instrument_refresh_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # P0：先停 K 线聚合器再停采集，保证关闭时不会再有"读 trades / 写 klines"
+        # 的协程在飞，避免与连接池关闭竞态。
+        if self.kline_aggregator is not None:
+            await self.kline_aggregator.stop()
         if self.ingestion_runner is not None:
             await self.ingestion_runner.stop()
         await self.okx_rest.close()

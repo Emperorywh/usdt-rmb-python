@@ -30,6 +30,10 @@ async def lifespan(app: FastAPI):
 
     if container.ingestion_runner is not None:
         await container.ingestion_runner.start()
+    # P0：启动多周期 K 线增量聚合器（仅在 enable_mtf_factors=True 时创建实例）
+    # 1m / 5m 每秒一次；15m / 1h 每 10 秒一次；4h / 1d 每分钟一次。
+    if container.kline_aggregator is not None:
+        await container.kline_aggregator.start(symbols=list(settings.symbols))
     await container.signal_service.start_periodic(
         symbols=settings.symbols,
         interval_seconds=settings.signal_interval_seconds,

@@ -1,7 +1,7 @@
 """OKX V5 public WebSocket client.
 
 Channels subscribed: ``trades``, ``books5``, ``tickers``,
-``funding-rate``, ``open-interest``.
+``funding-rate``, ``open-interest``, ``liquidation-orders``（P0 新增）.
 
 Architectural note: funding-rate / open-interest are now consumed via the
 **WebSocket as the primary path** (push-based, no rate-limit cost). The REST
@@ -114,8 +114,12 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         构造订阅参数列表
         ---------------------------------------------------------------
         说明：
-            funding-rate / open-interest 也走 WS 主路径，REST 仅在
-            数据陈旧时由 runner 的 watchdog 兜底拉一次。
+            - funding-rate / open-interest 也走 WS 主路径，REST 仅在
+              数据陈旧时由 runner 的 watchdog 兜底拉一次。
+            - liquidation-orders 是 OKX 的"全市场推送"频道，按 instType
+              订阅而非 instId（订阅时给 instId 会被服务端忽略），客户端
+              必须自行按 self.symbols 过滤，否则 BTC / SOL 等无关合约的
+              强平也会被写到我们的 liquidations 表里污染数据。
         """
         args: List[Dict[str, str]] = []
         books_channel = "books5" if self.depth <= 5 else "books"
@@ -125,6 +129,9 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
             args.append({"channel": "tickers", "instId": sym})
             args.append({"channel": "funding-rate", "instId": sym})
             args.append({"channel": "open-interest", "instId": sym})
+        # liquidation-orders 全市场频道：每种 instType 订阅一次即可。
+        # 当前我们只关心 SWAP（永续合约），如果以后扩到 FUTURES 再加。
+        args.append({"channel": "liquidation-orders", "instType": "SWAP"})
         return args
 
     async def stop(self) -> None:
@@ -285,4 +292,75 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                     "ts": ts,
                     "oi": float(item.get("oi") or 0.0),
                     "oi_ccy": float(item.get("oiCcy") or 0) or None,
+                }
+        elif channel == "liquidation-orders":
+            # OKX V5 liquidation-orders 是全市场推送：data 里每条都带各自的
+            # instId，客户端必须按 self.symbols 过滤掉不感兴趣的合约。
+            # 单条结构：
+            #   {"instType":"SWAP","instId":"ETH-USDT-SWAP",
+            #    "details":[{"side":"sell","posSide":"long","bkPx":"...","sz":"..."}, ...]}
+            #
+            # side 字段语义：
+            #   side=sell → 平多操作 → 一个多头仓位被强平 → 我们记 'long'
+            #   side=buy  → 平空操作 → 一个空头仓位被强平 → 我们记 'short'
+            # 部分版本会同时给 posSide，优先用 posSide（语义直接），
+            # 不可用时按上面的反向映射回退。
+            async for ev in self._emit_liquidations(data):
+                yield ev
+
+    async def _emit_liquidations(
+        self, data: List[Dict[str, Any]]
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        把一批 liquidation-orders 推送展开成扁平的强平事件流
+        ---------------------------------------------------------------
+        参数：
+            data: msg["data"]，每个元素带 instId 与 details 列表。
+        说明：
+            - 必须按 self.symbols 客户端过滤，详见 _build_subscribe_args 注释。
+            - size 同样按 ctVal 换算到基础币种数量。
+            - notional = price * size（已换算）。
+        产出：
+            type=liquidation 的事件 dict，字段：
+                exchange / symbol / ts / side(long|short) / price / size / notional
+        """
+        for entry in data:
+            inst_id = entry.get("instId")
+            if not inst_id or inst_id not in self.symbols:
+                continue
+            ct_val = self._ct_val(inst_id)
+            details = entry.get("details") or []
+            for det in details:
+                side_raw = (det.get("side") or "").lower()
+                pos_side = (det.get("posSide") or "").lower()
+                if pos_side in ("long", "short"):
+                    side_norm = pos_side
+                elif side_raw == "sell":
+                    side_norm = "long"
+                elif side_raw == "buy":
+                    side_norm = "short"
+                else:
+                    continue
+
+                price_str = det.get("bkPx") or det.get("fillPx") or det.get("px")
+                size_str = det.get("sz")
+                ts_raw = det.get("ts") or det.get("cTime")
+                if price_str is None or size_str is None or ts_raw is None:
+                    continue
+
+                try:
+                    price = float(price_str)
+                    size = float(size_str) * ct_val
+                except (TypeError, ValueError):
+                    continue
+
+                yield {
+                    "type": "liquidation",
+                    "exchange": self.name,
+                    "symbol": inst_id,
+                    "ts": _ms_to_dt(ts_raw),
+                    "side": side_norm,
+                    "price": price,
+                    "size": size,
+                    "notional": price * size,
                 }

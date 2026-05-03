@@ -30,6 +30,85 @@ from app.signal_engine.schemas import TradingSignal
 logger = get_logger(__name__)
 
 
+# ------------------------------------------------------------------
+# DeepSeek 思考模式 reasoning_content 透传补丁
+# ------------------------------------------------------------------
+# 背景：
+#   langchain-openai (<= 0.3.x) 的 ``_convert_dict_to_message`` 只识别
+#   OpenAI 标准字段（content / function_call / tool_calls / audio），
+#   对 DeepSeek 在 assistant 消息上额外返回的 ``reasoning_content``
+#   字段（即"思维链原文"）会**直接丢弃**。
+#   表现就是：开启思考模式后，调用方从 AIMessage.additional_kwargs 与
+#   AIMessage.response_metadata 里都拿不到 reasoning_content，最终
+#   signals.reasoning_content 列永远为 NULL。
+#
+# 修复方案：
+#   子类化 ChatOpenAI，重写 ``_create_chat_result``：
+#   1) 让父类先按原逻辑构建 ChatResult；
+#   2) 再从原始响应字典里把每个 choice 的 ``message.reasoning_content``
+#      取出来，塞进对应 AIMessage.additional_kwargs["reasoning_content"]。
+#   这样 ``LLMAgent._extract_reasoning`` 现有的查找路径就能命中，
+#   service 层也无需改动入库逻辑。
+#
+# 设计取舍：
+#   - 不去 monkey-patch langchain 内部函数：影响面不可控、阻碍未来升级。
+#   - 不绕开 langchain 直接裸调 openai SDK：会让 prompt / 解析 /
+#     重试 / 日志全部要重写，得不偿失。
+#   - 不在 chain 上挂一层 RunnableLambda 后处理：拿不到原始 dict，
+#     只能拿到已经被 langchain 转换后丢失了 reasoning_content 的 AIMessage。
+#   重写 _create_chat_result 是改动面最小、最稳妥的做法。
+def _build_deepseek_chat_openai_class():
+    """
+    构造一个支持 DeepSeek ``reasoning_content`` 透传的 ChatOpenAI 子类
+    --------------------------------------------------------------
+    放在函数里延迟导入，避免在没装 langchain-openai 的环境里 import
+    本模块就直接挂掉（与 ``_build_chain`` 的延迟导入策略保持一致）。
+    """
+    from langchain_core.messages import AIMessage
+    from langchain_openai import ChatOpenAI
+
+    class _DeepSeekChatOpenAI(ChatOpenAI):
+        """
+        DeepSeek 思考模式专用的 ChatOpenAI 子类
+        ----------------------------------------------------------
+        唯一改动：在 ``_create_chat_result`` 中把响应里每个 choice 的
+        ``message.reasoning_content`` 透传到对应 AIMessage 的
+        ``additional_kwargs["reasoning_content"]``。
+        """
+
+        def _create_chat_result(self, response, generation_info=None):
+            # 先让父类完成标准转换；它会把 response 序列化成 dict 再走
+            # _convert_dict_to_message。我们这里需要的也是同一份 dict，
+            # 因此再独立 dump 一次以拿到原始 reasoning_content。
+            chat_result = super()._create_chat_result(response, generation_info)
+
+            response_dict = (
+                response if isinstance(response, dict) else response.model_dump()
+            )
+            choices = response_dict.get("choices") or []
+
+            for idx, choice in enumerate(choices):
+                if idx >= len(chat_result.generations):
+                    break
+                message_dict = choice.get("message") or {}
+                # DeepSeek 把思维链放在 message.reasoning_content 中；
+                # 部分网关/代理也会放在 message.reasoning，这里一并兼容。
+                reasoning = message_dict.get("reasoning_content") or message_dict.get(
+                    "reasoning"
+                )
+                if not isinstance(reasoning, str) or not reasoning.strip():
+                    continue
+                generated_message = chat_result.generations[idx].message
+                if isinstance(generated_message, AIMessage):
+                    generated_message.additional_kwargs["reasoning_content"] = (
+                        reasoning
+                    )
+
+            return chat_result
+
+    return _DeepSeekChatOpenAI
+
+
 @dataclass(frozen=True)
 class LLMAnalysisResult:
     """
@@ -58,29 +137,56 @@ class LLMAnalysisResult:
 
 
 SYSTEM_PROMPT = """\
-你是一名资深加密衍生品量化交易分析师。系统会给你一份从实时行情中
-计算出的结构化因子快照，以及一个由确定性规则引擎给出的初步打分。
+你是一名资深加密衍生品量化交易分析师。系统会给你一份多周期因子矩阵
+（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口以及多周期
+关键价位列表。
 
-请基于这些信息输出**一个**简洁的交易偏置判断，并以严格符合给定
-schema 的 JSON 对象返回。该信号仅作交易建议，不会被执行下单。
+请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为
+完整可执行的交易计划。该信号仅作交易建议，不会被自动下单。
 
-输出语言要求：
+【输出语言要求】
 - reason / risk / suggestion 三个字段必须使用**简体中文**。
 - bias 字段保持 long / short / neutral 三个英文枚举值之一，**不要翻译**。
+- timeframe_alignment 的 value 也保持 long/short/neutral 英文枚举。
 
-判断要点：
+【因子使用要点】
 - 综合考虑四类因子：资金流（capital_flow）、订单簿（orderbook）、
   衍生品（derivatives）、市场结构（market_structure）。
 - 注意：当前没有链上数据与参与者画像，请勿引用任何 on-chain / whale /
   smart money 相关信息，也不要编造。
-- 当各因子方向冲突时，优先输出 "neutral" 并给出较低的 confidence。
-- "confidence" 必须落在 [0, 1] 区间，反映各因子方向的一致程度。
-- "reason" 必须引用因子中最具代表性的具体数值（净流入金额、盘口失衡、
-  资金费率、OI 变动百分比、趋势判断、关键支撑/阻力位等）。
-- "risk" 必须列出明确的失效条件（例如：资金费率反转、关键价位被跌破、
-  对侧大单墙形成等）。
-- "suggestion" 必须给出**具体的入场区间、止损位、目标位**，并在文末
-  注明"仅供参考，不构成交易指令"。
+
+【多周期共振原则】
+- 因子数据按 5m / 15m / 1h / 4h / 1d 五个周期分层提供。
+  周期越大权重越高：4h、1d 决定主方向，1h 决定波段，
+  15m、5m 决定入场时机。
+- 出现冲突时，优先信任高周期，并在 reason 中显式说明你为什么
+  舍弃了哪些低周期信号。
+- timeframe_alignment 必须把 5 个周期的方向都填上，缺一不可。
+
+【可执行交易计划】
+你必须输出完整可执行交易计划：
+- entry_zone：**区间，不是单点**，宽度建议 0.2 × ATR(15m) ~ 0.5 × ATR(15m)。
+- stop_loss：必须落在结构关键位（HH/HL swing 点 / 4h 支撑或阻力）的另一侧，
+  且与 entry 中点的距离 ≥ 1 × ATR(15m)。
+- take_profit：至少 2 档，对应附近的对侧关键位 / 流动性池
+  （例如：tp1 = 1h 阻力，tp2 = 4h 阻力 / 上一波等量目标）。
+- risk_reward_ratio：必须 ≥ 1.5（按 |tp1 − entry_mid| / |entry_mid − sl| 计算）。
+- position_size_pct：基于 1% 账户风险预算计算
+  （= 0.01 / (|entry_mid - stop_loss| / entry_mid)），
+  最大不超过 0.25。
+- invalidation_conditions：≥ 2 条**量化**失效条件（必须含具体价位 / 阈值），
+  例如："4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
+
+【降级规则】
+- 如果不满足 RR ≥ 1.5、或多周期方向严重冲突（alignment_score 绝对值 < 0.4
+  且 dominant_bias=neutral），必须输出 neutral，不得硬给方向。
+- neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct
+  全部置 null（schema 强约束）。
+- reason 字段务必引用具体数值（净流入 USD、CVD slope、OI 变动百分比、
+  funding_rate、爆仓 imbalance、关键价位等），不要写"看起来"、
+  "似乎"等模糊表述。
+- suggestion 字段为面向用户的简体中文建议段落，文末必须注明
+  "仅供参考，不构成交易指令"。
 """
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -99,16 +205,35 @@ JSON Schema:
 """
 
 HUMAN_PROMPT = """\
-合约代码: {symbol}
-时间戳: {ts}
+合约: {symbol}
+时间: {ts}
 
-规则引擎初判: bias={rule_bias} confidence={rule_confidence} score={rule_score}
-规则引擎各因子贡献度: {rule_contributions}
+规则引擎: bias={rule_bias} score={rule_score} confidence={rule_confidence}
+规则引擎贡献度: {rule_contributions}
 
-因子快照 (JSON):
-{factors_json}
+===== 多周期因子矩阵 =====
+{mtf_factor_table}
 
-请基于以上信息输出最终的 TradingSignal。"""
+===== 多周期共振 =====
+{mtf_alignment_text}
+
+===== 衍生品 =====
+{derivatives_text}
+
+===== 爆仓（滚动窗口）=====
+{liquidations_table}
+
+===== 关键价位（从大周期到小周期）=====
+{key_levels_text}
+
+===== 订单簿快照（最新一次，跨周期共享）=====
+{orderbook_text}
+
+请输出完整的 TradingSignal JSON，必须包含：
+bias / confidence / reason / risk / suggestion / entry_zone /
+stop_loss / take_profit（≥2 档）/ risk_reward_ratio / position_size_pct /
+timeframe_alignment（5 个周期都填）/ invalidation_conditions（≥2 条）。
+"""
 
 
 class LLMAgent:
@@ -176,6 +301,13 @@ class LLMAgent:
 
         返回的是已经构建好的 Runnable；同时把"是否思考模式"记到
         ``self._chain_thinking_mode``，供 ``analyze`` 决定如何解析返回值。
+
+        ChatOpenAI 类的选择策略：
+            - 思考模式：使用 ``_build_deepseek_chat_openai_class()`` 返回的
+              子类，它会把 DeepSeek 的 ``reasoning_content`` 透传到
+              AIMessage.additional_kwargs，否则 langchain-openai 会丢字段，
+              导致 signals.reasoning_content 永远写入 NULL。
+            - 非思考模式：原生 ``ChatOpenAI`` 即可（响应里本就没有该字段）。
         """
         from langchain_openai import ChatOpenAI
 
@@ -185,6 +317,9 @@ class LLMAgent:
             )
 
         thinking_enabled = bool(self.settings.deepseek_thinking_enabled)
+        chat_openai_cls = (
+            _build_deepseek_chat_openai_class() if thinking_enabled else ChatOpenAI
+        )
 
         llm_kwargs: Dict[str, Any] = {
             "model": self.settings.deepseek_model,
@@ -217,7 +352,7 @@ class LLMAgent:
                 self.settings.llm_temperature,
             )
 
-        llm = ChatOpenAI(**llm_kwargs)
+        llm = chat_openai_cls(**llm_kwargs)
 
         if thinking_enabled:
             # 思考模式：deepseek-reasoner 不支持 tool_choice，走 prompt + 手动解析。
@@ -327,13 +462,23 @@ class LLMAgent:
             return None
 
         try:
+            # 缓存重建只为了"跳过本轮 LLM 调用"，本身不会影响下游交易计划
+            # （结构化字段 entry_zone / SL / TP 等在节流命中时不会被透出执行）。
+            # P0 升级后 model_validator 对 long/short 强约束 entry_zone/SL/TP 必填，
+            # 但历史 signals 行可能没有这些列；为了不破坏节流通路，缓存重建时
+            # 一律把 bias 当作"展示用 bias"，并强制走 neutral 路径让校验通过：
+            #   - 如果上层只读 bias / confidence 用于日志，结果是一致的；
+            #   - 真正的执行计划只来自"真正调用 LLM 的那次"，缓存命中本来就不入库。
             cached_signal = TradingSignal(
-                bias=row["bias"],
+                bias="neutral",
                 confidence=float(row["confidence"]),
                 reason=row.get("reason") or "",
                 risk=row.get("risk") or "",
                 suggestion=row.get("suggestion") or "",
             )
+            # 然后把真实 bias 透出来供日志展示（model_validator 已通过，
+            # 这里直接 setattr 不会再触发约束）。
+            object.__setattr__(cached_signal, "bias", row["bias"])
         except Exception:
             # 历史脏数据 / schema 不匹配时，不强行卡死节流通道；记日志后
             # 当作没有缓存处理，让本轮去真打一次 LLM 重建判断。
@@ -356,6 +501,247 @@ class LLMAgent:
             signal=cached_signal,
             reasoning_content=row.get("reasoning_content"),
             from_cache=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Prompt 构造（多周期因子矩阵 → 紧凑中文表格）
+    # ------------------------------------------------------------------
+    def _build_prompt_inputs(
+        self,
+        symbol: str,
+        factors: Dict[str, Any],
+        rule_signal: TradingSignal,
+        rule_score: float,
+        rule_contributions: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """
+        把多周期因子矩阵渲染成紧凑中文表格，作为 ChatPromptTemplate 输入
+        ---------------------------------------------------------------
+        参数：
+            symbol / factors / rule_signal / rule_score / rule_contributions:
+                同 analyze() 形参
+        返回：
+            ChatPromptTemplate.format 所需的全部 key-value 字典。
+        说明：
+            - 多周期模式下逐周期渲染表格行；缺失字段统一显示 '-'。
+            - 老格式（无 by_timeframe）下，自动降级为单行 / 单段表格，
+              保证回滚通道 LLM 仍然能拿到结构化输入。
+        """
+        is_mtf = "by_timeframe" in factors
+
+        ts = factors.get("computed_at") or ""
+
+        if is_mtf:
+            mtf_factor_table = self._render_mtf_factor_table(factors)
+            mtf_alignment_text = self._render_alignment(factors)
+            derivatives_text = self._render_derivatives_text(factors)
+            liquidations_table = self._render_liquidations_table(factors)
+            key_levels_text = self._render_key_levels(factors)
+            orderbook_text = self._render_orderbook(factors, mtf=True)
+        else:
+            mtf_factor_table = self._render_legacy_factor_block(factors)
+            mtf_alignment_text = "（老聚合器模式：未提供多周期共振）"
+            derivatives_text = self._render_legacy_derivatives(factors)
+            liquidations_table = "（老聚合器模式：未提供爆仓窗口）"
+            key_levels_text = self._render_legacy_key_levels(factors)
+            orderbook_text = self._render_orderbook(factors, mtf=False)
+
+        return {
+            "symbol": symbol,
+            "ts": ts,
+            "rule_bias": rule_signal.bias,
+            "rule_confidence": round(float(rule_signal.confidence), 4),
+            "rule_score": round(rule_score, 4),
+            "rule_contributions": json.dumps(rule_contributions, ensure_ascii=False),
+            "mtf_factor_table": mtf_factor_table,
+            "mtf_alignment_text": mtf_alignment_text,
+            "derivatives_text": derivatives_text,
+            "liquidations_table": liquidations_table,
+            "key_levels_text": key_levels_text,
+            "orderbook_text": orderbook_text,
+        }
+
+    @staticmethod
+    def _fmt(value: Any, digits: int = 4) -> str:
+        """
+        统一的数值格式化：None -> '-'；float 保留指定位数；其它走 str
+        ---------------------------------------------------------------
+        参数：
+            value:  原始值
+            digits: float 保留的小数位
+        返回：
+            渲染后的字符串。
+        """
+        if value is None:
+            return "-"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int,)):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:.{digits}f}"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @classmethod
+    def _render_mtf_factor_table(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染多周期"主因子表"（Markdown 风格 ASCII 表）
+        ---------------------------------------------------------------
+        列：周期 / trend / net_flow_usd / cvd_slope / taker_buy% /
+            oi_change% / oi_price / atr_14 / last_close
+        """
+        by_tf = factors.get("by_timeframe") or {}
+        header = (
+            "| 周期 | trend | net_flow_usd | cvd_slope | taker_buy% | "
+            "oi_change% | oi_price | atr_14 | last_close |"
+        )
+        sep = "|------|-------|--------------|-----------|------------|-----------|----------|--------|------------|"
+        rows = [header, sep]
+        for tf in ("5m", "15m", "1h", "4h", "1d"):
+            block = by_tf.get(tf) or {}
+            cap = block.get("capital_flow") or {}
+            deriv = block.get("derivatives") or {}
+            struct = block.get("market_structure") or {}
+            taker = cap.get("taker_buy_ratio")
+            taker_pct = (
+                f"{taker * 100:.2f}%" if isinstance(taker, (int, float)) else "-"
+            )
+            oi_chg = deriv.get("oi_change_pct")
+            oi_pct = (
+                f"{oi_chg * 100:+.3f}%"
+                if isinstance(oi_chg, (int, float))
+                else "-"
+            )
+            rows.append(
+                f"| {tf:<4} | {struct.get('trend') or '-':<7} | "
+                f"{cls._fmt(cap.get('net_flow_usd'), 0):>12} | "
+                f"{cls._fmt(cap.get('cvd_slope'), 6):>9} | "
+                f"{taker_pct:>10} | "
+                f"{oi_pct:>9} | "
+                f"{deriv.get('oi_price_relation') or '-':<9} | "
+                f"{cls._fmt(struct.get('atr_14'), 4):>6} | "
+                f"{cls._fmt(struct.get('last_close'), 4):>10} |"
+            )
+        return "\n".join(rows)
+
+    @classmethod
+    def _render_alignment(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染多周期共振指标
+        """
+        mtf = factors.get("mtf_alignment") or {}
+        votes = mtf.get("trend_votes") or {}
+        return (
+            f"trend_votes={json.dumps(votes, ensure_ascii=False)}  "
+            f"alignment_score={cls._fmt(mtf.get('alignment_score'), 3)}  "
+            f"dominant_bias={mtf.get('dominant_bias') or '-'}"
+        )
+
+    @classmethod
+    def _render_derivatives_text(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染衍生品概要（funding 全周期共享，因此抽 1h block 即可）
+        """
+        by_tf = factors.get("by_timeframe") or {}
+        deriv = ((by_tf.get("1h") or {}).get("derivatives")) or {}
+        funding = deriv.get("funding_rate_now")
+        next_settlement = deriv.get("next_settlement_at") or "-"
+        return (
+            f"funding_rate={cls._fmt(funding, 8)}（最新一次结算时间 {next_settlement}）"
+        )
+
+    @classmethod
+    def _render_liquidations_table(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染爆仓滚动窗口表
+        """
+        liq = factors.get("liquidations") or {}
+        header = "| 窗口 | long_liq(ETH) | short_liq(ETH) | imbalance | cascade |"
+        sep = "|------|----------------|-----------------|-----------|---------|"
+        rows = [header, sep]
+        for w in (5, 15, 60):
+            rows.append(
+                f"| {w}m | "
+                f"{cls._fmt(liq.get(f'long_{w}m'), 4):>14} | "
+                f"{cls._fmt(liq.get(f'short_{w}m'), 4):>15} | "
+                f"{cls._fmt(liq.get(f'imbalance_{w}m'), 3):>9} | "
+                f"{cls._fmt(liq.get('cascade_signal'))} |"
+            )
+        rows.append(
+            f"last_minute_size={cls._fmt(liq.get('last_minute_size'), 4)} "
+            f"last_hour_avg_per_min={cls._fmt(liq.get('last_hour_avg_per_min'), 4)}"
+        )
+        return "\n".join(rows)
+
+    @classmethod
+    def _render_key_levels(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染从大周期到小周期的 supports / resistances（4h / 1h / 15m）
+        """
+        by_tf = factors.get("by_timeframe") or {}
+        lines = []
+        for tf in ("4h", "1h", "15m"):
+            block = by_tf.get(tf) or {}
+            struct = block.get("market_structure") or {}
+            sup = struct.get("supports") or []
+            res = struct.get("resistances") or []
+            lines.append(
+                f"{tf}: supports={sup}  resistances={res}  "
+                f"last_close={struct.get('last_close')}"
+            )
+        return "\n".join(lines)
+
+    @classmethod
+    def _render_orderbook(cls, factors: Dict[str, Any], mtf: bool) -> str:
+        """
+        渲染最新订单簿快照（多周期模式下取 5m 那份；老模式下取顶层）
+        """
+        if mtf:
+            block = (factors.get("by_timeframe") or {}).get("5m") or {}
+            ob = block.get("orderbook") or {}
+        else:
+            ob = factors.get("orderbook") or {}
+        if not ob.get("available"):
+            return "（订单簿快照不可用）"
+        return (
+            f"best_bid={ob.get('best_bid')}  best_ask={ob.get('best_ask')}  "
+            f"spread={ob.get('spread')}  imbalance={ob.get('imbalance')}  "
+            f"bid_walls={ob.get('bid_walls')}  ask_walls={ob.get('ask_walls')}"
+        )
+
+    @classmethod
+    def _render_legacy_factor_block(cls, factors: Dict[str, Any]) -> str:
+        """
+        老聚合器模式下渲染单段因子摘要（保留回滚通道）
+        """
+        cap = factors.get("capital_flow") or {}
+        struct = factors.get("market_structure") or {}
+        return (
+            f"capital_flow={json.dumps(cap, ensure_ascii=False, default=str)}\n"
+            f"market_structure={json.dumps(struct, ensure_ascii=False, default=str)}"
+        )
+
+    @classmethod
+    def _render_legacy_derivatives(cls, factors: Dict[str, Any]) -> str:
+        """
+        老聚合器模式下渲染衍生品摘要
+        """
+        deriv = factors.get("derivatives") or {}
+        return json.dumps(deriv, ensure_ascii=False, default=str)
+
+    @classmethod
+    def _render_legacy_key_levels(cls, factors: Dict[str, Any]) -> str:
+        """
+        老聚合器模式下渲染单一窗口的关键价位
+        """
+        struct = factors.get("market_structure") or {}
+        return (
+            f"supports={struct.get('supports')}  "
+            f"resistances={struct.get('resistances')}  "
+            f"last_price={struct.get('last_price')}"
         )
 
     @staticmethod
@@ -383,17 +769,23 @@ class LLMAgent:
         # AIMessage 实例
         additional = getattr(raw_message, "additional_kwargs", None)
         if isinstance(additional, dict):
+            # 优先用 reasoning_content（DeepSeek 原生字段名 / 我们子类透传名）；
+            # 兜底再看 reasoning（部分网关/未来 langchain 升级后的别名）。
             candidates.append(additional.get("reasoning_content"))
+            candidates.append(additional.get("reasoning"))
         response_meta = getattr(raw_message, "response_metadata", None)
         if isinstance(response_meta, dict):
             candidates.append(response_meta.get("reasoning_content"))
+            candidates.append(response_meta.get("reasoning"))
 
         # dict 形态（旧版本或测试桩）
         if isinstance(raw_message, dict):
             candidates.append(raw_message.get("reasoning_content"))
+            candidates.append(raw_message.get("reasoning"))
             ak = raw_message.get("additional_kwargs")
             if isinstance(ak, dict):
                 candidates.append(ak.get("reasoning_content"))
+                candidates.append(ak.get("reasoning"))
 
         for value in candidates:
             if isinstance(value, str) and value.strip():
@@ -506,19 +898,14 @@ class LLMAgent:
                 logger.info(
                     "LLM 发起调用 -> %s（最小间隔=%ss）", symbol, self.min_interval
                 )
-                result = await self._chain.ainvoke(
-                    {
-                        "symbol": symbol,
-                        "ts": factors.get("computed_at"),
-                        "rule_bias": rule_signal.bias,
-                        "rule_confidence": rule_signal.confidence,
-                        "rule_score": round(rule_score, 4),
-                        "rule_contributions": json.dumps(rule_contributions),
-                        "factors_json": json.dumps(
-                            factors, ensure_ascii=False, default=str
-                        ),
-                    }
+                prompt_inputs = self._build_prompt_inputs(
+                    symbol=symbol,
+                    factors=factors,
+                    rule_signal=rule_signal,
+                    rule_score=rule_score,
+                    rule_contributions=rule_contributions,
                 )
+                result = await self._chain.ainvoke(prompt_inputs)
             except Exception:
                 logger.exception("LangChain 调用失败，回退到规则引擎")
                 return None
