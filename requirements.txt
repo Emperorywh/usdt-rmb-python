@@ -1,26 +1,36 @@
 # Web framework
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
+# Web 框架：FastAPI 提供 ASGI 路由与依赖注入；uvicorn 作为生产级 ASGI server。
+fastapi>=0.115.5,<0.117
+uvicorn[standard]>=0.32.1,<0.34
 
 # Config & validation
-pydantic==2.9.2
-pydantic-settings==2.6.1
-python-dotenv==1.0.1
+# 配置与校验：pydantic 2.12+ 才正式提供 Python 3.14 的 cp314 wheel，
+# pydantic-settings 跟随 pydantic 主版本，python-dotenv 用于读取 .env。
+pydantic>=2.12.0,<3
+pydantic-settings>=2.7.0,<3
+python-dotenv>=1.0.1,<2
 
 # Database (async)
-asyncpg==0.30.0
+# 异步 PostgreSQL 驱动：asyncpg 0.31.0 起才提供 Py3.14 wheel。
+asyncpg>=0.31.0,<0.32
 
 # HTTP & WebSocket
-httpx==0.27.2
-websockets==13.1
+# 异步 HTTP 与 WebSocket 客户端：用于 OKX REST 与行情 WS。
+# websockets 14+ 才有 cp314 wheel，httpx 0.27 兼容 Py3.14（纯 Python）。
+httpx>=0.27.2,<0.29
+websockets>=14.0,<16
 
 # LangChain + DeepSeek (OpenAI-compatible)
-langchain==0.3.7
-langchain-core==0.3.21
-langchain-openai==0.2.9
+# LangChain 体系：langchain-openai 走 OpenAI 兼容协议接 DeepSeek，
+# 0.3.x 系列与 pydantic 2.12+ 兼容。
+langchain>=0.3.7,<0.4
+langchain-core>=0.3.21,<0.4
+langchain-openai>=0.2.9,<0.4
 
 # Numeric
-numpy==2.1.3
+# 数值计算：numpy 2.3.2 起提供 cp314 wheel。
+numpy>=2.3.2,<3
 
 # Logging
-structlog==24.4.0
+# 结构化日志：纯 Python 实现，对解释器版本无要求。
+structlog>=24.4.0,<26

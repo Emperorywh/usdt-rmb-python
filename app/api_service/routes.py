@@ -48,13 +48,17 @@ async def get_factors(
 @router.get("/signal", tags=["signal"])
 async def get_signal(
     symbol: Optional[str] = Query(default=None),
+    include_reasoning: bool = Query(
+        default=False,
+        description="是否返回思考模式下的 reasoning_content 原文（可能很长）",
+    ),
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
     sym = _resolve_symbol(symbol, container)
     row = await container.repos.fetch_latest_signal(sym)
     if not row:
         raise HTTPException(status_code=404, detail="No signal yet, try /signal/refresh")
-    return {
+    payload: Dict[str, Any] = {
         "timestamp": row["ts"].isoformat(),
         "symbol": row["symbol"],
         "source": row["source"],
@@ -66,22 +70,38 @@ async def get_signal(
             "suggestion": row["suggestion"],
         },
         "factors": row["factors"],
+        # 仅暴露"是否存在思维链"作为元信息；具体内容只在显式请求时返回，
+        # 避免默认响应被一两万字的思维链撑爆带宽与日志。
+        "reasoning_available": bool(row.get("reasoning_content")),
     }
+    if include_reasoning:
+        payload["reasoning_content"] = row.get("reasoning_content")
+    return payload
 
 
 @router.post("/signal/refresh", tags=["signal"])
 async def refresh_signal(
     symbol: Optional[str] = Query(default=None),
+    include_reasoning: bool = Query(
+        default=False,
+        description="是否返回本次 LLM 的 reasoning_content 原文（可能很长）",
+    ),
     container: AppContainer = Depends(get_container),
     signal_service: SignalService = Depends(get_signal_service),
 ) -> Dict[str, Any]:
     sym = _resolve_symbol(symbol, container)
     result = await signal_service.generate(sym)
-    return {
+    payload: Dict[str, Any] = {
         "timestamp": result["factors"]["computed_at"],
         "symbol": sym,
         "source": result["source"],
         "signal": result["signal"],
         "rule_signal": result["rule_signal"],
         "rule_score": result["rule_score"],
+        # 注意：persisted=False 时 reasoning_content 不会进入 DB（纯规则引擎路径）
+        "persisted": result["persisted"],
+        "reasoning_available": result["reasoning_content"] is not None,
     }
+    if include_reasoning:
+        payload["reasoning_content"] = result["reasoning_content"]
+    return payload

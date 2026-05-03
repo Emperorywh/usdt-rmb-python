@@ -1,4 +1,4 @@
-"""Derivatives factors: funding rate level + open interest change."""
+"""衍生品因子：资金费率水平 + 持仓量变动百分比。"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -8,16 +8,27 @@ def compute_derivatives_factors(
     funding: Optional[Dict[str, Any]],
     oi_history: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Combine the latest funding rate and an OI history list.
-
-    ``oi_history`` should be ordered ascending by ``ts``. We compute the
-    percentage change between the first and last sample in the window.
+    """
+    计算衍生品因子
+    -------------------------------------------------------------------
+    参数：
+        funding:    funding_rates 表里最近一条记录，可空。
+        oi_history: open_interest 表里按 ``ts`` 升序排列的样本列表。
+                    会用首尾两点的差值计算 OI 变动百分比。
+    返回：
+        含有以下键的因子 dict：
+            funding_rate:        最新资金费率（小数表示）
+            next_settlement_at:  下次资金费率结算时间（ISO 字符串），
+                                 是结算时间而非"下次费率值"，仅供参考
+            oi_first / oi_last:  窗口首尾两个 OI 样本
+            oi_change_pct:       OI 在窗口内的相对变动
+            oi_samples:          窗口内的 OI 样本数
     """
     funding_rate: Optional[float] = None
-    next_funding_ts = None
+    next_settlement_at = None
     if funding:
         funding_rate = float(funding.get("funding_rate") or 0.0)
-        next_funding_ts = funding.get("next_funding_ts")
+        next_settlement_at = funding.get("next_funding_ts")
 
     oi_first: Optional[float] = None
     oi_last: Optional[float] = None
@@ -30,7 +41,10 @@ def compute_derivatives_factors(
 
     return {
         "funding_rate": funding_rate,
-        "next_funding_ts": next_funding_ts.isoformat() if next_funding_ts else None,
+        # 下次资金费率结算时间（不是"下次费率值"），改名避免 LLM 误解
+        "next_settlement_at": (
+            next_settlement_at.isoformat() if next_settlement_at else None
+        ),
         "oi_first": oi_first,
         "oi_last": oi_last,
         "oi_change_pct": oi_change_pct,

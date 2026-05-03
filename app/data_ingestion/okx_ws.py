@@ -1,9 +1,16 @@
 """OKX V5 public WebSocket client.
 
-Channels subscribed: ``trades``, ``books5``, ``tickers``. Funding rate / OI are
-also broadcast on the public WS via ``funding-rate`` and ``open-interest``
-channels which we subscribe to as well, freeing the REST poller to serve as a
-recovery path.
+Channels subscribed: ``trades``, ``books5``, ``tickers``.
+
+Funding rate / open interest are intentionally NOT subscribed on the WS:
+they update slowly (funding settles every 8 h, OI updates every few seconds
+with mostly identical values), so polling the REST endpoint once per minute
+is cheaper and avoids duplicate writes against the unique-keyed tables.
+
+Trade ``size`` and orderbook ``size`` come back from OKX in *contracts*
+(张) for SWAP / FUTURES. We multiply by ``ct_val`` (contract face value)
+on emission so downstream factor / signal code consistently sees the
+quantity in the base currency (e.g. ETH).
 
 Auto-reconnects with exponential backoff; sends ``ping`` every 25 s to keep the
 connection alive (OKX disconnects idle sockets after ~30 s).
@@ -30,26 +37,70 @@ def _ms_to_dt(ms: str | int) -> datetime:
 
 
 class OKXWebSocketClient(ExchangeWebSocketClient):
+    """
+    OKX V5 公共行情 WebSocket 客户端
+    ---------------------------------------------------------------
+    职责：
+        - 订阅 trades / books5 / tickers 三个频道，输出标准化事件流。
+        - 不订阅 funding-rate / open-interest，这两类数据由 REST 60s 轮询。
+        - 把交易所推送中的 sz（合约张数）按 contract_values[symbol]
+          换算成基础币种数量（如 ETH），统一全链路单位。
+    """
+
     name = "okx"
 
-    def __init__(self, ws_url: str, symbols: List[str], depth: int = 5):
+    def __init__(
+        self,
+        ws_url: str,
+        symbols: List[str],
+        depth: int = 5,
+        contract_values: Optional[Dict[str, float]] = None,
+        default_contract_value: float = 1.0,
+    ):
+        """
+        构造函数
+        ---------------------------------------------------------------
+        参数：
+            ws_url:                 OKX 公共 WS 地址
+            symbols:                需要订阅的 symbol 列表
+            depth:                  订单簿深度（<=5 用 books5，否则 books）
+            contract_values:        {symbol: ctVal} 合约面值映射，可空
+            default_contract_value: 在 contract_values 中找不到时使用的兜底值
+        """
         self.ws_url = ws_url
         self.symbols = symbols
         self.depth = depth
+        self._contract_values: Dict[str, float] = dict(contract_values or {})
+        self._default_ct_val = float(default_contract_value)
         self._stop = asyncio.Event()
+
+    def _ct_val(self, symbol: str) -> float:
+        """
+        获取指定 symbol 的合约面值
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+        返回：
+            ctVal（每张合约对应多少基础币种），找不到时返回默认值。
+        """
+        return self._contract_values.get(symbol, self._default_ct_val)
 
     def subscribe_symbols(self) -> List[str]:
         return list(self.symbols)
 
     def _build_subscribe_args(self) -> List[Dict[str, str]]:
+        """
+        构造订阅参数列表
+        ---------------------------------------------------------------
+        说明：
+            funding-rate / open-interest 不再订阅，由 REST 轮询负责。
+        """
         args: List[Dict[str, str]] = []
         books_channel = "books5" if self.depth <= 5 else "books"
         for sym in self.symbols:
             args.append({"channel": "trades", "instId": sym})
             args.append({"channel": books_channel, "instId": sym})
             args.append({"channel": "tickers", "instId": sym})
-            args.append({"channel": "funding-rate", "instId": sym})
-            args.append({"channel": "open-interest", "instId": sym})
         return args
 
     async def stop(self) -> None:
@@ -134,28 +185,38 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         if not channel or not data:
             return
 
+        ct_val = self._ct_val(symbol) if symbol else self._default_ct_val
+
         if channel == "trades":
             for item in data:
+                # OKX SWAP / FUTURES 推送中 sz 单位是张数，乘以 ctVal 转成基础币种
                 yield {
                     "type": "trade",
                     "exchange": self.name,
                     "symbol": symbol,
                     "ts": _ms_to_dt(item["ts"]),
                     "price": float(item["px"]),
-                    "size": float(item["sz"]),
+                    "size": float(item["sz"]) * ct_val,
                     "side": item["side"],
                     "trade_id": item.get("tradeId"),
                 }
         elif channel in ("books5", "books"):
             for item in data:
+                # 同上：盘口每档 size 也按 ctVal 换算成基础币种数量
                 yield {
                     "type": "orderbook",
                     "exchange": self.name,
                     "symbol": symbol,
                     "ts": _ms_to_dt(item["ts"]),
                     # OKX format: [price, size, liquidated_orders, num_orders]
-                    "bids": [[float(b[0]), float(b[1])] for b in item.get("bids", [])],
-                    "asks": [[float(a[0]), float(a[1])] for a in item.get("asks", [])],
+                    "bids": [
+                        [float(b[0]), float(b[1]) * ct_val]
+                        for b in item.get("bids", [])
+                    ],
+                    "asks": [
+                        [float(a[0]), float(a[1]) * ct_val]
+                        for a in item.get("asks", [])
+                    ],
                 }
         elif channel == "tickers":
             for item in data:
@@ -168,25 +229,4 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
                     "bid": float(item.get("bidPx") or 0) or None,
                     "ask": float(item.get("askPx") or 0) or None,
                 }
-        elif channel == "funding-rate":
-            for item in data:
-                yield {
-                    "type": "funding_rate",
-                    "exchange": self.name,
-                    "symbol": symbol,
-                    "ts": _ms_to_dt(item["ts"]),
-                    "funding_rate": float(item["fundingRate"]),
-                    "next_funding_ts": _ms_to_dt(item["nextFundingTime"])
-                    if item.get("nextFundingTime")
-                    else None,
-                }
-        elif channel == "open-interest":
-            for item in data:
-                yield {
-                    "type": "open_interest",
-                    "exchange": self.name,
-                    "symbol": symbol,
-                    "ts": _ms_to_dt(item["ts"]),
-                    "oi": float(item.get("oi") or 0),
-                    "oi_ccy": float(item.get("oiCcy") or 0) or None,
-                }
+        # funding-rate / open-interest 故意不在 WS 消费，统一交给 REST 轮询。

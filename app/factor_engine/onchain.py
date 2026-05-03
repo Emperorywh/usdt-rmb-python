@@ -1,10 +1,26 @@
-"""On-chain factor calculation: thin transformation layer."""
+"""链上因子计算：薄薄一层数据转换。
+
+说明：
+    当前未启用。FactorAggregator 已经停止调用本函数，
+    等接入真实链上数据源（Glassnode / Nansen / Etherscan 等）
+    并恢复 ingestion 端写入后再启用。
+"""
+# TODO: 等真实链上数据源接入后再启用
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
 
 def compute_onchain_factors(latest: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    链上因子转换函数（当前未启用）
+    -------------------------------------------------------------------
+    参数：
+        latest: ``onchain_metrics`` 表中最近一行的 dict，可空。
+    返回：
+        一个固定结构的因子 dict，包含交易所净流出、巨鲸交易数、
+        gas 费用、销毁速率等关键链上指标。
+    """
     if not latest:
         return {
             "available": False,
