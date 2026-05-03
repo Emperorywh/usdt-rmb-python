@@ -520,6 +520,227 @@ class Repositories:
             )
         return dict(row) if row else None
 
+    # ------------------------------------------------------------------
+    # orderbook_metrics（P1 新增 - 订单簿时序）
+    # ------------------------------------------------------------------
+    async def insert_orderbook_metric(
+        self,
+        exchange: str,
+        symbol: str,
+        ts: datetime,
+        metric: Dict[str, Any],
+    ) -> None:
+        """
+        写入一条订单簿时序指标
+        --------------------------------------------------------------
+        参数：
+            exchange : 交易所标识，如 'okx'
+            symbol   : 合约代码
+            ts       : 指标时间戳（来自 WS 推送）
+            metric   : 已经聚合好的指标 dict，键见 SQL VALUES 列表
+        说明：
+            - UNIQUE(exchange, symbol, ts) + ON CONFLICT DO NOTHING：
+              10s 节流粒度下 ts 天然去重；偶发重复写入直接吞掉。
+            - 走 db.run_with_retry，瞬时连接错误自动指数退避。
+            - 单行 < 100 字节，比写 orderbook_snapshots（~2KB JSONB）轻得多。
+        """
+
+        async def _do() -> None:
+            async with self.db.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO orderbook_metrics
+                        (exchange, symbol, ts, imbalance,
+                         bid_qty, ask_qty,
+                         top5_bid_notional, top5_ask_notional,
+                         bid_wall_count, ask_wall_count,
+                         spread_bp, mid_price)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    ON CONFLICT (exchange, symbol, ts) DO NOTHING
+                    """,
+                    exchange,
+                    symbol,
+                    ts,
+                    _to_dec(metric.get("imbalance")),
+                    _to_dec(metric.get("bid_qty")),
+                    _to_dec(metric.get("ask_qty")),
+                    _to_dec(metric.get("top5_bid_notional")),
+                    _to_dec(metric.get("top5_ask_notional")),
+                    int(metric.get("bid_wall_count") or 0),
+                    int(metric.get("ask_wall_count") or 0),
+                    _to_dec(metric.get("spread_bp")),
+                    _to_dec(metric.get("mid_price")),
+                )
+
+        await self.db.run_with_retry(_do, op_name="insert_orderbook_metric")
+
+    async def fetch_orderbook_metrics_since(
+        self,
+        symbol: str,
+        since: datetime,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """
+        读取 [since, now] 内的订单簿时序指标（按 ts 升序返回）
+        --------------------------------------------------------------
+        参数：
+            symbol : 合约代码
+            since  : 起始 UTC 时间（含）
+            limit  : 防御性上限，避免长时间历史误传爆查询
+        返回：
+            按 ts 升序的 dict 列表；字段与 insert_orderbook_metric 对齐。
+        说明：
+            - 走 idx_orderbook_metrics_symbol_ts (symbol, ts DESC) 索引；
+              15 分钟窗口下 ~90 行，1 小时基线 ~360 行，单次扫描 < 5ms。
+        """
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ts, imbalance, bid_qty, ask_qty,
+                       top5_bid_notional, top5_ask_notional,
+                       bid_wall_count, ask_wall_count,
+                       spread_bp, mid_price
+                FROM orderbook_metrics
+                WHERE symbol = $1 AND ts >= $2
+                ORDER BY ts ASC
+                LIMIT $3
+                """,
+                symbol,
+                since,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def delete_orderbook_metrics_older_than(self, cutoff: datetime) -> int:
+        """
+        删除 ts < cutoff 的 orderbook_metrics 行
+        --------------------------------------------------------------
+        参数：
+            cutoff: 截止时间（UTC datetime）
+        返回：
+            被删除的行数
+        说明：
+            与 orderbook_snapshots 的清理逻辑一致；P1 升级在
+            retention 任务里追加该表，沿用 orderbook 保留时长。
+        """
+        async with self.db.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM orderbook_metrics WHERE ts < $1",
+                cutoff,
+            )
+        return _parse_delete_count(result)
+
+    # ------------------------------------------------------------------
+    # position_ratios（P1 新增 - 散户/精英多空比）
+    # ------------------------------------------------------------------
+    async def insert_position_ratios(self, rows: Sequence[Dict[str, Any]]) -> int:
+        """
+        批量写入持仓比（散户多空 / 精英持仓比）
+        --------------------------------------------------------------
+        参数：
+            rows: 每条字段需包含
+                exchange / symbol / ts / ratio_type /
+                long_ratio / short_ratio / ratio
+        返回：
+            尝试入库的行数
+        说明：
+            - 复合唯一键 (exchange, symbol, ts, ratio_type) +
+              ON CONFLICT DO NOTHING；同一周期 + 同一维度只保留一条。
+            - 拉取失败 → 返回 0 行；本方法对空 rows 也安全（早返）。
+        """
+        if not rows:
+            return 0
+        records = [
+            (
+                r["exchange"],
+                r["symbol"],
+                r["ts"],
+                r["ratio_type"],
+                _to_dec(r.get("long_ratio")),
+                _to_dec(r.get("short_ratio")),
+                _to_dec(r.get("ratio")),
+            )
+            for r in rows
+        ]
+
+        async def _do() -> None:
+            async with self.db.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO position_ratios
+                        (exchange, symbol, ts, ratio_type,
+                         long_ratio, short_ratio, ratio)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (exchange, symbol, ts, ratio_type) DO NOTHING
+                    """,
+                    records,
+                )
+
+        await self.db.run_with_retry(_do, op_name="insert_position_ratios")
+        return len(records)
+
+    async def fetch_latest_position_ratios(
+        self, symbol: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        读取每个 ratio_type 维度下"最新一条"持仓比
+        --------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+        返回：
+            {ratio_type: {ts, long_ratio, short_ratio, ratio}}
+            找不到时该 ratio_type 不会出现在返回字典里。
+        说明：
+            - 用 DISTINCT ON 让 PG 在索引上"每组取首条"，单次 < 5ms。
+            - 因子层依赖最新值即可，不再读历史序列。
+        """
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (ratio_type)
+                       ratio_type, ts, long_ratio, short_ratio, ratio
+                FROM position_ratios
+                WHERE symbol = $1
+                ORDER BY ratio_type, ts DESC
+                """,
+                symbol,
+            )
+        return {r["ratio_type"]: dict(r) for r in rows}
+
+    # ------------------------------------------------------------------
+    # funding_rates 历史读取（P1 新增 - 7 天分位数）
+    # ------------------------------------------------------------------
+    async def fetch_funding_rates_since(
+        self, symbol: str, since: datetime, limit: int = 20000
+    ) -> List[Dict[str, Any]]:
+        """
+        读取 [since, now] 内的资金费率历史（升序）
+        --------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+            since:  起始 UTC 时间（含）
+            limit:  防御性上限；7 天 × WS+REST ≈ 几百到几千行
+        返回：
+            按 ts 升序的 dict 列表，键含 ts / funding_rate
+        说明：
+            - 用于 derivatives 因子的 funding_rate_pct_rank_7d 分位数计算。
+            - 走 idx_funding_symbol_ts，单次扫描 < 30ms。
+        """
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ts, funding_rate
+                FROM funding_rates
+                WHERE symbol = $1 AND ts >= $2
+                ORDER BY ts ASC
+                LIMIT $3
+                """,
+                symbol,
+                since,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
     async def fetch_trades_in_window(
         self,
         symbol: str,

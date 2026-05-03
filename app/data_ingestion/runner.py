@@ -33,6 +33,7 @@ from app.data_ingestion.base import (
 )
 from app.data_ingestion.okx_rest import CircuitOpenError
 from app.data_storage.repositories import Repositories
+from app.factor_engine.orderbook import compute_orderbook_metric_row
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -83,6 +84,9 @@ class IngestionRunner:
         self._stopping = asyncio.Event()
         # 订单簿节流用：记录每个 symbol 最近一次成功落库的单调时钟时间戳
         self._last_orderbook_write: Dict[str, float] = {}
+        # P1：orderbook_metrics 写入节流（独立于 orderbook_snapshots）
+        # 用 monotonic 时钟，键是 symbol，值是上一次成功写入的时刻
+        self._last_orderbook_metric_write: Dict[str, float] = {}
         # WS 通道健康度：记录每个 (symbol, kind) 最近一次成功收到推送的
         # 单调时钟时间戳；REST watchdog 用它判断是否需要兜底拉一次。
         # kind 取值：'trade' / 'orderbook' / 'funding_rate' / 'open_interest'
@@ -119,6 +123,15 @@ class IngestionRunner:
         # REST 不再无脑 60s 轮询，改成 stale-watchdog：仅当 WS 长时间没有
         # 推送对应频道时才发一次 REST 兜底，降低对外网请求频率。
         self._tasks.append(asyncio.create_task(self._run_rest_watchdog(), name="rest-watchdog"))
+        # P1：持仓比 REST 轮询任务（与主行情链路完全解耦）
+        # 关闭开关 / 没配置 settings 字段时不启动，跳过即可保留 P0 行为。
+        if bool(getattr(self.settings, "enable_position_ratios", False)):
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_position_ratios_poller(),
+                    name="position-ratios-poller",
+                )
+            )
         # 数据保留清理任务：retention_run_interval_seconds <= 0 时彻底关闭。
         # 不启动该任务时高频表会无限增长，仅在外部已有清理脚本时才允许关闭。
         if int(getattr(self.settings, "retention_run_interval_seconds", 0) or 0) > 0:
@@ -191,15 +204,41 @@ class IngestionRunner:
             elif etype == "orderbook":
                 # 即便被节流丢弃，也要标记"通道是活的"，避免 watchdog 误判
                 self._mark_ws_event(symbol, "orderbook")
-                if not self._should_write_orderbook(event["symbol"]):
-                    return
-                await self.repos.insert_orderbook(
-                    exchange=event["exchange"],
-                    symbol=event["symbol"],
-                    ts=event["ts"],
-                    bids=event["bids"],
-                    asks=event["asks"],
-                )
+                # P0 路径：原始 bids/asks 快照入 orderbook_snapshots（5s 节流）
+                if self._should_write_orderbook(event["symbol"]):
+                    await self.repos.insert_orderbook(
+                        exchange=event["exchange"],
+                        symbol=event["symbol"],
+                        ts=event["ts"],
+                        bids=event["bids"],
+                        asks=event["asks"],
+                    )
+                # P1 路径：独立的 orderbook_metrics 时序指标（默认 10s 节流）
+                # 任一计算 / 落库失败都只记 warn，不影响 P0 主路径。
+                if (
+                    bool(getattr(self.settings, "enable_orderbook_timeseries", False))
+                    and self._should_write_orderbook_metric(event["symbol"])
+                ):
+                    try:
+                        metric = compute_orderbook_metric_row(
+                            snapshot=event,
+                            wall_multiplier=float(
+                                self.settings.liquidity_wall_multiplier
+                            ),
+                            top_n=int(self.settings.orderbook_depth),
+                        )
+                        await self.repos.insert_orderbook_metric(
+                            exchange=event["exchange"],
+                            symbol=event["symbol"],
+                            ts=event["ts"],
+                            metric=metric,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "orderbook_metrics 计算/落库失败 symbol=%s",
+                            event.get("symbol"),
+                            exc_info=True,
+                        )
             elif etype == "funding_rate":
                 await self.repos.insert_funding_rate(
                     exchange=event["exchange"],
@@ -266,6 +305,34 @@ class IngestionRunner:
                 "last_event_at": self._last_ws_event_iso.get((symbol, kind)),
             }
         return out
+
+    def _should_write_orderbook_metric(self, symbol: str) -> bool:
+        """
+        判断 orderbook_metrics 是否到达可以写入的最小间隔
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+        返回：
+            True - 距上次写入已经超过 P1 节流阈值；
+            False - 太密集，丢弃本次。
+        说明：
+            - 与 _should_write_orderbook 完全独立：
+              orderbook_snapshots 5s 节流是历史快照存储，
+              orderbook_metrics 10s 节流是给因子层做时序回归用，
+              两者任意一个落库失败都不影响另一个。
+            - 单调时钟，避免系统时间跳变。
+        """
+        min_interval = float(
+            getattr(self.settings, "orderbook_metrics_min_interval_seconds", 0.0) or 0.0
+        )
+        if min_interval <= 0:
+            return True
+        now = time.monotonic()
+        last = self._last_orderbook_metric_write.get(symbol, 0.0)
+        if now - last < min_interval:
+            return False
+        self._last_orderbook_metric_write[symbol] = now
+        return True
 
     def _should_write_orderbook(self, symbol: str) -> bool:
         """
@@ -571,6 +638,10 @@ class IngestionRunner:
              self.repos.delete_orderbook_older_than),
             ("signals", int(self.settings.retention_signals_seconds),
              self.repos.delete_signals_older_than),
+            # P1：orderbook_metrics 与 orderbook_snapshots 共享保留时长，
+            # 单行更小（< 100 字节），但样本更密集（10s 一行），同样需要清理。
+            ("orderbook_metrics", int(self.settings.retention_orderbook_seconds),
+             self.repos.delete_orderbook_metrics_older_than),
         )
         for table, retain_seconds, deleter in targets:
             if retain_seconds <= 0:
@@ -598,6 +669,91 @@ class IngestionRunner:
                     exc.__class__.__name__,
                     exc,
                 )
+
+    # ------------------------------------------------------------------
+    # P1：持仓比 REST 轮询
+    # ------------------------------------------------------------------
+    async def _run_position_ratios_poller(self) -> None:
+        """
+        OKX rubik 持仓比轮询任务
+        ---------------------------------------------------------------
+        说明：
+            - 每 ``settings.position_ratios_poll_interval_seconds`` 秒为
+              每个 symbol 拉取 3 类持仓比并落库（散户币种 / 散户合约 / 精英持仓）。
+            - 全部走 ExchangeRestClient 自带的熔断 + 退避；连续失败到阈值
+              会被 circuit breaker 自动停一阵，本任务无须额外退避。
+            - 任何一次失败只 warn 不抛，不影响下一轮拉取与主行情链路。
+            - 启动后先等一个 grace 周期再开跑，避免冷启动瞬间 REST 抖动。
+        """
+        rest = self.rest_client
+        # 用 hasattr 兜底兼容旧版 REST 客户端（没接 P1 接口时跳过）
+        fetchers: List[Tuple[str, Callable[[str], Awaitable[List[Dict[str, Any]]]]]] = []
+        for fname, label in (
+            ("fetch_long_short_account_ratio", "account"),
+            ("fetch_long_short_account_ratio_contract", "account_contract"),
+            ("fetch_top_trader_position_ratio", "top_trader_position"),
+        ):
+            fn = getattr(rest, fname, None)
+            if callable(fn):
+                fetchers.append((label, fn))
+        if not fetchers:
+            logger.warning(
+                "REST 客户端不支持 P1 持仓比接口，position-ratios-poller 退出"
+            )
+            return
+
+        interval = max(60, int(self.settings.position_ratios_poll_interval_seconds))
+        period = str(getattr(self.settings, "position_ratios_period", "5m"))
+        logger.info(
+            "持仓比轮询启动：每 %ds，period=%s，symbols=%s",
+            interval,
+            period,
+            list(self.settings.symbols),
+        )
+        # 初始 grace：与 REST watchdog 一样给 30s 让连接池起来
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            while not self._stopping.is_set():
+                for symbol in self.settings.symbols:
+                    for label, fn in fetchers:
+                        try:
+                            rows = await fn(symbol, period=period)
+                        except CircuitOpenError:
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "持仓比拉取失败 %s/%s：%s",
+                                symbol,
+                                label,
+                                exc.__class__.__name__,
+                            )
+                            continue
+                        if rows:
+                            try:
+                                await self.repos.insert_position_ratios(rows)
+                                logger.debug(
+                                    "持仓比已落库 %s/%s：%d 行",
+                                    symbol,
+                                    label,
+                                    len(rows),
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "持仓比入库失败 %s/%s",
+                                    symbol,
+                                    label,
+                                    exc_info=True,
+                                )
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
 
     async def _run_onchain_poller(self) -> None:
         """

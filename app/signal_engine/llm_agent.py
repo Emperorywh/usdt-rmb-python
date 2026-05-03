@@ -138,8 +138,9 @@ class LLMAnalysisResult:
 
 SYSTEM_PROMPT = """\
 你是一名资深加密衍生品量化交易分析师。系统会给你一份多周期因子矩阵
-（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口以及多周期
-关键价位列表。
+（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口、多周期关键价位列表，
+以及（P1 升级新增）：market regime（市场状态）、流动性地图、订单簿时序指标、
+散户/精英多空比。
 
 请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为
 完整可执行的交易计划。该信号仅作交易建议，不会被自动下单。
@@ -187,6 +188,22 @@ SYSTEM_PROMPT = """\
   "似乎"等模糊表述。
 - suggestion 字段为面向用户的简体中文建议段落，文末必须注明
   "仅供参考，不构成交易指令"。
+
+【P1 强约束（必须严格遵守）】
+1) 当 regime=ranging 时禁止给 trending 仓位建议：必须降为 neutral，
+   或在最近 supports/resistances 之间做"区间策略"，并把
+   position_size_pct ≤ 0.05；reason 必须显式提到 "regime=ranging"。
+2) 当 regime=breakout 或 regime=breakdown 时，stop_loss 必须放在
+   "被突破的结构位另一侧"（breakout → SL 放在被刺破的 swing high 下方少量
+   buffer；breakdown → SL 放在被刺破的 swing low 上方）。
+3) 当 retail_vs_smart_divergence='bearish_warning' 时（散户狂多 + 精英反向）：
+   confidence ≤ 0.6；risk 字段必须明确写出"散户/精英背离风险"。
+   bullish_warning 同理处理（不准盲目追多）。
+4) 当 funding_extreme='long_squeeze_risk' 且 bias='long' 时，confidence ≤ 0.5；
+   反之 'short_squeeze_risk' + bias='short' 同理。
+5) 当 liquidity_vacuum_above=true 且 bias='long' 时，take_profit 至少
+   一档要落在"上方流动性池中第一档 strong/medium 节点"附近 ±0.3% 范围内；
+   vacuum_below + 'short' 同理。
 """
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -228,6 +245,18 @@ HUMAN_PROMPT = """\
 
 ===== 订单簿快照（最新一次，跨周期共享）=====
 {orderbook_text}
+
+===== 市场状态 =====
+{regime_text}
+
+===== 订单簿动态 =====
+{orderbook_dynamic_text}
+
+===== 主力 / 散户 =====
+{position_ratios_text}
+
+===== 流动性地图 =====
+{liquidity_text}
 
 请输出完整的 TradingSignal JSON，必须包含：
 bias / confidence / reason / risk / suggestion / entry_zone /
@@ -394,11 +423,97 @@ class LLMAgent:
     @property
     def min_interval(self) -> int:
         """
-        LLM 调用最小间隔（秒）。
+        LLM 调用最小间隔（秒）—— P0 静态版，作为自适应节流的兜底
         --------------------------------------------------------------
         从 settings 读取，方便单元测试通过 monkeypatch 修改 settings 调整。
+        compute_min_interval(factors) 抛任何异常时统一回退到该值。
         """
         return max(0, int(self.settings.llm_min_interval_seconds))
+
+    def compute_min_interval(self, factors: Optional[Dict[str, Any]]) -> int:
+        """
+        P1 自适应 LLM 节流：根据当前因子矩阵动态计算下一次允许调用的最小间隔
+        --------------------------------------------------------------
+        参数：
+            factors: FactorAggregator.compute 的输出（多周期模式）；
+                     None 或老格式时直接走兜底
+        返回：
+            建议的 min_interval 秒数；失败 / 关闭时回退到 self.min_interval
+        规则（与 P1 提示词同源）：
+            volatility_ratio = atr_5m × 12 / atr_1h
+                （把 5m ATR 折算到 1h 尺度后与 1h ATR 比较，> 1 表示 5 分钟波动异常放大）
+            volatility_ratio >= 1.5 或 regime ∈ {breakout, breakdown} → 180s（3 分钟）
+            volatility_ratio >= 1.2 或 |alignment_score| >= 0.75      → 600s（10 分钟）
+            其他                                                      → 1800s（30 分钟）
+        上下限通过 settings.llm_min_interval_seconds_min/max 钳制。
+        """
+        # 关闭开关：直接回退到 P0 静态节流
+        if not bool(getattr(self.settings, "enable_adaptive_throttle", False)):
+            return self.min_interval
+        try:
+            base_default = int(self.min_interval) if self.min_interval > 0 else 1800
+            lo = int(getattr(self.settings, "llm_min_interval_seconds_min", 180))
+            hi = int(getattr(self.settings, "llm_min_interval_seconds_max", 1800))
+            if not factors or not isinstance(factors, dict):
+                return self._clamp_interval(base_default, lo, hi)
+
+            by_tf = factors.get("by_timeframe") or {}
+            ms_5m = ((by_tf.get("5m") or {}).get("market_structure")) or {}
+            ms_1h = ((by_tf.get("1h") or {}).get("market_structure")) or {}
+            atr_5m = ms_5m.get("atr_14")
+            atr_1h = ms_1h.get("atr_14")
+            volatility_ratio: Optional[float] = None
+            try:
+                if atr_5m is not None and atr_1h is not None and float(atr_1h) > 0:
+                    volatility_ratio = float(atr_5m) * 12.0 / float(atr_1h)
+            except (TypeError, ValueError):
+                volatility_ratio = None
+
+            regime = factors.get("regime")
+            mtf = factors.get("mtf_alignment") or {}
+            try:
+                alignment_score = abs(float(mtf.get("alignment_score") or 0.0))
+            except (TypeError, ValueError):
+                alignment_score = 0.0
+
+            if (volatility_ratio is not None and volatility_ratio >= 1.5) or regime in (
+                "breakout",
+                "breakdown",
+            ):
+                interval = 180
+            elif (
+                volatility_ratio is not None and volatility_ratio >= 1.2
+            ) or alignment_score >= 0.75:
+                interval = 600
+            else:
+                interval = 1800
+
+            clamped = self._clamp_interval(interval, lo, hi)
+            logger.debug(
+                "自适应 LLM 节流：volatility_ratio=%s regime=%s alignment=%.3f → %ds (clamped to %ds)",
+                ("%.3f" % volatility_ratio) if volatility_ratio is not None else "-",
+                regime,
+                alignment_score,
+                interval,
+                clamped,
+            )
+            return clamped
+        except Exception:
+            logger.warning(
+                "compute_min_interval 计算失败，回退到 P0 默认 %ds",
+                self.min_interval,
+                exc_info=True,
+            )
+            return self.min_interval
+
+    @staticmethod
+    def _clamp_interval(interval: int, lo: int, hi: int) -> int:
+        """
+        把建议节流秒数钳制到 [lo, hi]
+        """
+        if lo > hi:
+            lo, hi = hi, lo
+        return int(max(lo, min(int(interval), hi)))
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
         """
@@ -414,28 +529,36 @@ class LLMAgent:
         return lock
 
     async def _load_recent_judgment(
-        self, symbol: str
+        self,
+        symbol: str,
+        min_interval: Optional[int] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         若指定 symbol 在节流窗口内已有 LLM 判断（落在 signals 表里），
         则把它重建成 LLMAnalysisResult 返回；否则返回 None 让上层调用 LLM。
         --------------------------------------------------------------
+        参数：
+            symbol:       合约代码
+            min_interval: P1 自适应节流窗口（秒）。None 时回退到 self.min_interval。
         步骤：
-            1) ``min_interval <= 0``：节流关闭，直接返回 None（每次都真调）。
+            1) ``effective_interval <= 0``：节流关闭，直接返回 None（每次都真调）。
             2) 查 signals 表里该 symbol 最近一条记录的 ts；
                表为空则视为未节流，让上层去打 LLM。
             3) 计算 ``now - ts``；
-               - ``< min_interval``：节流命中，把那一行的 bias / confidence
+               - ``< effective_interval``：节流命中，把那一行的 bias / confidence
                  / reason / risk / suggestion / reasoning_content 重建成
                  LLMAnalysisResult，并把 ``from_cache`` 置 True 返回。
                  service 层据此跳过本次入库，避免重复行。
-               - ``>= min_interval``：节流过期，返回 None。
+               - ``>= effective_interval``：节流过期，返回 None。
         异常处理：
             DB 查询失败时（如连接被 reset），不应阻塞 LLM 调用；记一行
             warning 后返回 None，让上层退化为"直接打 LLM"——成本上界仍是
-            min_interval，最差也只是少一次节流命中。
+            effective_interval，最差也只是少一次节流命中。
         """
-        if self.min_interval <= 0:
+        effective_interval = (
+            int(min_interval) if min_interval is not None else self.min_interval
+        )
+        if effective_interval <= 0:
             return None
         try:
             row = await self.repos.fetch_latest_signal_judgment(symbol)
@@ -458,7 +581,7 @@ class LLMAgent:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
 
         elapsed = (datetime.now(timezone.utc) - last_ts).total_seconds()
-        if elapsed >= self.min_interval:
+        if elapsed >= effective_interval:
             return None
 
         try:
@@ -490,12 +613,13 @@ class LLMAgent:
             )
             return None
 
-        remaining = self.min_interval - elapsed
+        remaining = effective_interval - elapsed
         logger.info(
-            "LLM 数据库节流命中 %s（已过 %.0fs，下次调用还需 %.0fs）",
+            "LLM 数据库节流命中 %s（已过 %.0fs，下次调用还需 %.0fs，min_interval=%ds）",
             symbol,
             elapsed,
             remaining,
+            effective_interval,
         )
         return LLMAnalysisResult(
             signal=cached_signal,
@@ -538,6 +662,10 @@ class LLMAgent:
             liquidations_table = self._render_liquidations_table(factors)
             key_levels_text = self._render_key_levels(factors)
             orderbook_text = self._render_orderbook(factors, mtf=True)
+            regime_text = self._render_regime(factors)
+            orderbook_dynamic_text = self._render_orderbook_dynamic(factors)
+            position_ratios_text = self._render_position_ratios(factors)
+            liquidity_text = self._render_liquidity(factors)
         else:
             mtf_factor_table = self._render_legacy_factor_block(factors)
             mtf_alignment_text = "（老聚合器模式：未提供多周期共振）"
@@ -545,6 +673,10 @@ class LLMAgent:
             liquidations_table = "（老聚合器模式：未提供爆仓窗口）"
             key_levels_text = self._render_legacy_key_levels(factors)
             orderbook_text = self._render_orderbook(factors, mtf=False)
+            regime_text = "regime: -（老聚合器模式不提供 regime）"
+            orderbook_dynamic_text = "（老聚合器模式：未提供订单簿时序）"
+            position_ratios_text = "（老聚合器模式：未提供散户/精英多空比）"
+            liquidity_text = "（老聚合器模式：未提供流动性地图）"
 
         return {
             "symbol": symbol,
@@ -559,6 +691,10 @@ class LLMAgent:
             "liquidations_table": liquidations_table,
             "key_levels_text": key_levels_text,
             "orderbook_text": orderbook_text,
+            "regime_text": regime_text,
+            "orderbook_dynamic_text": orderbook_dynamic_text,
+            "position_ratios_text": position_ratios_text,
+            "liquidity_text": liquidity_text,
         }
 
     @staticmethod
@@ -744,6 +880,71 @@ class LLMAgent:
             f"last_price={struct.get('last_price')}"
         )
 
+    @classmethod
+    def _render_regime(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染 regime 段：当前市场状态 + 决定性指标（1h_adx_14 / 4h_bb_width）
+        """
+        regime = factors.get("regime") or "-"
+        by_tf = factors.get("by_timeframe") or {}
+        ms_1h = ((by_tf.get("1h") or {}).get("market_structure")) or {}
+        ms_4h = ((by_tf.get("4h") or {}).get("market_structure")) or {}
+        return (
+            f"regime: {regime}   "
+            f"1h_adx_14={cls._fmt(ms_1h.get('adx_14'), 2)}   "
+            f"4h_bb_width={cls._fmt(ms_4h.get('bb_width'), 6)}   "
+            f"4h_trend={ms_4h.get('trend') or '-'}"
+        )
+
+    @classmethod
+    def _render_orderbook_dynamic(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染订单簿时序段：取 5m 周期块（订单簿因子主要挂在 5m / 15m）
+        """
+        by_tf = factors.get("by_timeframe") or {}
+        ob = ((by_tf.get("5m") or {}).get("orderbook")) or {}
+        if not ob.get("available"):
+            return "（订单簿时序不可用）"
+        return (
+            f"imbalance_now={cls._fmt(ob.get('imbalance_now'), 4)}  "
+            f"slope_5m={cls._fmt(ob.get('imbalance_slope_5m'), 8)}  "
+            f"zscore_15m={cls._fmt(ob.get('imbalance_zscore_15m'), 3)}\n"
+            f"vacuum_above={cls._fmt(ob.get('liquidity_vacuum_above'))}  "
+            f"vacuum_below={cls._fmt(ob.get('liquidity_vacuum_below'))}\n"
+            f"bid_wall_persistence_avg_s={cls._fmt(ob.get('bid_wall_persistence_avg_s'), 1)}  "
+            f"ask_wall_persistence_avg_s={cls._fmt(ob.get('ask_wall_persistence_avg_s'), 1)}\n"
+            f"wall_distance_pct={ob.get('wall_distance_pct')}  "
+            f"spread_bp_now={cls._fmt(ob.get('spread_bp_now'), 2)}"
+        )
+
+    @classmethod
+    def _render_position_ratios(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染散户/精英多空比段
+        """
+        pr = factors.get("position_ratios") or {}
+        return (
+            f"account_long_short_ratio={cls._fmt(pr.get('account_long_short_ratio'), 4)}（散户币种，反指）\n"
+            f"account_contract_ratio={cls._fmt(pr.get('account_contract_ratio'), 4)}（散户合约，反指）\n"
+            f"top_trader_position_ratio={cls._fmt(pr.get('top_trader_position_ratio'), 4)}（精英持仓，顺指）\n"
+            f"divergence={pr.get('retail_vs_smart_divergence') or 'unknown'}"
+        )
+
+    @classmethod
+    def _render_liquidity(cls, factors: Dict[str, Any]) -> str:
+        """
+        渲染流动性地图段：上下方各取前 3 档（按 strength 排序）
+        """
+        liq = factors.get("liquidity") or {}
+        above = (liq.get("liquidity_pool_above") or [])[:3]
+        below = (liq.get("liquidity_pool_below") or [])[:3]
+        cur = liq.get("current_price")
+        return (
+            f"current_price={cur}\n"
+            f"上方止损池: {above}  nearest_above_pct={liq.get('nearest_above_pct')}\n"
+            f"下方止损池: {below}  nearest_below_pct={liq.get('nearest_below_pct')}"
+        )
+
     @staticmethod
     def _extract_reasoning(raw_message: Any) -> Optional[str]:
         """
@@ -875,15 +1076,23 @@ class LLMAgent:
             logger.info("LLM 已禁用（未配置 DEEPSEEK_API_KEY），将使用规则引擎结果")
             return None
 
+        # P1 自适应节流：每轮根据当前因子矩阵动态计算 min_interval；
+        # 失败时方法内部已自动回退到 self.min_interval（P0 行为）。
+        adaptive_interval = self.compute_min_interval(factors)
+
         # 快速路径：先在锁外查一次 DB，避免抢锁。
-        cached = await self._load_recent_judgment(symbol)
+        cached = await self._load_recent_judgment(
+            symbol, min_interval=adaptive_interval
+        )
         if cached is not None:
             return cached
 
         # 慢速路径：拿锁后再查一次（double-checked locking），
         # 防止同一 symbol 在节流刚过期的瞬间被并发调用打多次接口。
         async with self._get_lock(symbol):
-            cached = await self._load_recent_judgment(symbol)
+            cached = await self._load_recent_judgment(
+                symbol, min_interval=adaptive_interval
+            )
             if cached is not None:
                 return cached
 
@@ -896,7 +1105,10 @@ class LLMAgent:
 
             try:
                 logger.info(
-                    "LLM 发起调用 -> %s（最小间隔=%ss）", symbol, self.min_interval
+                    "LLM 发起调用 -> %s（自适应最小间隔=%ss，P0 默认=%ss）",
+                    symbol,
+                    adaptive_interval,
+                    self.min_interval,
                 )
                 prompt_inputs = self._build_prompt_inputs(
                     symbol=symbol,

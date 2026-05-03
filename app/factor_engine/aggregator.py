@@ -56,12 +56,18 @@ from app.factor_engine.capital_flow import (
 from app.factor_engine.derivatives import (
     compute_derivatives_factors,
     compute_derivatives_per_timeframe,
+    compute_position_ratio_factors,
 )
+from app.factor_engine.liquidity import build_liquidity_map
 from app.factor_engine.market_structure import (
     compute_market_structure,
     compute_market_structure_from_klines,
 )
-from app.factor_engine.orderbook import compute_orderbook_factors
+from app.factor_engine.orderbook import (
+    compute_orderbook_factors,
+    compute_orderbook_factors_timeseries,
+)
+from app.factor_engine.regime import detect_regime
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -69,6 +75,27 @@ logger = get_logger(__name__)
 
 # 新版多周期矩阵覆盖的 5 个周期（按从快到慢）
 MTF_TIMEFRAMES: List[str] = ["5m", "15m", "1h", "4h", "1d"]
+
+
+def _ob_static_view(ob_factors: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    给大周期挂"订单簿静态视图"：去掉时序字段，避免 prompt / JSON 体积膨胀
+    -----------------------------------------------------------------
+    参数：
+        ob_factors: 完整的 P1 订单簿因子（含时序字段）
+    返回：
+        仅保留 P0 静态字段的 dict（available / imbalance / best_bid /
+        best_ask / spread / bid_qty / ask_qty / bid_walls / ask_walls）。
+    说明：
+        订单簿是高频指标，挂在 1h/4h/1d 上没有时序解释力（这些周期
+        bar 内可能已经发生几十次盘口结构变化）。所以大周期只挂静态
+        切片，时序字段全留给 5m / 15m。
+    """
+    keep_keys = (
+        "available", "imbalance", "best_bid", "best_ask", "spread",
+        "bid_qty", "ask_qty", "bid_walls", "ask_walls",
+    )
+    return {k: ob_factors.get(k) for k in keep_keys}
 
 
 class FactorAggregator:
@@ -171,9 +198,73 @@ class FactorAggregator:
         liq_since = now - timedelta(seconds=2 * 3600)
         liquidations = await self.repos.fetch_liquidations_since(symbol, liq_since)
 
-        ob_factors = compute_orderbook_factors(
-            orderbook, wall_multiplier=self.settings.liquidity_wall_multiplier
-        )
+        # ---- P1：订单簿时序 / 持仓比 / 7 天 funding 历史 ----
+        # 三块都只在对应开关打开时拉，关闭时退化到 P0 行为。
+        recent_orderbook_metrics: List[Dict[str, Any]] = []
+        if bool(getattr(self.settings, "enable_orderbook_timeseries", False)):
+            ob_metric_window = int(
+                getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
+            )
+            try:
+                recent_orderbook_metrics = await self.repos.fetch_orderbook_metrics_since(
+                    symbol=symbol,
+                    since=now - timedelta(seconds=ob_metric_window),
+                )
+            except Exception:
+                logger.warning(
+                    "拉取 orderbook_metrics 失败，退化为单快照模式 symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+                recent_orderbook_metrics = []
+
+        latest_position_ratios: Dict[str, Dict[str, Any]] = {}
+        if bool(getattr(self.settings, "enable_position_ratios", False)):
+            try:
+                latest_position_ratios = await self.repos.fetch_latest_position_ratios(
+                    symbol
+                )
+            except Exception:
+                logger.warning(
+                    "拉取 position_ratios 失败，散户/精英多空比将为 None symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+                latest_position_ratios = {}
+
+        funding_history: List[Dict[str, Any]] = []
+        try:
+            funding_window = int(
+                getattr(self.settings, "funding_pct_rank_window_seconds", 7 * 86400)
+            )
+            funding_history = await self.repos.fetch_funding_rates_since(
+                symbol=symbol, since=now - timedelta(seconds=funding_window)
+            )
+        except Exception:
+            logger.warning(
+                "拉取 funding_rates 历史失败，funding 分位数将为 None symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+
+        # 订单簿因子：P1 走时序版，回退到 P0 单快照
+        if bool(getattr(self.settings, "enable_orderbook_timeseries", False)):
+            ob_factors = compute_orderbook_factors_timeseries(
+                latest_snapshot=orderbook,
+                recent_metrics=recent_orderbook_metrics,
+                wall_multiplier=self.settings.liquidity_wall_multiplier,
+                now=now,
+                window_seconds=int(
+                    getattr(self.settings, "orderbook_metrics_window_seconds", 900)
+                ),
+                baseline_seconds=int(
+                    getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
+                ),
+            )
+        else:
+            ob_factors = compute_orderbook_factors(
+                orderbook, wall_multiplier=self.settings.liquidity_wall_multiplier
+            )
 
         lookback = int(self.settings.mtf_lookback_bars)
 
@@ -191,15 +282,26 @@ class FactorAggregator:
                 funding=funding,
                 oi_history=oi_history,
                 klines=klines,
+                funding_history=funding_history,
             )
             struct = compute_market_structure_from_klines(klines, levels_count=3)
-            # orderbook：P0 阶段不分周期，所有周期挂同一份快照，
-            # P1 再补按 N 秒平均的时序版。
+            # orderbook：P1 在 5m/15m 周期挂"时序版"指标，
+            # 1h/4h/1d 周期仍挂同一份（订单簿是高频，不下放到大周期）。
+            ob_for_tf = ob_factors if tf in ("5m", "15m") else _ob_static_view(ob_factors)
             by_timeframe[tf] = {
                 "capital_flow": cap,
-                "orderbook": ob_factors,
+                "orderbook": ob_for_tf,
                 "derivatives": deriv,
                 "market_structure": struct,
+            }
+
+        # P1：把持仓比因子合并到顶层"derivatives 维度"（同时挂在 1h block，
+        # 让规则引擎 _extract_layers 也能拿到，便于后续阈值化）
+        position_ratio_factors = compute_position_ratio_factors(latest_position_ratios)
+        if "1h" in by_timeframe:
+            by_timeframe["1h"]["derivatives"] = {
+                **by_timeframe["1h"].get("derivatives", {}),
+                **position_ratio_factors,
             }
 
         mtf_alignment = self._compute_alignment(by_timeframe)
@@ -207,13 +309,85 @@ class FactorAggregator:
             liquidations=liquidations, now=now,
         )
 
+        # P1：regime 检测（默认开启；关闭时挂 None）
+        regime: Optional[str] = None
+        if bool(getattr(self.settings, "enable_regime", False)):
+            try:
+                regime = detect_regime(
+                    by_timeframe=by_timeframe,
+                    bb_width_history_4h=self._collect_bb_width_history(by_timeframe, "4h"),
+                    bb_width_history_15m=self._collect_bb_width_history(by_timeframe, "15m"),
+                    adx_trending_threshold=float(
+                        getattr(self.settings, "regime_adx_trending_threshold", 25.0)
+                    ),
+                    adx_ranging_threshold=float(
+                        getattr(self.settings, "regime_adx_ranging_threshold", 18.0)
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "regime 检测失败，回退到 None symbol=%s", symbol, exc_info=True
+                )
+                regime = None
+
+        # P1：流动性地图
+        try:
+            liquidity = build_liquidity_map(
+                by_timeframe=by_timeframe,
+                round_step_usd=float(
+                    getattr(self.settings, "liquidity_round_level_step_usd", 50.0)
+                ),
+                max_levels_per_side=int(
+                    getattr(self.settings, "liquidity_max_levels_per_side", 5)
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "流动性地图构造失败，回退到空 symbol=%s", symbol, exc_info=True
+            )
+            liquidity = {
+                "liquidity_pool_above": [],
+                "liquidity_pool_below": [],
+                "nearest_above_pct": None,
+                "nearest_below_pct": None,
+                "current_price": None,
+            }
+
         return {
             "symbol": symbol,
             "computed_at": now.isoformat(),
             "by_timeframe": by_timeframe,
             "mtf_alignment": mtf_alignment,
             "liquidations": liquidation_summary,
+            # P1 根节点新增字段
+            "regime": regime,
+            "liquidity": liquidity,
+            "position_ratios": position_ratio_factors,
         }
+
+    @staticmethod
+    def _collect_bb_width_history(
+        by_timeframe: Dict[str, Dict[str, Any]],
+        tf: str,
+    ) -> List[float]:
+        """
+        从指定周期的 market_structure 块中收集"过去 N 根 bar 的 bb_width 序列"
+        -----------------------------------------------------------------
+        参数：
+            by_timeframe: 多周期因子矩阵
+            tf:           '4h' / '15m' 等
+        返回：
+            float 列表；当前 P0 阶段 market_structure 只输出"最新一根的
+            bb_width 标量"，因此这里只返回 [当前值]，给 regime 一个保底。
+            下阶段如果接入按周期的 bb_width 历史窗口，把序列填进来即可。
+        """
+        block = (by_timeframe or {}).get(tf) or {}
+        ms = block.get("market_structure") or {}
+        v = ms.get("bb_width")
+        try:
+            return [float(v)] if v is not None else []
+        except (TypeError, ValueError):
+            return []
 
     # ------------------------------------------------------------------
     # mtf_alignment 共振

@@ -256,3 +256,80 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS risk_reward_ratio        NUMERIC(10
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS position_size_pct        NUMERIC(8, 6);
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe_alignment      JSONB;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS invalidation_conditions  JSONB;
+
+-- ============================================================
+-- P1 升级：订单簿时序 + 主力/散户持仓比
+-- ============================================================
+-- 设计取舍：
+--   1) 订单簿时序：原 orderbook_snapshots 仅保留"最新一条快照"语义，
+--      P1 需要"过去 5/15 分钟的盘口动态"。直接把 bids/asks JSONB 全
+--      存进时序表会让单 symbol 一天写入 8000+ JSONB 行（10s 节流），
+--      JSONB 体积大、读时反序列化慢，索引也不友好。
+--      所以新增 orderbook_metrics：只存"已经聚合好的标量指标"
+--      （imbalance / wall 计数 / spread 等），单行 < 100 字节，
+--      读 5/15 分钟序列只需 ~30/90 行，时序回放成本极低。
+--   2) 持仓比：OKX rubik 接口本身就已经按周期聚合（5m/15m/1h/1d），
+--      没必要再做二次聚合，只需把每次 REST 拉取的几条历史落库即可。
+--      ratio_type 用 CHECK 约束区分 4 种维度，方便未来加新维度。
+--   3) 两张表都加 UNIQUE 抑制重复写入，符合 P0 既定的"WS/REST 双路
+--      幂等"风格；orderbook_metrics 用 (exchange, symbol, ts) 即可，
+--      因为 10s 节流粒度下 ts 已经是天然去重键。
+
+-- 10) 订单簿时序指标
+--   说明：
+--     - 与 orderbook_snapshots 完全解耦：snapshots 是"原始 bids/asks"快照，
+--       供回放与离线复盘；orderbook_metrics 是"已聚合标量"，供因子层时序分析。
+--     - imbalance / spread_bp 是开窗口统计（5m / 15m / 1h）的基础列。
+--     - wall 计数 / notional 用于检测"大墙撤单"和"流动性真空"。
+CREATE TABLE IF NOT EXISTS orderbook_metrics (
+    id                   BIGSERIAL PRIMARY KEY,
+    exchange             TEXT        NOT NULL,
+    symbol               TEXT        NOT NULL,
+    ts                   TIMESTAMPTZ NOT NULL,
+    imbalance            NUMERIC(10, 6),
+    bid_qty              NUMERIC(30, 10),
+    ask_qty              NUMERIC(30, 10),
+    top5_bid_notional    NUMERIC(30, 4),
+    top5_ask_notional    NUMERIC(30, 4),
+    bid_wall_count       INTEGER,
+    ask_wall_count       INTEGER,
+    spread_bp            NUMERIC(12, 4),
+    mid_price            NUMERIC(24, 10),
+    CONSTRAINT orderbook_metrics_unique UNIQUE (exchange, symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_orderbook_metrics_symbol_ts
+    ON orderbook_metrics (symbol, ts DESC);
+
+-- 11) 主力 / 散户多空 / 持仓比
+--   ratio_type：
+--     'account'             - 散户层多空账户比（按 ccy）
+--     'account_contract'    - 散户层多空账户比（按 instId，更精确）
+--     'top_trader_account'  - 精英账户多空比（按账户数）
+--     'top_trader_position' - 精英账户多空比（按持仓量，更顺指）
+--   long_ratio / short_ratio：百分比形式（0~1），来自 OKX 原始
+--   ratio：long / short 比值（OKX 部分接口直接提供）
+--   设计取舍：
+--     - 不为每种 ratio_type 单独建表：4 种维度 schema 完全一致，
+--       单表 + ratio_type 列让读侧可以一次拉齐多维度，省一次 JOIN。
+--     - UNIQUE 含 ratio_type，避免不同维度互相挤占同一时间戳。
+CREATE TABLE IF NOT EXISTS position_ratios (
+    id           BIGSERIAL PRIMARY KEY,
+    exchange     TEXT        NOT NULL,
+    symbol       TEXT        NOT NULL,
+    ts           TIMESTAMPTZ NOT NULL,
+    ratio_type   TEXT        NOT NULL CHECK (
+        ratio_type IN (
+            'account', 'account_contract',
+            'top_trader_account', 'top_trader_position'
+        )
+    ),
+    long_ratio   NUMERIC(10, 6),
+    short_ratio  NUMERIC(10, 6),
+    ratio        NUMERIC(12, 6),
+    CONSTRAINT position_ratios_unique
+        UNIQUE (exchange, symbol, ts, ratio_type)
+);
+CREATE INDEX IF NOT EXISTS idx_position_ratios_symbol_ts
+    ON position_ratios (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_position_ratios_symbol_type_ts
+    ON position_ratios (symbol, ratio_type, ts DESC);

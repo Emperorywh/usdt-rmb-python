@@ -148,6 +148,53 @@ class Settings(BaseSettings):
     # 订单簿写入节流：每个 symbol 至少间隔 N 秒落库一次
     # 既保证信号引擎能拿到较新的盘口（N 秒以内），又把存储压力降到合理水平
     orderbook_min_interval_seconds: float = 5.0
+
+    # ===== P1 升级：订单簿时序 / 持仓比 / regime / 自适应节流 =====
+    # 4 个独立 enable_* 开关，便于灰度上线；任一关闭都会回退到 P0 行为。
+    # ----------------------------------------------------------------
+    # 订单簿时序快照：False 时 runner 不写 orderbook_metrics，
+    # orderbook 因子层退化为"仅最新一条快照"的 P0 行为。
+    enable_orderbook_timeseries: bool = True
+    # OKX 散户多空比 / 精英持仓比：False 时 runner 不再启动对应轮询，
+    # derivatives 因子层 account_long_short_ratio 等字段保持 None。
+    enable_position_ratios: bool = True
+    # 市场状态检测：False 时因子矩阵不挂载 regime 字段（None），
+    # LLM Prompt 中 regime 段固定输出 "regime: -"。
+    enable_regime: bool = True
+    # 自适应 LLM 节流：False 时 compute_min_interval 直接返回 P0 的
+    # llm_min_interval_seconds（默认 900s）。
+    enable_adaptive_throttle: bool = True
+
+    # orderbook_metrics 写入节流（秒）。比 orderbook_snapshots 的 5s
+    # 更长一档，因为时序因子只需要相对稀疏的样本来回归斜率与 zscore。
+    orderbook_metrics_min_interval_seconds: float = 10.0
+    # orderbook_metrics 因子读取窗口 / 历史回看长度
+    orderbook_metrics_window_seconds: int = 900  # 15 分钟
+    orderbook_metrics_baseline_seconds: int = 3600  # 1 小时（vacuum 比基准）
+
+    # 持仓比 REST 拉取节奏（秒），默认 5 分钟。OKX rubik 接口本身就是
+    # 5m 粒度，再短意义不大。
+    position_ratios_poll_interval_seconds: int = 300
+    # 持仓比拉取的回看周期（OKX 接口的 period 参数）
+    position_ratios_period: str = "5m"
+    # 持仓比拉取失败的连续容忍次数；超过仍只 warn 不抛
+    position_ratios_max_consecutive_errors: int = 5
+
+    # funding 分位数计算的回看时长（秒），默认 7 天
+    funding_pct_rank_window_seconds: int = 7 * 86_400
+
+    # 自适应 LLM 节流上下限（秒），与 P0 的 llm_min_interval_seconds 配合
+    llm_min_interval_seconds_min: int = 180   # 3 分钟，暴动行情下限
+    llm_min_interval_seconds_max: int = 1800  # 30 分钟，平静期上限
+
+    # regime 判定阈值；公开成 setting 是为了未来可调，不要在代码里硬编码。
+    regime_adx_trending_threshold: float = 25.0
+    regime_adx_ranging_threshold: float = 18.0
+
+    # 流动性地图：整数关口的格子大小（USD）；按 50 美元一档对 ETH 合理
+    liquidity_round_level_step_usd: float = 50.0
+    # 流动性地图每个方向最多保留 N 档
+    liquidity_max_levels_per_side: int = 5
     # 合约面值（ctVal）默认值 - 启动时若能从 OKX instruments 接口拿到则覆盖
     # ETH-USDT-SWAP 在 OKX 上 1 张 = 0.1 ETH（可被 instruments 元数据覆盖）
     default_contract_value: float = 0.1
