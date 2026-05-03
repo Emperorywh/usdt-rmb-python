@@ -1,0 +1,26 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Config & validation
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# Database (async)
+asyncpg==0.30.0
+
+# HTTP & WebSocket
+httpx==0.27.2
+websockets==13.1
+
+# LangChain + DeepSeek (OpenAI-compatible)
+langchain==0.3.7
+langchain-core==0.3.21
+langchain-openai==0.2.9
+
+# Numeric
+numpy==2.1.3
+
+# Logging
+structlog==24.4.0
