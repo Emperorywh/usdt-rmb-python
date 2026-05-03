@@ -1,9 +1,17 @@
-"""HTTP routes."""
+"""HTTP routes（P0/P1/P2 共用）。
+
+P2 新增接口：
+* GET  /signals/{signal_id}/attribution   信号因子贡献度归因
+* GET  /factors/weights/current           当前生效的权重表（按 regime 过滤）
+* GET  /signals/lifecycle/stats           近 N 天信号胜率 / 平均 RR / 各 regime 命中率
+* POST /admin/calibrate-ic                手动触发一次 IC 校准（带 token）
+"""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app.api_service.deps import (
     get_container,
@@ -150,3 +158,224 @@ async def refresh_signal(
     if include_reasoning:
         payload["reasoning_content"] = result["reasoning_content"]
     return payload
+
+
+# ======================================================================
+# P2：归因 / 权重 / 生命周期统计
+# ======================================================================
+@router.get("/signals/{signal_id}/attribution", tags=["signal", "p2"])
+async def get_signal_attribution(
+    signal_id: int,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    返回某条信号的因子贡献度分解（基于规则引擎 contributions + LLM reasoning_content 摘要）
+    -------------------------------------------------------------------
+    返回字段：
+        signal_id        : 入参
+        symbol / ts / bias / confidence / source
+        rule_score       : 规则引擎打分
+        rule_contributions : 原子因子粒度的贡献度（来自 signals.factors.rule_contributions）
+        regime           : 当时的 market regime（来自 signals.factors.factors.regime）
+        weights_snapshot : 该 regime 下当前生效的权重（用于"当时打分用了哪些权重"溯源）
+        reasoning_excerpt: LLM 思维链前 800 字符（仅审计用，全文走 /signal?include_reasoning）
+    说明：
+        signals.factors 是 JSONB，里面的 rule_contributions 由 service 层在
+        持久化时写入；P2 升级后 contributions 已经是"tf:group.factor_name"粒度。
+    """
+    async with container.db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, ts, symbol, bias, confidence, factors, source,
+                   reasoning_content
+            FROM signals
+            WHERE id = $1
+            """,
+            signal_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="signal_id not found")
+
+    factors_blob = row["factors"] or {}
+    inner_factors = (
+        factors_blob.get("factors")
+        if isinstance(factors_blob, dict) and "factors" in factors_blob
+        else factors_blob
+    )
+    rule_contribs = (
+        factors_blob.get("rule_contributions")
+        if isinstance(factors_blob, dict)
+        else None
+    )
+    rule_score = (
+        factors_blob.get("rule_score")
+        if isinstance(factors_blob, dict)
+        else None
+    )
+    regime = (
+        inner_factors.get("regime")
+        if isinstance(inner_factors, dict)
+        else None
+    ) or "overall"
+
+    # 当前权重表快照（按 regime 取，附带 overall 兜底）
+    weights_snapshot: List[Dict[str, Any]] = []
+    try:
+        weights_rows = await container.repos.fetch_factor_weights_by_regime(regime)
+        weights_snapshot = [
+            {
+                "timeframe": r["timeframe"],
+                "factor_group": r["factor_group"],
+                "factor_name": r["factor_name"],
+                "weight": float(r["weight"]),
+                "ic_30d": float(r["ic_30d"]) if r["ic_30d"] is not None else None,
+                "ic_90d": float(r["ic_90d"]) if r["ic_90d"] is not None else None,
+                "sample_count": r["sample_count"],
+            }
+            for r in weights_rows
+        ]
+    except Exception:
+        weights_snapshot = []
+
+    reasoning = row.get("reasoning_content") or ""
+    excerpt = reasoning[:800] if isinstance(reasoning, str) else ""
+
+    return {
+        "signal_id": row["id"],
+        "ts": row["ts"].isoformat(),
+        "symbol": row["symbol"],
+        "bias": row["bias"],
+        "confidence": float(row["confidence"]),
+        "source": row["source"],
+        "regime": regime,
+        "rule_score": rule_score,
+        "rule_contributions": rule_contribs or {},
+        "weights_snapshot": weights_snapshot,
+        "reasoning_excerpt": excerpt,
+        "reasoning_total_chars": len(reasoning) if isinstance(reasoning, str) else 0,
+    }
+
+
+@router.get("/factors/weights/current", tags=["factors", "p2"])
+async def get_current_factor_weights(
+    regime: Optional[str] = Query(
+        default=None,
+        description="按 regime 过滤；不传则返回全表",
+    ),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    返回当前生效的因子权重（按 regime 维度过滤；不传 regime 则返回全表）
+    -------------------------------------------------------------------
+    用途：
+        前端展示 "当前 regime=trending_up 下，net_flow_usd 在 5m 上权重 0.18"
+        这种归因细节；同时给运维 / 量化研究员一个"快速查看 IC 校准结果"的入口。
+    """
+    if regime:
+        rows = await container.repos.fetch_factor_weights_by_regime(regime)
+    else:
+        rows = await container.repos.fetch_all_factor_weights()
+    return {
+        "count": len(rows),
+        "regime_filter": regime,
+        "shadow_mode": bool(
+            getattr(container.settings, "ic_calibrator_shadow_mode", True)
+        ),
+        "weights": [
+            {
+                "regime": r["regime"],
+                "timeframe": r["timeframe"],
+                "factor_group": r["factor_group"],
+                "factor_name": r["factor_name"],
+                "weight": float(r["weight"]),
+                "ic_30d": float(r["ic_30d"]) if r["ic_30d"] is not None else None,
+                "ic_90d": float(r["ic_90d"]) if r["ic_90d"] is not None else None,
+                "sample_count": r["sample_count"],
+                "updated_at": (
+                    r["updated_at"].isoformat()
+                    if r.get("updated_at") is not None
+                    else None
+                ),
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/signals/lifecycle/stats", tags=["signal", "p2"])
+async def get_lifecycle_stats(
+    symbol: Optional[str] = Query(default=None),
+    days: int = Query(default=7, ge=1, le=180),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    近 N 天信号胜率 / 平均 RR / 平均 PnL / 各 regime 下的命中率
+    -------------------------------------------------------------------
+    参数：
+        symbol: 合约代码；缺省取 settings.symbols[0]
+        days  : 统计窗口（天），上限 180 天，避免误传巨大窗口拖垮 DB
+    返回：
+        {
+          "symbol": ...,
+          "since": ...,
+          "total": ..,
+          "win_rate": float,
+          "avg_pnl_pct": float,
+          "avg_rr": float,
+          "by_regime": {regime: {...}}
+        }
+    """
+    sym = _resolve_symbol(symbol, container)
+    since = datetime.now(timezone.utc) - timedelta(days=int(days))
+    stats = await container.repos.fetch_lifecycle_stats(symbol=sym, since=since)
+    return {
+        "symbol": sym,
+        "since": since.isoformat(),
+        "days": days,
+        **stats,
+    }
+
+
+@router.post("/admin/calibrate-ic", tags=["admin", "p2"])
+async def admin_calibrate_ic(
+    container: AppContainer = Depends(get_container),
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> Dict[str, Any]:
+    """
+    手动立刻触发一次 IC 校准（不等待下一个周期）
+    -------------------------------------------------------------------
+    Header：
+        X-Admin-Token : 必须等于 settings.ic_calibrator_admin_token；
+                         token 留空时本接口直接 403（避免误暴露重计算入口）。
+    返回：
+        校准报告摘要（与 logs/ic_calibration_*.json 对齐）。
+    说明：
+        - 任务内部带 asyncio.Lock，与 cron 周期任务串行，不会并发跑两轮；
+        - container.ic_calibrator 为 None 时（开关关闭）返回 503。
+    """
+    expected = (container.settings.ic_calibrator_admin_token or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="admin calibrate disabled: ic_calibrator_admin_token is empty",
+        )
+    if (x_admin_token or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+    if container.ic_calibrator is None:
+        raise HTTPException(
+            status_code=503, detail="IC calibrator is disabled at startup"
+        )
+    report = await container.ic_calibrator.run_once(triggered_by="admin")
+    return {
+        "ran_at": report.ran_at.isoformat(),
+        "finished_at": report.finished_at.isoformat(),
+        "skipped": report.skipped,
+        "skipped_reason": report.skipped_reason,
+        "total_signals_30d": report.total_signals_30d,
+        "total_signals_90d": report.total_signals_90d,
+        "total_records_30d": report.total_records_30d,
+        "groups_updated": report.groups_updated,
+        "groups_skipped_low_sample": report.groups_skipped_low_sample,
+        "weights_written": report.weights_written,
+    }

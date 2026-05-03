@@ -34,6 +34,12 @@ async def lifespan(app: FastAPI):
     # 1m / 5m 每秒一次；15m / 1h 每 10 秒一次；4h / 1d 每分钟一次。
     if container.kline_aggregator is not None:
         await container.kline_aggregator.start(symbols=list(settings.symbols))
+    # P2：启动 IC 校准 + 信号生命周期跟踪后台任务
+    # （任一开关关闭则容器里对应字段为 None，这里跳过启动；既不查表也不写表）。
+    if container.ic_calibrator is not None:
+        await container.ic_calibrator.start()
+    if container.lifecycle_tracker is not None:
+        await container.lifecycle_tracker.start()
     await container.signal_service.start_periodic(
         symbols=settings.symbols,
         interval_seconds=settings.signal_interval_seconds,

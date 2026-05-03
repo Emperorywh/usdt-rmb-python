@@ -18,8 +18,10 @@ from app.data_ingestion.runner import IngestionRunner
 from app.data_storage.database import Database
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
+from app.factor_engine.ic_calibrator import ICCalibrator
 from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
+from app.signal_engine.lifecycle import LifecycleTracker
 from app.signal_engine.llm_agent import LLMAgent
 from app.signal_engine.rules import RuleEngine
 from app.signal_engine.service import SignalService
@@ -54,6 +56,10 @@ class AppContainer:
     instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
     # P0：多周期 K 线增量聚合器；enable_mtf_factors=False 时不创建（None）
     kline_aggregator: Optional[KlineAggregator] = field(default=None)
+    # P2：IC 校准任务；enable_factor_weights_table=False 时不创建（None）
+    ic_calibrator: Optional[ICCalibrator] = field(default=None)
+    # P2：信号生命周期跟踪任务；enable_lifecycle_tracking=False 时不创建（None）
+    lifecycle_tracker: Optional[LifecycleTracker] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
@@ -126,7 +132,8 @@ class AppContainer:
 
         # ---- Factor + signal ----
         factor_aggregator = FactorAggregator(repos=repos, settings=settings)
-        rule_engine = RuleEngine(settings=settings)
+        # P2：rule_engine 现在持有 repos 用来查 factor_weights 表（带 5min 缓存）
+        rule_engine = RuleEngine(settings=settings, repos=repos)
         llm_agent = LLMAgent(settings=settings, repos=repos)
         signal_service = SignalService(
             repos=repos,
@@ -146,6 +153,27 @@ class AppContainer:
                 exchange="okx",
             )
 
+        # ---- P2：IC 校准 + 生命周期跟踪 ----
+        # 两个独立开关：任意一个关闭都不会破坏 P0/P1 行为，方便灰度上线。
+        ic_calibrator: Optional[ICCalibrator] = None
+        if bool(getattr(settings, "enable_factor_weights_table", False)):
+            # 默认对配置里的第一个 symbol 跑校准。
+            # 多 symbol 部署时可以扩展为 list[ICCalibrator]，本期保持单实例。
+            primary_symbol = (
+                settings.symbols[0] if settings.symbols else "ETH-USDT-SWAP"
+            )
+            ic_calibrator = ICCalibrator(
+                settings=settings, repos=repos, symbol=primary_symbol
+            )
+
+        lifecycle_tracker: Optional[LifecycleTracker] = None
+        if bool(getattr(settings, "enable_lifecycle_tracking", False)):
+            lifecycle_tracker = LifecycleTracker(
+                settings=settings,
+                repos=repos,
+                symbols=list(settings.symbols),
+            )
+
         return cls(
             settings=settings,
             db=db,
@@ -159,6 +187,8 @@ class AppContainer:
             ingestion_runner=runner,
             instrument_refresh_task=instrument_refresh_task,
             kline_aggregator=kline_aggregator,
+            ic_calibrator=ic_calibrator,
+            lifecycle_tracker=lifecycle_tracker,
         )
 
     @staticmethod
@@ -223,6 +253,11 @@ class AppContainer:
                 await self.instrument_refresh_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # P2：先停 lifecycle / IC 任务，避免它们在 shutdown 期间还在写表
+        if self.lifecycle_tracker is not None:
+            await self.lifecycle_tracker.stop()
+        if self.ic_calibrator is not None:
+            await self.ic_calibrator.stop()
         # P0：先停 K 线聚合器再停采集，保证关闭时不会再有"读 trades / 写 klines"
         # 的协程在飞，避免与连接池关闭竞态。
         if self.kline_aggregator is not None:

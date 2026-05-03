@@ -1,13 +1,22 @@
-"""Signal service: fuses rule engine + LLM agent and persists outputs."""
+"""Signal service: fuses rule engine + LLM agent and persists outputs.
+
+P2 升级：
+* 在 INSERT signals 后**同事务节奏**追加一条 ``signal_lifecycle`` 行
+  （pending / 或 neutral 的直接 expired），让生命周期跟踪任务能拿到信号；
+* 在调用 LLMAgent.analyze 之前从 ``signal_lifecycle`` 读最近 N 条已结算 +
+  当前未结算行，作为 ``recent_settled / open_lifecycle`` 透传给 LLM；
+  这样 llm_agent 不直接依赖 repos，职责清晰。
+"""
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
 from app.logging_config import get_logger
+from app.signal_engine.lifecycle import compute_expires_at
 from app.signal_engine.llm_agent import LLMAgent, LLMAnalysisResult
 from app.signal_engine.rules import RuleEngine
 from app.signal_engine.schemas import TradingSignal
@@ -35,7 +44,13 @@ class SignalService:
     # ------------------------------------------------------------------
     async def generate(self, symbol: str) -> Dict[str, Any]:
         factors = await self.factor_aggregator.compute(symbol)
-        rule_signal, rule_score, contributions = self.rule_engine.evaluate(factors)
+        # P2：rule_engine.evaluate 现在是 async（要查 factor_weights 表）
+        rule_signal, rule_score, contributions = await self.rule_engine.evaluate(factors)
+
+        # P2：在调 LLM 之前从 signal_lifecycle 读"近 5 条已结算 + 未结算占用"，
+        # 作为 recent_settled / open_lifecycle 透传给 LLMAgent；
+        # llm_agent 不直接依赖 repos，避免双向耦合。
+        recent_settled, open_lifecycle = await self._fetch_lifecycle_feedback(symbol)
 
         # llm_agent.analyze 返回 LLMAnalysisResult（包装了 TradingSignal +
         # 思考模式下的 reasoning_content）；调用失败 / 未启用时返回 None。
@@ -45,6 +60,8 @@ class SignalService:
             rule_signal=rule_signal,
             rule_score=rule_score,
             rule_contributions=contributions,
+            recent_settled=recent_settled,
+            open_lifecycle=open_lifecycle,
         )
 
         if llm_result is not None:
@@ -114,6 +131,40 @@ class SignalService:
                     else None
                 ),
             )
+            # P2：信号入库成功后立刻挂一条 lifecycle 行（pending）
+            # 失败不阻塞主路径——下一轮 generate 会重新写一条新的 signal，
+            # lifecycle 任务也会跳过没有对应 lifecycle 行的旧 signal。
+            if signal_id is not None and bool(
+                getattr(self.factor_aggregator.settings, "enable_lifecycle_tracking", False)
+            ):
+                try:
+                    ttl_hours = int(
+                        getattr(
+                            self.factor_aggregator.settings,
+                            "lifecycle_default_ttl_hours",
+                            24,
+                        )
+                    )
+                    expires_at = compute_expires_at(ttl_hours=ttl_hours)
+                    await self.repos.insert_signal_lifecycle(
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        bias=final.bias,
+                        entry_zone=(
+                            list(final.entry_zone) if final.entry_zone else None
+                        ),
+                        stop_loss=final.stop_loss,
+                        take_profit=(
+                            list(final.take_profit) if final.take_profit else None
+                        ),
+                        expires_at=expires_at,
+                    )
+                except Exception:
+                    logger.warning(
+                        "写入 signal_lifecycle 失败 signal_id=%s（不影响主路径）",
+                        signal_id,
+                        exc_info=True,
+                    )
         else:
             logger.debug(
                 "跳过信号入库 %s：source=%s（llm_present=%s，from_cache=%s）",
@@ -137,6 +188,50 @@ class SignalService:
             # 避免污染 signal 主体；未启用思考模式或纯规则路径时为 None。
             "reasoning_content": reasoning_content,
         }
+
+    async def _fetch_lifecycle_feedback(
+        self, symbol: str
+    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        拉取 P2 自我反馈所需的 lifecycle 数据
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约
+        返回：
+            (recent_settled, open_lifecycle)
+                recent_settled : 近 N 条已结算行（含 join 出来的 signals 字段）
+                open_lifecycle : 当前未结算的最近一条；找不到时为 None
+        说明：
+            - enable_llm_self_feedback=False / enable_lifecycle_tracking=False
+              时直接返回空，避免无意义查表；
+            - 任意一项查询失败都吞掉异常返回空：自我反馈是"锦上添花"，
+              不能因为它把整轮 LLM 调用打挂。
+        """
+        settings = self.factor_aggregator.settings
+        if not bool(getattr(settings, "enable_llm_self_feedback", False)):
+            return [], None
+        if not bool(getattr(settings, "enable_lifecycle_tracking", False)):
+            return [], None
+        recent_n = int(getattr(settings, "llm_feedback_recent_n", 5))
+        recent: List[Dict[str, Any]] = []
+        open_one: Optional[Dict[str, Any]] = None
+        try:
+            recent = await self.repos.fetch_recent_settled_lifecycles(
+                symbol=symbol, limit=max(1, recent_n)
+            )
+        except Exception:
+            logger.warning(
+                "读取 %s 最近成绩单失败，本次 LLM 自我反馈降级为空", symbol, exc_info=True
+            )
+        try:
+            open_one = await self.repos.fetch_open_signal_lifecycle_for_symbol(symbol)
+        except Exception:
+            logger.warning(
+                "读取 %s 未结算 lifecycle 失败，本次 LLM 自我反馈忽略未结算告警",
+                symbol,
+                exc_info=True,
+            )
+        return recent, open_one
 
     # ------------------------------------------------------------------
     # periodic background loop (started from FastAPI lifespan)

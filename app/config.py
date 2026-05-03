@@ -214,6 +214,54 @@ class Settings(BaseSettings):
     # 设为 0 可彻底关闭清理任务（仅当外部已有清理脚本时使用）。
     retention_run_interval_seconds: int = 600
 
+    # ===== P2 升级：IC 自适应权重 + 信号生命周期 + LLM 自我反馈 =====
+    # 三个独立 enable_* 开关，便于灰度上线。任一关闭都不会破坏 P0/P1 行为。
+    # ----------------------------------------------------------------
+    # 因子权重表：True 时 RuleEngine 走 factor_weights 表 + 缓存；
+    #             False 时退回 P1 的硬编码权重（capital_flow / orderbook /
+    #             derivatives / market_structure 四类等权）。
+    enable_factor_weights_table: bool = True
+    # 信号生命周期跟踪：True 时 service 写入 signal_lifecycle、后台跑跟踪任务；
+    #                    False 时不写表也不跑跟踪，对 P0/P1 信号生成完全透明。
+    enable_lifecycle_tracking: bool = True
+    # LLM 自我反馈：True 时 analyze() 在 prompt 开头注入近 5 条已结算成绩单
+    #              + 应用"近 5 条 ≥3 次失败必须降低 confidence"等强约束。
+    #              False 时回退到 P1 prompt（不注入历史 PnL）。
+    enable_llm_self_feedback: bool = True
+
+    # IC 校准任务（影子模式）：
+    # True 时 IC 任务计算结果只写表与日志，但 RuleEngine 不读 factor_weights，
+    # 仍走 P1 兜底权重。两周 shadow 期对比新旧权重质量后再切到 False。
+    ic_calibrator_shadow_mode: bool = True
+    # IC 任务运行周期（秒），默认每天 02:00 UTC 跑一次（86400s）；
+    # 为了避免引入 cron / APScheduler，启动后简单 sleep 86400s 循环跑。
+    ic_calibrator_interval_seconds: int = 86_400
+    # IC 校准任务每天首次启动相对 lifespan 的延迟（秒）：
+    # 默认延后 30 秒，避免与冷启动 warmup / 数据回灌竞争 IO。
+    ic_calibrator_first_delay_seconds: int = 30
+    # IC 校准最小总样本数（30 天内全 LLM 信号）：< 该值整轮跳过校准，
+    # 避免冷启动期权重崩坏。
+    ic_calibrator_min_total_samples: int = 30
+    # 单个 (regime, timeframe) 组合的最小样本数：< 该值不更新该组合，
+    # 保留基线权重。
+    ic_calibrator_min_group_samples: int = 10
+    # IC 校准任务的 admin 触发 token，用于 POST /admin/calibrate-ic。
+    # 留空则禁用该接口（避免误暴露重计算入口）。
+    ic_calibrator_admin_token: str = ""
+    # IC 校准任务输出日志目录（相对项目根 / 绝对路径均可）
+    ic_calibrator_log_dir: str = "logs"
+
+    # 生命周期跟踪任务运行节奏（秒）。30s 与 signal_interval 对齐，
+    # 不会在新信号入库后等过久才进入"pending → triggered"。
+    lifecycle_tick_seconds: int = 30
+    # 信号默认有效期（小时）：超过后强制按当前价 exit + 置 expired。
+    lifecycle_default_ttl_hours: int = 24
+    # mark price 数据源的最大年龄（秒）：超过此值跳过本轮，避免 K 线断流误结算。
+    lifecycle_mark_price_max_age_seconds: float = 60.0
+
+    # LLM 自我反馈：注入到 prompt 的"成绩单"条数
+    llm_feedback_recent_n: int = 5
+
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000

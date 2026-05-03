@@ -1,123 +1,275 @@
-"""规则引擎：基于因子的快速预筛。
+"""规则引擎：基于因子的快速预筛（P2 升级版：从 factor_weights 表加载权重 + 缓存 + fallback）。
 
-将聚合后的因子 dict 通过一组确定性启发式规则映射成
-:class:`TradingSignal` 与 [-1, 1] 区间的打分。打分还会作为
-额外上下文喂给 LLM Agent。
+设计目标
+========
+- P0：把因子聚合 dict 映射成有方向偏置 + [-1, 1] 的总分，并构造结构化交易计划。
+- P1：按 regime 切换三套硬编码权重（trending / ranging / breakout）。
+- P2（本版）：
+    * 权重不再硬编码：周期性从 ``factor_weights`` 表加载（同一 regime / timeframe
+      下所有 factor_name 的 weight 总和应 = 1，由 IC 校准任务保证）；
+    * 内存缓存 5 分钟，避免热路径反复打 DB；
+    * 任意失败（开关关闭 / 表为空 / 查询异常）自动降级到 P1 三套硬编码权重；
+    * ``contributions`` 字段从"P0 的 4 类粗粒度"升级为"原子因子"粒度，
+      给归因 API（/signals/{id}/attribution）提供更细的分解。
 
-所有阈值都从 :class:`Settings` 中读取，避免在代码里出现魔法数字。
+关于"按 timeframe 累加"的设计取舍
+================================
+一条信号要落地交易计划，必须用一个标量 score 决定 bias。但 factor_weights
+是按 (regime, timeframe, factor_name) 三维存储，IC 把"在 5m 上 cvd_slope 的
+有效程度"和"在 1h 上 cvd_slope 的有效程度"分得很开。
+这里采取的策略：
+    score = Σ_tf  Σ_f  weight(regime, tf, f) × normalize(factor_value(tf, f))
+归一化器 normalize 把不同量纲打到 [-1, 1]，让 weight 直接作为加权和的系数。
+由于 IC 校准任务在每个 (regime, tf) 内部已经把权重归一到 sum=1，
+跨 tf 累加后 score 的最大绝对值上限 = 周期数（5）；最后 clamp 回 [-1, 1]。
 
-输出语言：reason / risk / suggestion 三个字段统一使用简体中文，
-bias 仍然保持 long/short/neutral 英文枚举（与表 CHECK 约束对齐）。
+Fallback：与 P1 行为对齐
+========================
+表查询失败 / 影子模式 / 总开关关闭时，使用与 P1 等价的硬编码权重：
+    capital_flow=0.35  orderbook=0.15  derivatives=0.20  market_structure=0.30
+对应 contributions 仍以"原子因子"为键写入（同一 group 内分摊基线权重），
+保证下游归因接口 schema 统一。
 """
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import Settings
+from app.data_storage.repositories import Repositories
 from app.signal_engine.schemas import TradingSignal
 
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------------------
+# 基线权重（P1 三套 regime 权重的展开版本，也是 P2 fallback 种子）
+# ----------------------------------------------------------------------
+# 数据结构：
+#   _BASELINE_WEIGHTS[regime][timeframe][factor_name] = weight (∈ [0, 1])
+# 含义：
+#   - 同一 (regime, tf) 内所有 factor_name 的 weight 总和应 ≈ 1；
+#   - 没显式列出的 factor_name 视为 weight=0（IC 任务可后续补全）。
+# 该表由 P1 的"四类粗粒度权重"展开而来：
+#   trending_*  → capital_flow=0.30 / orderbook=0.10 / derivatives=0.25 / market_structure=0.35
+#   ranging     → capital_flow=0.20 / orderbook=0.30 / derivatives=0.20 / market_structure=0.30
+#   breakout/down → capital_flow=0.40 / orderbook=0.15 / derivatives=0.25 / market_structure=0.20
+#   transitional → 与 trending_up 同（保守兜底）
+_TRENDING_TF_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "5m": {"net_flow_usd": 0.10, "imbalance": 0.05, "oi_change_pct": 0.10, "trend": 0.20},
+    "15m": {"net_flow_usd": 0.10, "imbalance": 0.05, "oi_change_pct": 0.05, "trend": 0.10},
+    "1h": {"net_flow_usd": 0.05, "imbalance": 0.00, "oi_change_pct": 0.05, "trend": 0.05},
+    "4h": {"net_flow_usd": 0.05, "imbalance": 0.00, "oi_change_pct": 0.05, "trend": 0.00},
+    "1d": {"net_flow_usd": 0.00, "imbalance": 0.00, "oi_change_pct": 0.00, "trend": 0.00},
+}
+
+_RANGING_TF_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "5m": {"net_flow_usd": 0.05, "imbalance": 0.15, "oi_change_pct": 0.05, "trend": 0.10},
+    "15m": {"net_flow_usd": 0.05, "imbalance": 0.10, "oi_change_pct": 0.05, "trend": 0.10},
+    "1h": {"net_flow_usd": 0.05, "imbalance": 0.05, "oi_change_pct": 0.05, "trend": 0.05},
+    "4h": {"net_flow_usd": 0.05, "imbalance": 0.00, "oi_change_pct": 0.05, "trend": 0.05},
+    "1d": {"net_flow_usd": 0.00, "imbalance": 0.00, "oi_change_pct": 0.00, "trend": 0.00},
+}
+
+_BREAKOUT_TF_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "5m": {"net_flow_usd": 0.15, "imbalance": 0.10, "oi_change_pct": 0.10, "trend": 0.15},
+    "15m": {"net_flow_usd": 0.15, "imbalance": 0.05, "oi_change_pct": 0.10, "trend": 0.05},
+    "1h": {"net_flow_usd": 0.05, "imbalance": 0.00, "oi_change_pct": 0.05, "trend": 0.00},
+    "4h": {"net_flow_usd": 0.05, "imbalance": 0.00, "oi_change_pct": 0.00, "trend": 0.00},
+    "1d": {"net_flow_usd": 0.00, "imbalance": 0.00, "oi_change_pct": 0.00, "trend": 0.00},
+}
+
+_BASELINE_WEIGHTS: Dict[str, Dict[str, Dict[str, float]]] = {
+    "trending_up": _TRENDING_TF_WEIGHTS,
+    "trending_down": _TRENDING_TF_WEIGHTS,
+    "breakout": _BREAKOUT_TF_WEIGHTS,
+    "breakdown": _BREAKOUT_TF_WEIGHTS,
+    "ranging": _RANGING_TF_WEIGHTS,
+    "transitional": _TRENDING_TF_WEIGHTS,
+    "overall": _TRENDING_TF_WEIGHTS,
+}
+
+# 因子归一化"参考量纲"：用 sigmoid(value / scale) × 2 - 1 把任意值压到 (-1, 1)。
+# scale 选取依据：
+#   - net_flow_usd：阈值 ±5e4，sigmoid(±1) ≈ ±0.46，量纲合理；
+#   - imbalance：原值已在 [-1, 1]，不需要 sigmoid，直接 clamp；
+#   - oi_change_pct：阈值 ±0.005，scale 取 0.01；
+#   - cvd_slope：经验值，scale 取 1e-4；
+#   - 其余未列出的因子默认走"value 直接 tanh"。
+_NORMALIZE_SCALES: Dict[str, float] = {
+    "net_flow_usd": 5e4,
+    "net_flow": 5e4,
+    "oi_change_pct": 0.01,
+    "cvd_slope": 1e-4,
+    "funding_rate_now": 1e-4,
+    "funding_rate": 1e-4,
+    "imbalance_slope_5m": 1e-3,
+    "imbalance_zscore_15m": 2.0,
+    "spread_bp": 5.0,
+    "atr_14": 50.0,
+    "adx_14": 25.0,
+    "bb_width": 0.02,
+    "wall_distance_pct": 0.005,
+}
+
+# trend 取值映射（uptrend=+1 / downtrend=-1 / 其他=0）
+_TREND_VALUE_MAP: Dict[str, float] = {
+    "uptrend": 1.0,
+    "downtrend": -1.0,
+    "range": 0.0,
+    "neutral": 0.0,
+}
+
+
+def _normalize_factor(name: str, value: Any) -> Optional[float]:
+    """
+    把单个原子因子的值压到 [-1, 1]
+    --------------------------------------------------------------
+    参数：
+        name : 因子名（决定使用哪种归一化策略）
+        value: 原始值
+    返回：
+        float ∈ [-1, 1]；无法解析时返回 None。
+    实现：
+        - bool / 'true|false' 映射到 ±1；
+        - trend 字段映射到 +1/-1/0；
+        - 其他数值走 sigmoid(value / scale) * 2 - 1；
+        - imbalance / *_pct 一类已经天然在 [-1, 1]，直接 clamp 不再 sigmoid。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else -1.0
+    if isinstance(value, str):
+        return _TREND_VALUE_MAP.get(value)
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    # 已经在 [-1, 1] 量纲的，直接 clamp
+    if name in ("imbalance", "imbalance_now", "alignment_score") or name.endswith("_ratio"):
+        return max(-1.0, min(1.0, v))
+    scale = _NORMALIZE_SCALES.get(name)
+    if scale is None or scale <= 0:
+        return math.tanh(v)
+    return math.tanh(v / scale)
+
+
+def _direction_sign(name: str, value: Any) -> float:
+    """
+    估算"该因子在多空两个方向上的有效贡献符号"
+    --------------------------------------------------------------
+    多数因子是"值越大越偏多、越小越偏空"，符号 = sign(normalize(value))；
+    少数特殊因子会反过来（例如 retail_long_short_ratio 极高 = 散户狂多 = 反指）。
+    本函数集中处理这些方向反转，避免在 evaluate 里散落 if-else。
+    返回：
+        +1.0 / -1.0 / 0.0
+    """
+    norm = _normalize_factor(name, value)
+    if norm is None:
+        return 0.0
+    sign = 1.0 if norm > 0 else (-1.0 if norm < 0 else 0.0)
+    # 反指因子：散户多空比 / 散户合约比（顶 ↔ 底反相关）
+    if name in ("account_long_short_ratio", "account_contract_ratio"):
+        return -sign
+    return sign
+
+
 class RuleEngine:
     """
-    确定性快速信号生成器
+    确定性快速信号生成器（P2 升级：权重表 + 缓存 + 原子粒度 contributions）
     -----------------------------------------------------------------
     职责：
         - 把因子聚合结果映射成有方向的偏置（long/short/neutral）。
-        - 输出归一到 [-1, 1] 的总分以及各因子组的贡献度，方便给 LLM
-          做二次决策时参考。
+        - 输出 [-1, 1] 的总分以及"原子因子"贡献度，方便下游归因。
+        - 周期性从 factor_weights 表刷新权重；表为空 / 失败时退回基线。
     """
 
-    def __init__(self, settings: Settings):
+    # 缓存有效期（秒）。5 分钟是经验取舍：低于此值会让规则引擎对 IC
+    # 任务结果反应过快（不利于平稳性），高于此值灰度切换感知会变慢。
+    _CACHE_TTL_SECONDS: float = 300.0
+
+    def __init__(self, settings: Settings, repos: Optional[Repositories] = None):
         """
         构造规则引擎
         ---------------------------------------------------------------
         参数：
-            settings: 全局配置，提供四个核心阈值与权重的来源。
+            settings : 全局配置（含 enable_factor_weights_table /
+                       ic_calibrator_shadow_mode 等开关）
+            repos    : 数据仓储；P0/P1 模式下可选（None → 直接走基线权重）
         """
         self.settings = settings
+        self.repos = repos
+        # 缓存：{(regime, timeframe): {factor_name: weight}}
+        self._weight_cache: Dict[Tuple[str, str], Dict[str, float]] = {}
+        self._weight_cache_ts: float = 0.0
+        # 缓存来源标记：'db' / 'baseline' / 'shadow_baseline'
+        # 仅用于日志诊断，不影响业务。
+        self._weight_cache_source: str = "baseline"
 
-    def evaluate(
+    # ------------------------------------------------------------------
+    # 公开入口
+    # ------------------------------------------------------------------
+    async def evaluate(
         self, factors: Dict[str, Any]
     ) -> Tuple[TradingSignal, float, Dict[str, Any]]:
         """
-        基于因子 dict 评估信号
+        基于因子 dict 评估信号（P2 升级：异步，需要拉权重表）
         ---------------------------------------------------------------
         参数：
-            factors: :class:`FactorAggregator.compute` 的输出（兼容多周期与老格式）。
+            factors: FactorAggregator.compute 的输出（兼容多周期与老格式）。
         返回：
-            ``(signal, score, contributions)``：
-                signal:        TradingSignal 实例（中文 reason/risk/suggestion）
+            (signal, score, contributions)
+                signal:        TradingSignal（中文 reason/risk/suggestion）
                 score:         [-1, 1] 区间的加权打分
-                contributions: 每个因子组的原始贡献度（-1 / 0 / +1 / -0.5 等）
-        说明：
-            P0 升级后兼容两种输入：
-                1) 老格式（enable_mtf_factors=False）：单层 dict，含 capital_flow 等四类；
-                2) 新格式（enable_mtf_factors=True）：含 by_timeframe；规则引擎默认抽取
-                   15m 周期的因子作为代表（与原 30 分钟窗口的语义最接近），并把
-                   net_flow_usd 用作老 net_flow 的等价值。
+                contributions: dict，键为 "tf:group.factor_name"，值为该原子因子
+                               对总打分的贡献（含正负号）。
         """
-        # 阈值统一从 Settings 拉取
-        net_flow_thr = self.settings.rule_net_flow_usd_threshold
-        ob_thr = self.settings.rule_orderbook_imbalance_threshold
-        oi_thr = self.settings.rule_oi_change_threshold
-        funding_thr = self.settings.rule_funding_rate_threshold
+        regime = factors.get("regime") or "overall"
+        await self._ensure_weight_cache()
 
-        cap, ob, deriv, struct = self._extract_layers(factors)
+        # 多周期 / 老格式抽取：构造"按 (timeframe, factor_name) 索引的因子表"
+        # 同时保留四类粗粒度块用于 reason 文案 / 交易计划构造。
+        atomic_values: Dict[Tuple[str, str, str], Any] = self._collect_atomic_values(factors)
+        # 兼容老格式的 4 类粗粒度（仅用于 reason / suggestion 渲染）
+        cap_layer, ob_layer, deriv_layer, struct_layer = self._extract_legacy_layers(factors)
 
+        # ---- 计算 contributions（原子因子粒度）+ 总分 ----
         contributions: Dict[str, float] = {}
+        score = 0.0
+        weight_lookup_count = 0
+        for (tf, group, name), value in atomic_values.items():
+            weight = self._lookup_weight(regime=regime, tf=tf, factor_name=name)
+            if weight <= 0:
+                continue
+            sign = _direction_sign(name, value)
+            if sign == 0.0:
+                continue
+            contrib = sign * weight
+            score += contrib
+            contributions[f"{tf}:{group}.{name}"] = round(contrib, 6)
+            weight_lookup_count += 1
 
-        # ---- 资金流贡献度 ----
-        # 兼容：老格式用 net_flow（USD）；新格式用 net_flow_usd
-        net_flow = float(cap.get("net_flow_usd") or cap.get("net_flow") or 0.0)
-        if net_flow > net_flow_thr:
-            contributions["capital_flow"] = +1.0
-        elif net_flow < -net_flow_thr:
-            contributions["capital_flow"] = -1.0
-        else:
-            contributions["capital_flow"] = 0.0
+        # 若没有任何因子命中权重（极端情况：表里只有黑名单因子），
+        # 退回老的 4 类粗粒度计算逻辑，保证 score 不长期为 0。
+        if weight_lookup_count == 0:
+            score, legacy_contribs = self._evaluate_legacy_score(
+                regime=regime,
+                cap=cap_layer,
+                ob=ob_layer,
+                deriv=deriv_layer,
+                struct=struct_layer,
+            )
+            contributions.update(legacy_contribs)
+            logger.debug(
+                "规则引擎未命中任何权重表因子，已退回 P1 等价的四类粗粒度打分"
+            )
 
-        # ---- 订单簿贡献度 ----
-        imbalance = float(ob.get("imbalance") or 0.0)
-        if imbalance > ob_thr:
-            contributions["orderbook"] = +1.0
-        elif imbalance < -ob_thr:
-            contributions["orderbook"] = -1.0
-        else:
-            contributions["orderbook"] = 0.0
-
-        # ---- 衍生品贡献度（funding × OI 变动）----
-        funding = float(
-            deriv.get("funding_rate_now") or deriv.get("funding_rate") or 0.0
-        )
-        oi_change = deriv.get("oi_change_pct")
-        oi_signal = 0.0
-        if oi_change is not None:
-            if oi_change > oi_thr and funding > funding_thr:
-                oi_signal = +1.0
-            elif oi_change > oi_thr and funding < -funding_thr:
-                oi_signal = -1.0
-            elif oi_change < -oi_thr:
-                oi_signal = -0.5
-        contributions["derivatives"] = oi_signal
-
-        # ---- 市场结构贡献度 ----
-        trend = struct.get("trend") or "range"
-        contributions["market_structure"] = (
-            +1.0 if trend == "uptrend" else -1.0 if trend == "downtrend" else 0.0
-        )
-
-        # 链上因子已下线，剩余四类重新分配权重，保证总和为 1.0
-        weights = {
-            "capital_flow": 0.35,
-            "orderbook": 0.15,
-            "derivatives": 0.20,
-            "market_structure": 0.30,
-        }
-        score = sum(contributions[k] * weights[k] for k in weights)
-        score = max(min(score, 1.0), -1.0)
+        score = max(-1.0, min(1.0, score))
 
         if score >= 0.25:
             bias = "long"
@@ -128,35 +280,21 @@ class RuleEngine:
 
         confidence = round(min(abs(score), 1.0), 3)
 
-        # ---- 中文 reason ----
-        oi_change_str = (
-            "暂无" if oi_change is None else f"{oi_change:+.4%}"
+        # ---- 构造 reason / risk / suggestion + 结构化交易计划 ----
+        reason = self._render_reason(
+            regime=regime,
+            cap=cap_layer,
+            ob=ob_layer,
+            deriv=deriv_layer,
+            struct=struct_layer,
+            cache_source=self._weight_cache_source,
         )
-        reason_parts = [
-            f"净流入={net_flow:+.0f} USDT",
-            f"盘口失衡={imbalance:+.3f}",
-            f"资金费率={funding:+.6f}",
-            f"持仓量变动={oi_change_str}",
-            f"趋势={_trend_zh(trend)}",
-        ]
-        reason = "规则引擎: " + ", ".join(reason_parts)
+        risk = self._render_risk(cap=cap_layer, struct=struct_layer)
 
-        # ---- 中文 risk ----
-        risk_bits = []
-        if abs(net_flow) < net_flow_thr:
-            risk_bits.append("资金流方向不明")
-        if trend == "range" or trend == "neutral":
-            risk_bits.append("无明确趋势")
-        if not risk_bits:
-            risk_bits.append("关注资金费率反转与对侧大单墙")
-        risk = "；".join(risk_bits)
-
-        # ---- 中文 suggestion 与结构化交易计划 ----
-        sup = [float(s) for s in (struct.get("supports") or []) if s is not None]
-        res = [float(r) for r in (struct.get("resistances") or []) if r is not None]
-        # 兼容新老 schema：market_structure 在新格式里用 last_close
-        entry_raw = struct.get("last_price") or struct.get("last_close")
-        atr_14 = struct.get("atr_14")
+        sup = [float(s) for s in (struct_layer.get("supports") or []) if s is not None]
+        res = [float(r) for r in (struct_layer.get("resistances") or []) if r is not None]
+        entry_raw = struct_layer.get("last_price") or struct_layer.get("last_close")
+        atr_14 = struct_layer.get("atr_14")
         try:
             entry = float(entry_raw) if entry_raw is not None else None
         except (TypeError, ValueError):
@@ -166,7 +304,6 @@ class RuleEngine:
         except (TypeError, ValueError):
             atr_val = None
 
-        # 结构化交易计划（仅 long / short 时计算；neutral 时全为 None / 空）
         plan: Optional[Dict[str, Any]] = None
         if bias != "neutral" and entry is not None and entry > 0:
             plan = _build_trade_plan(
@@ -199,9 +336,6 @@ class RuleEngine:
                 "（仅供参考，不构成交易指令）。"
             )
 
-        # 如果计划构造失败（数据不足 / 价位顺序无法满足），则把 bias 软降级为
-        # neutral，避免在 TradingSignal schema 校验环节因缺字段直接抛 ValueError
-        # 把整轮信号生成打挂。score / contributions 保留原样供 LLM 参考。
         if bias != "neutral" and plan is None:
             logger.info(
                 "规则引擎缺少有效价位（entry/sup/res/atr 数据不足），"
@@ -229,23 +363,151 @@ class RuleEngine:
         signal = TradingSignal(**signal_kwargs)
         return signal, score, contributions
 
+    # ------------------------------------------------------------------
+    # 同步 evaluate 包装：service 层目前是 await self.rule_engine.evaluate(...)，
+    # 该 wrapper 仅为单元测试 / 旧调用方保持兼容（同步调用会直接报错）。
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 权重缓存
+    # ------------------------------------------------------------------
+    async def _ensure_weight_cache(self) -> None:
+        """
+        必要时刷新内存权重缓存（5 分钟 TTL）
+        ---------------------------------------------------------------
+        刷新策略：
+            - enable_factor_weights_table=False 或 ic_calibrator_shadow_mode=True
+              或 repos 缺失：直接装入基线权重（不查 DB）；
+            - 否则查表，按 (regime, timeframe) 聚合 → 写缓存；
+            - 任何异常 / 表为空 → 退回基线 + warning。
+        """
+        if (time.time() - self._weight_cache_ts) < self._CACHE_TTL_SECONDS and self._weight_cache:
+            return
+        use_db = (
+            bool(getattr(self.settings, "enable_factor_weights_table", False))
+            and not bool(getattr(self.settings, "ic_calibrator_shadow_mode", True))
+            and self.repos is not None
+        )
+        if not use_db:
+            self._weight_cache = self._load_baseline_cache()
+            self._weight_cache_ts = time.time()
+            self._weight_cache_source = (
+                "shadow_baseline"
+                if bool(getattr(self.settings, "ic_calibrator_shadow_mode", True))
+                else "baseline"
+            )
+            return
+
+        try:
+            rows = await self.repos.fetch_all_factor_weights()
+        except Exception:
+            logger.warning(
+                "factor_weights 查询失败，规则引擎降级到基线权重", exc_info=True
+            )
+            self._weight_cache = self._load_baseline_cache()
+            self._weight_cache_ts = time.time()
+            self._weight_cache_source = "baseline"
+            return
+
+        if not rows:
+            logger.warning(
+                "factor_weights 表为空，规则引擎降级到基线权重（IC 任务尚未跑过？）"
+            )
+            self._weight_cache = self._load_baseline_cache()
+            self._weight_cache_ts = time.time()
+            self._weight_cache_source = "baseline"
+            return
+
+        cache: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for r in rows:
+            key = (str(r["regime"]), str(r["timeframe"]))
+            try:
+                weight = float(r["weight"])
+            except (TypeError, ValueError):
+                continue
+            cache.setdefault(key, {})[str(r["factor_name"])] = weight
+
+        self._weight_cache = cache
+        self._weight_cache_ts = time.time()
+        self._weight_cache_source = "db"
+
+    @classmethod
+    def _load_baseline_cache(cls) -> Dict[Tuple[str, str], Dict[str, float]]:
+        """
+        把 _BASELINE_WEIGHTS 装成与 DB 同结构的缓存
+        """
+        out: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for regime, tf_map in _BASELINE_WEIGHTS.items():
+            for tf, factor_map in tf_map.items():
+                out[(regime, tf)] = dict(factor_map)
+        return out
+
+    def _lookup_weight(self, regime: str, tf: str, factor_name: str) -> float:
+        """
+        三级查找：(regime, tf) → ('overall', tf) → 0
+        ---------------------------------------------------------------
+        说明：
+            regime 在 detect_regime 输出 transitional 时也会走这里，
+            如果该 regime 下没有显式权重，退到 overall 兜底维度。
+        """
+        v = self._weight_cache.get((regime, tf), {}).get(factor_name)
+        if v is not None:
+            return float(v)
+        v = self._weight_cache.get(("overall", tf), {}).get(factor_name)
+        if v is not None:
+            return float(v)
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # 因子展开 / 抽取
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _collect_atomic_values(
+        factors: Dict[str, Any],
+    ) -> Dict[Tuple[str, str, str], Any]:
+        """
+        把多周期因子矩阵 + 老格式都展平到 (timeframe, group, name) → value 的 dict
+        """
+        out: Dict[Tuple[str, str, str], Any] = {}
+        # 多周期路径
+        by_tf = factors.get("by_timeframe") or {}
+        if isinstance(by_tf, dict):
+            for tf, block in by_tf.items():
+                if not isinstance(block, dict):
+                    continue
+                for group in (
+                    "capital_flow", "orderbook", "derivatives", "market_structure"
+                ):
+                    payload = block.get(group)
+                    if not isinstance(payload, dict):
+                        continue
+                    for k, v in payload.items():
+                        out[(str(tf), group, k)] = v
+        # 老格式（无 by_timeframe）：当 15m / overall 看待
+        if not by_tf:
+            for group in ("capital_flow", "orderbook", "derivatives", "market_structure"):
+                payload = factors.get(group)
+                if isinstance(payload, dict):
+                    for k, v in payload.items():
+                        out[("15m", group, k)] = v
+        # 根节点 liquidity / position_ratios → timeframe='overall'
+        for root_group in ("liquidity", "position_ratios"):
+            payload = factors.get(root_group)
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    out[("overall", root_group, k)] = v
+        return out
 
     @staticmethod
-    def _extract_layers(
+    def _extract_legacy_layers(
         factors: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """
-        从因子聚合结果中抽取四类因子层（兼容老 / 新格式）
+        抽取代表周期（默认 15m，回退 5m → 1h → 4h → 1d）的四类块
         ---------------------------------------------------------------
-        参数：
-            factors: 来自 FactorAggregator.compute 的输出
-        返回：
-            (capital_flow, orderbook, derivatives, market_structure)
         说明：
-            - 老格式（无 by_timeframe）：直接返回顶层四个键。
-            - 新格式（多周期矩阵）：默认抽取 15m 周期作为规则引擎代表周期，
-              这与历史"30 分钟单一窗口"的语义最接近，最大化与旧阈值的兼容性。
-              如果 15m 不存在则按 5m → 1h 顺序回退。
+            仅用于 reason / risk / suggestion 文案生成 + 交易计划构造，
+            真正的打分已经走 _collect_atomic_values 多周期展开了。
         """
         if "by_timeframe" not in factors:
             return (
@@ -269,7 +531,111 @@ class RuleEngine:
             chosen.get("market_structure", {}) or {},
         )
 
+    def _evaluate_legacy_score(
+        self,
+        regime: str,
+        cap: Dict[str, Any],
+        ob: Dict[str, Any],
+        deriv: Dict[str, Any],
+        struct: Dict[str, Any],
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        权重表完全无效时的兜底打分 —— 与 P1 行为等价，但 contributions 仍按
+        "原子因子键"输出，保证下游归因接口 schema 不变。
+        """
+        net_flow = float(cap.get("net_flow_usd") or cap.get("net_flow") or 0.0)
+        imbalance = float(ob.get("imbalance") or 0.0)
+        funding = float(deriv.get("funding_rate_now") or deriv.get("funding_rate") or 0.0)
+        oi_change = deriv.get("oi_change_pct")
+        trend = struct.get("trend") or "range"
 
+        # 与 P0/P1 等价的"四类粗粒度权重"
+        weights = {"capital_flow": 0.35, "orderbook": 0.15, "derivatives": 0.20, "market_structure": 0.30}
+
+        cap_score = (
+            1.0 if net_flow > self.settings.rule_net_flow_usd_threshold else
+            -1.0 if net_flow < -self.settings.rule_net_flow_usd_threshold else 0.0
+        )
+        ob_score = (
+            1.0 if imbalance > self.settings.rule_orderbook_imbalance_threshold else
+            -1.0 if imbalance < -self.settings.rule_orderbook_imbalance_threshold else 0.0
+        )
+        oi_score = 0.0
+        if oi_change is not None:
+            if oi_change > self.settings.rule_oi_change_threshold and funding > self.settings.rule_funding_rate_threshold:
+                oi_score = 1.0
+            elif oi_change > self.settings.rule_oi_change_threshold and funding < -self.settings.rule_funding_rate_threshold:
+                oi_score = -1.0
+            elif oi_change < -self.settings.rule_oi_change_threshold:
+                oi_score = -0.5
+        struct_score = +1.0 if trend == "uptrend" else -1.0 if trend == "downtrend" else 0.0
+
+        score = (
+            cap_score * weights["capital_flow"]
+            + ob_score * weights["orderbook"]
+            + oi_score * weights["derivatives"]
+            + struct_score * weights["market_structure"]
+        )
+        contribs = {
+            "15m:capital_flow.net_flow_usd": round(cap_score * weights["capital_flow"], 6),
+            "15m:orderbook.imbalance": round(ob_score * weights["orderbook"], 6),
+            "15m:derivatives.oi_change_pct": round(oi_score * weights["derivatives"], 6),
+            "15m:market_structure.trend": round(struct_score * weights["market_structure"], 6),
+        }
+        return score, contribs
+
+    def _render_reason(
+        self,
+        regime: str,
+        cap: Dict[str, Any],
+        ob: Dict[str, Any],
+        deriv: Dict[str, Any],
+        struct: Dict[str, Any],
+        cache_source: str,
+    ) -> str:
+        """
+        生成中文 reason 摘要
+        ---------------------------------------------------------------
+        说明：
+            cache_source 写在末尾，便于排查 LLM 是否拿到了影子模式 / DB 权重。
+        """
+        net_flow = float(cap.get("net_flow_usd") or cap.get("net_flow") or 0.0)
+        imbalance = float(ob.get("imbalance") or 0.0)
+        funding = float(deriv.get("funding_rate_now") or deriv.get("funding_rate") or 0.0)
+        oi_change = deriv.get("oi_change_pct")
+        trend = struct.get("trend") or "range"
+
+        oi_change_str = "暂无" if oi_change is None else f"{oi_change:+.4%}"
+        return (
+            f"规则引擎(regime={regime}, weights={cache_source}): "
+            f"净流入={net_flow:+.0f} USDT, "
+            f"盘口失衡={imbalance:+.3f}, "
+            f"资金费率={funding:+.6f}, "
+            f"持仓量变动={oi_change_str}, "
+            f"趋势={_trend_zh(trend)}"
+        )
+
+    def _render_risk(
+        self, cap: Dict[str, Any], struct: Dict[str, Any]
+    ) -> str:
+        """
+        生成中文 risk 摘要
+        """
+        net_flow = float(cap.get("net_flow_usd") or cap.get("net_flow") or 0.0)
+        trend = struct.get("trend") or "range"
+        risk_bits: List[str] = []
+        if abs(net_flow) < self.settings.rule_net_flow_usd_threshold:
+            risk_bits.append("资金流方向不明")
+        if trend in ("range", "neutral"):
+            risk_bits.append("无明确趋势")
+        if not risk_bits:
+            risk_bits.append("关注资金费率反转与对侧大单墙")
+        return "；".join(risk_bits)
+
+
+# ----------------------------------------------------------------------
+# 与 P0/P1 完全相同的交易计划构造（保持兼容；逻辑未改动）
+# ----------------------------------------------------------------------
 def _build_trade_plan(
     bias: str,
     entry: float,
@@ -280,27 +646,12 @@ def _build_trade_plan(
     """
     基于支撑 / 阻力 / ATR 构造一份满足 TradingSignal schema 的粗粒度交易计划
     -------------------------------------------------------------------
-    参数：
-        bias:        'long' 或 'short'
-        entry:       当前最新成交价（last_close）
-        supports:    支撑位列表（按距 entry 由近到远）
-        resistances: 阻力位列表（按距 entry 由近到远）
-        atr:         14 周期 ATR；缺失时退化为基于价格的百分比波动估计
-    返回：
-        包含 ``entry_zone / stop_loss / take_profit / risk_reward_ratio`` 的 dict；
-        若构造结果不满足 schema 顺序约束（sl / ez / tp 链条单调）或 RR<1.5，
-        返回 None，调用方将信号降级为 neutral。
     说明：
-        - 入场区间：以 entry 为中心，宽度取 max(0.1×ATR, 0.1% × entry)；
-        - 止损：优先使用最近的支撑/阻力，否则按 1.0×ATR 或 0.5% 兜底；
-        - 止盈 1：优先使用最近的对侧阻力/支撑，否则按 2.0×ATR 或 1.0% 兜底；
-        - 止盈 2：优先取下一档对侧位，否则在 tp1 上再加一档 (1.0×ATR / 1.0%)；
-        - 严格按 schema 顺序约束校验，构造失败返回 None 由上层降级处理。
+        与 P0/P1 完全一致，未做任何调整；P2 升级只改打分通路，不改交易
+        计划构造逻辑，避免一次性引入两个变化导致回归难度上升。
     """
     if entry <= 0:
         return None
-
-    # ATR 缺失时退化为价格百分比波动；这是 P0 阶段的兜底估计
     band_unit = atr if atr and atr > 0 else max(entry * 0.005, 1e-6)
     half_band = max(band_unit * 0.1, entry * 0.001)
     ez_low = entry - half_band
@@ -312,7 +663,6 @@ def _build_trade_plan(
             sl = max(valid_sup)
         else:
             sl = ez_low - max(band_unit * 1.0, entry * 0.005)
-
         valid_res = sorted({round(r, 6) for r in resistances if r > ez_high})
         if len(valid_res) >= 2:
             tp1, tp2 = float(valid_res[0]), float(valid_res[1])
@@ -322,10 +672,8 @@ def _build_trade_plan(
         else:
             tp1 = ez_high + max(band_unit * 2.0, entry * 0.01)
             tp2 = tp1 + max(band_unit * 1.0, entry * 0.01)
-
         if not (sl < ez_low <= ez_high < tp1 < tp2):
             return None
-
         entry_mid = (ez_low + ez_high) / 2
         risk_per_unit = abs(entry_mid - sl)
         reward_per_unit = abs(tp1 - entry_mid)
@@ -335,7 +683,6 @@ def _build_trade_plan(
             sl = min(valid_res)
         else:
             sl = ez_high + max(band_unit * 1.0, entry * 0.005)
-
         valid_sup = sorted({round(s, 6) for s in supports if s < ez_low}, reverse=True)
         if len(valid_sup) >= 2:
             tp1, tp2 = float(valid_sup[0]), float(valid_sup[1])
@@ -345,10 +692,8 @@ def _build_trade_plan(
         else:
             tp1 = ez_low - max(band_unit * 2.0, entry * 0.01)
             tp2 = tp1 - max(band_unit * 1.0, entry * 0.01)
-
         if not (sl > ez_high >= ez_low > tp1 > tp2):
             return None
-
         entry_mid = (ez_low + ez_high) / 2
         risk_per_unit = abs(entry_mid - sl)
         reward_per_unit = abs(tp1 - entry_mid)
@@ -358,12 +703,8 @@ def _build_trade_plan(
     if risk_per_unit <= 1e-9:
         return None
     rr = round(reward_per_unit / risk_per_unit, 4)
-    # schema 内置 RR<1.5 强制降级；这里如果一开始就低于阈值就直接放弃，
-    # 让调用方走 neutral 路径，省去 schema 内部 warning 与字段擦除
     if rr < 1.5:
         return None
-
-    # 价位精度统一保留 4 位小数，与 market_structure 输出一致
     return {
         "entry_zone": (round(ez_low, 4), round(ez_high, 4)),
         "stop_loss": round(float(sl), 4),
@@ -375,11 +716,6 @@ def _build_trade_plan(
 def _trend_zh(trend: str) -> str:
     """
     把英文趋势枚举映射到中文标签
-    -------------------------------------------------------------------
-    参数：
-        trend: 'uptrend' / 'downtrend' / 'range' / 'neutral' 等
-    返回：
-        中文标签字符串，未知值原样返回。
     """
     mapping = {
         "uptrend": "上升",
@@ -393,11 +729,6 @@ def _trend_zh(trend: str) -> str:
 def _fmt_price(value: Any) -> str:
     """
     格式化价格：None 显示为'未知'，其他保留原值
-    -------------------------------------------------------------------
-    参数：
-        value: 数字或 None
-    返回：
-        中文友好的价格字符串。
     """
     if value is None:
         return "未知"

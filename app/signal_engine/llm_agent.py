@@ -17,7 +17,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -204,6 +204,23 @@ SYSTEM_PROMPT = """\
 5) 当 liquidity_vacuum_above=true 且 bias='long' 时，take_profit 至少
    一档要落在"上方流动性池中第一档 strong/medium 节点"附近 ±0.3% 范围内；
    vacuum_below + 'short' 同理。
+
+【P2 强约束（自我反馈机制 - 必须严格遵守）】
+1) 你将看到自己最近 N 次判断的实际 PnL（来自 signal_lifecycle 表，含
+   sl_hit / tp1_hit / tp2_hit / expired 四类终态）。如果近 5 次中有
+   ≥ 3 次为 sl_hit 或 expired（即胜率 ≤ 40%），必须显著降低本次 confidence
+   到 < 0.5；同时在 reason 字段中明确反思失败模式（例如：
+   "近 5 次中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"
+   或 "近 5 次 4 次 expired，入场区间过窄导致始终未触发"）。
+2) 如果上一条信号仍处于 triggered 状态（未结算），新判断方向**不能**
+   与其相反。除非有明显的反转证据（例如同时出现 swept_high +
+   cvd_price_divergence + 大周期趋势翻转），否则你应输出 neutral
+   等待上一条结算，并在 reason 中显式提到 "上一条信号 #<id> 仍持仓中"。
+3) 当近 5 次判断的 sample_count < 3（冷启动期）时不应用上述硬约束，
+   但 reason 中要注明 "样本不足，未触发自我反馈降权"。
+4) 对历史成绩的解释必须客观：不要因为 1 次大额胜利就过度自信，
+   也不要因为 1 次最大不利波动就强行翻转方向；优先看胜率 / 平均 RR
+   / 最大回撤三者的组合。
 """
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -222,7 +239,7 @@ JSON Schema:
 """
 
 HUMAN_PROMPT = """\
-合约: {symbol}
+{self_feedback_block}合约: {symbol}
 时间: {ts}
 
 规则引擎: bias={rule_bias} score={rule_score} confidence={rule_confidence}
@@ -637,6 +654,8 @@ class LLMAgent:
         rule_signal: TradingSignal,
         rule_score: float,
         rule_contributions: Dict[str, float],
+        recent_settled: Optional[List[Dict[str, Any]]] = None,
+        open_lifecycle: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         把多周期因子矩阵渲染成紧凑中文表格，作为 ChatPromptTemplate 输入
@@ -678,6 +697,19 @@ class LLMAgent:
             position_ratios_text = "（老聚合器模式：未提供散户/精英多空比）"
             liquidity_text = "（老聚合器模式：未提供流动性地图）"
 
+        # P2：自我反馈段（注入到 HUMAN_PROMPT 的最前面）
+        # ----------------------------------------------------------
+        # 只有 enable_llm_self_feedback=True 且 recent_settled / open_lifecycle
+        # 至少一项非空时，才渲染该段；否则给空字符串占位（不破坏模板）。
+        if bool(getattr(self.settings, "enable_llm_self_feedback", False)):
+            self_feedback_block = self._render_self_feedback(
+                symbol=symbol,
+                recent_settled=recent_settled or [],
+                open_lifecycle=open_lifecycle,
+            )
+        else:
+            self_feedback_block = ""
+
         return {
             "symbol": symbol,
             "ts": ts,
@@ -695,7 +727,114 @@ class LLMAgent:
             "orderbook_dynamic_text": orderbook_dynamic_text,
             "position_ratios_text": position_ratios_text,
             "liquidity_text": liquidity_text,
+            "self_feedback_block": self_feedback_block,
         }
+
+    @classmethod
+    def _render_self_feedback(
+        cls,
+        symbol: str,
+        recent_settled: List[Dict[str, Any]],
+        open_lifecycle: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        渲染"近 5 次成绩单 + 未结算持仓"段（P2 自我反馈）
+        ---------------------------------------------------------------
+        参数：
+            symbol           : 合约
+            recent_settled   : 近 N 条已结算 lifecycle（含 join 出来的 signals 字段）
+            open_lifecycle   : 当前未结算的最近一条；可选
+        返回：
+            紧凑中文表格（含统计摘要 + 未结算告警）；总长度严格控制在
+            ~1500 token 以内（用 markdown 表格而非 JSON），避免反复推高
+            prompt 成本（详见模块顶部 P2 强约束）。
+        """
+        lines: List[str] = []
+        lines.append(f"===== 你最近 {len(recent_settled)} 次判断的实际成绩（{symbol}）=====")
+
+        if not recent_settled:
+            lines.append("（样本不足：lifecycle 表里还没有该 symbol 的已结算记录）")
+        else:
+            lines.append(
+                "| ts | bias | conf | regime | 入场区间 | 触发价 | 退出原因 | PnL% | 最大有利% | 最大不利% |"
+            )
+            lines.append(
+                "|----|------|------|--------|----------|--------|----------|------|-----------|-----------|"
+            )
+            wins = 0
+            losses = 0
+            expired_cnt = 0
+            pnl_acc: List[float] = []
+            for row in recent_settled:
+                ts = row.get("signal_ts")
+                ts_str = ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else "-"
+                bias = row.get("bias") or "-"
+                conf = row.get("confidence")
+                conf_str = f"{float(conf):.2f}" if conf is not None else "-"
+                regime = cls._extract_regime_from_factors(row.get("factors"))
+                ez_low = row.get("entry_zone_low")
+                ez_high = row.get("entry_zone_high")
+                ez_str = (
+                    f"[{float(ez_low):.2f},{float(ez_high):.2f}]"
+                    if ez_low is not None and ez_high is not None
+                    else "-"
+                )
+                trig = row.get("triggered_price")
+                trig_str = f"{float(trig):.2f}" if trig is not None else "-"
+                status = row.get("status") or "-"
+                pnl = row.get("pnl_pct")
+                pnl_str = f"{float(pnl) * 100:+.2f}" if pnl is not None else "-"
+                mfp = row.get("max_favorable_pct")
+                mfp_str = f"{float(mfp) * 100:+.2f}" if mfp is not None else "-"
+                map_ = row.get("max_adverse_pct")
+                map_str = f"{float(map_) * 100:+.2f}" if map_ is not None else "-"
+                lines.append(
+                    f"| {ts_str} | {bias} | {conf_str} | {regime} | {ez_str} | "
+                    f"{trig_str} | {status} | {pnl_str} | {mfp_str} | {map_str} |"
+                )
+                if status in ("tp1_hit", "tp2_hit"):
+                    wins += 1
+                elif status == "sl_hit":
+                    losses += 1
+                elif status == "expired":
+                    expired_cnt += 1
+                if pnl is not None:
+                    pnl_acc.append(float(pnl))
+            total = len(recent_settled)
+            win_rate = wins / total if total else 0.0
+            avg_pnl = sum(pnl_acc) / len(pnl_acc) if pnl_acc else 0.0
+            lines.append(
+                f"统计：胜率={win_rate:.0%}（{wins}赢/{losses}输/{expired_cnt}超时） "
+                f"平均PnL={avg_pnl * 100:+.2f}%"
+            )
+
+        # 未结算持仓提醒（P2 强约束 #2）
+        if open_lifecycle:
+            sid = open_lifecycle.get("signal_id")
+            ob = open_lifecycle.get("bias")
+            ostat = open_lifecycle.get("status")
+            otrig = open_lifecycle.get("triggered_price")
+            otrig_str = f"@{float(otrig):.2f}" if otrig is not None else ""
+            lines.append(
+                f"⚠️ 上一条信号 #{sid} ({ob}, {ostat}{otrig_str}) **仍未结算**：除非你有明确反转证据，"
+                "否则应保持同向或输出 neutral 等待结算。"
+            )
+        lines.append("")  # 空行作为段落分隔
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _extract_regime_from_factors(factors_blob: Any) -> str:
+        """
+        从 signals.factors JSONB 中尽力取出 regime 字段（成绩单展示用）
+        """
+        if not isinstance(factors_blob, dict):
+            return "-"
+        inner = factors_blob.get("factors") if "factors" in factors_blob else factors_blob
+        if isinstance(inner, dict):
+            r = inner.get("regime")
+            if isinstance(r, str) and r:
+                return r
+        return "-"
 
     @staticmethod
     def _fmt(value: Any, digits: int = 4) -> str:
@@ -1051,6 +1190,8 @@ class LLMAgent:
         rule_signal: TradingSignal,
         rule_score: float,
         rule_contributions: Dict[str, float],
+        recent_settled: Optional[List[Dict[str, Any]]] = None,
+        open_lifecycle: Optional[Dict[str, Any]] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         执行一次 LLM 分析，带按 symbol 的节流缓存。
@@ -1116,6 +1257,8 @@ class LLMAgent:
                     rule_signal=rule_signal,
                     rule_score=rule_score,
                     rule_contributions=rule_contributions,
+                    recent_settled=recent_settled,
+                    open_lifecycle=open_lifecycle,
                 )
                 result = await self._chain.ainvoke(prompt_inputs)
             except Exception:
