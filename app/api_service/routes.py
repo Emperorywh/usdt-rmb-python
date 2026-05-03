@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from app.api_service.analysis_view import serialize_signal_full
 from app.api_service.deps import (
     get_container,
     get_factor_aggregator,
@@ -158,6 +159,139 @@ async def refresh_signal(
     if include_reasoning:
         payload["reasoning_content"] = result["reasoning_content"]
     return payload
+
+
+# ======================================================================
+# 前端综合分析视图（最近一次 / 历史列表 / 单条详情）
+# ----------------------------------------------------------------------
+# 设计目标：
+#   1) 一次拿齐前端"分析卡片 / 详情页"需要的所有字段，避免串行多次调用
+#      /signal + /signals/{id}/attribution + lifecycle stats。
+#   2) 把所有 Decimal / datetime / 枚举字段都做成对前端友好的形态：
+#      - Decimal → float、datetime → ISO8601；
+#      - bias / source / lifecycle_status 都补一份中文 label + Tag color；
+#      - take_profit 自动算好"距入场点的收益百分比"，前端直接渲染；
+#      - rule_contributions 已经按贡献度绝对值排好序并截断 top N。
+#   3) 默认带 factors_snapshot（可关），不带 reasoning_content 全文（可显式打开），
+#      避免默认响应被一两万字思维链撑爆。
+# ======================================================================
+@router.get("/analysis/latest", tags=["analysis"])
+async def get_latest_analysis(
+    symbol: Optional[str] = Query(default=None, description="合约代码；缺省取 settings.symbols[0]"),
+    include_factors: bool = Query(
+        default=True,
+        description="是否携带完整 factors 快照；前端列表页可置 False 节省带宽",
+    ),
+    include_reasoning: bool = Query(
+        default=False,
+        description="是否携带 LLM 思维链全文（reasoning_content，可能很长）",
+    ),
+    top_contributions: int = Query(
+        default=10, ge=1, le=50, description="规则引擎归因 top N 因子",
+    ),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    返回最新一次综合分析（前端友好视图）
+    -------------------------------------------------------------------
+    包含：信号判断 / 结构化交易计划 / 多周期共振 / regime / 流动性地图 /
+    规则引擎归因 / 信号生命周期实战表现 等。
+    """
+    sym = _resolve_symbol(symbol, container)
+    row = await container.repos.fetch_latest_signal_full(sym)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "暂无分析结果，请稍后再试或调用 POST /signal/refresh 主动触发"
+            ),
+        )
+    return serialize_signal_full(
+        row,
+        include_factors_snapshot=bool(include_factors),
+        include_reasoning=bool(include_reasoning),
+        rule_contributions_top_n=int(top_contributions),
+    )
+
+
+@router.get("/analysis/history", tags=["analysis"])
+async def get_analysis_history(
+    symbol: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100, description="返回条数（1~100）"),
+    bias: Optional[str] = Query(
+        default=None,
+        description="按 bias 过滤：long / short / neutral",
+    ),
+    source: Optional[str] = Query(
+        default=None,
+        description="source ILIKE 模式（如 '%llm%' 只看 LLM 路径）",
+    ),
+    include_factors: bool = Query(
+        default=False,
+        description="列表场景默认不返回 factors 快照，节省带宽；详情页再单独取",
+    ),
+    top_contributions: int = Query(default=5, ge=1, le=50),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    返回最近 N 条综合分析（按时间倒序，前端时间线 / 历史列表用）
+    -------------------------------------------------------------------
+    返回：
+        {
+            "symbol": ..., "count": N,
+            "items": [<同 /analysis/latest 的视图>, ...]
+        }
+    """
+    if bias is not None and bias not in ("long", "short", "neutral"):
+        raise HTTPException(
+            status_code=400, detail="bias 必须是 long / short / neutral"
+        )
+    sym = _resolve_symbol(symbol, container)
+    rows = await container.repos.fetch_recent_signals_full(
+        symbol=sym,
+        limit=int(limit),
+        bias=bias,
+        source_like=source,
+    )
+    items = [
+        serialize_signal_full(
+            r,
+            include_factors_snapshot=bool(include_factors),
+            include_reasoning=False,
+            rule_contributions_top_n=int(top_contributions),
+        )
+        for r in rows
+    ]
+    return {
+        "symbol": sym,
+        "count": len(items),
+        "filters": {"bias": bias, "source_like": source, "limit": int(limit)},
+        "items": items,
+    }
+
+
+@router.get("/analysis/{signal_id}", tags=["analysis"])
+async def get_analysis_by_id(
+    signal_id: int,
+    include_factors: bool = Query(default=True),
+    include_reasoning: bool = Query(default=False),
+    top_contributions: int = Query(default=20, ge=1, le=100),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    按 signals.id 读取单条综合分析详情
+    -------------------------------------------------------------------
+    与 /analysis/latest 字段一致；详情页通常打开 include_reasoning=true 看思维链全文。
+    """
+    row = await container.repos.fetch_signal_full_by_id(signal_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="signal_id not found")
+    return serialize_signal_full(
+        row,
+        include_factors_snapshot=bool(include_factors),
+        include_reasoning=bool(include_reasoning),
+        rule_contributions_top_n=int(top_contributions),
+    )
 
 
 # ======================================================================

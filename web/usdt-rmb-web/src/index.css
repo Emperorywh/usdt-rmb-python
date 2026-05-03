@@ -1,111 +1,238 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+@import "tailwindcss";
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/* ============================================================
+ * 主题变量（Tailwind v4 @theme）
+ * ----------------------------------------------------------
+ * 设计基调：明亮 / 留白 / 卡片式。参考 Linear / Notion / Vercel / Stripe Dashboard。
+ *   - bg / surface / hairline：基于 Tailwind slate 调色阶
+ *   - long / short / neutral：emerald / red / amber 的对比色阶（主色 + soft + bg）
+ *   - accent：indigo / blue 系，作为引导主色
+ *   - 圆角 / 阴影 / 字号：在 Tailwind 默认基础上提供 token，便于复用
+ * ============================================================ */
+@theme {
+  /* ------------------------- 字体 ------------------------- */
+  /* 字体设计：优先 Inter（产品级现代体），中文回落到苹方 / 鸿蒙 / 思源 */
+  --font-sans: "Inter", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas,
+    "Liberation Mono", monospace;
+  --font-display: "Inter", "PingFang SC", system-ui, sans-serif;
+  --font-cn: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Source Han Sans SC", sans-serif;
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  /* ----------------------- 中性色阶 ----------------------- */
+  /* 灰阶取自 Tailwind slate；保持极柔和的冷灰，不偏蓝也不偏暖 */
+  --color-bg: #f7f8fa;          /* 页面底色，柔和灰白 */
+  --color-bg-2: #f1f3f7;        /* 次级面板（如表格 hover） */
+  --color-surface: #ffffff;     /* 卡片底色 */
+  --color-surface-2: #fafbfc;   /* 卡片内嵌的浅灰区块 */
+  --color-hairline: #eaecef;    /* 一级分割线（≈ slate-200） */
+  --color-hairline-strong: #d8dde3; /* 二级分割线（≈ slate-300） */
+  --color-ink: #0f172a;         /* 主文字，slate-900 */
+  --color-ink-2: #334155;       /* 次文字，slate-700 */
+  --color-muted: #64748b;       /* 弱化文字，slate-500 */
+  --color-muted-2: #94a3b8;     /* 极弱文字 / 占位，slate-400 */
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
+  /* ----------------------- 语义色 ----------------------- */
+  /* 引导主色：indigo / blue 系（用于交互高亮、链接、focus） */
+  --color-accent: #2563eb;
+  --color-accent-2: #1d4ed8;
+  --color-accent-soft: #dbeafe;
+  --color-accent-bg: #eff6ff;
+
+  /* 做多 / 看多：emerald 系（绿色，纯净清爽） */
+  --color-long: #059669;
+  --color-long-2: #047857;
+  --color-long-soft: #d1fae5;
+  --color-long-bg: #ecfdf5;
+
+  /* 做空 / 看空：red 系 */
+  --color-short: #dc2626;
+  --color-short-2: #b91c1c;
+  --color-short-soft: #fee2e2;
+  --color-short-bg: #fef2f2;
+
+  /* 中性 / 观望：amber 系（黄棕） */
+  --color-neutral: #b45309;
+  --color-neutral-2: #92400e;
+  --color-neutral-soft: #fde68a;
+  --color-neutral-bg: #fffbeb;
+
+  /* ----------------------- 圆角 / 阴影 ----------------------- */
+  --radius-card: 1rem;
+  --shadow-card: 0 1px 2px 0 rgba(15, 23, 42, 0.04),
+    0 1px 3px 0 rgba(15, 23, 42, 0.04);
+  --shadow-card-hover: 0 8px 24px -8px rgba(15, 23, 42, 0.12),
+    0 2px 4px 0 rgba(15, 23, 42, 0.04);
+  --shadow-modal: 0 24px 48px -12px rgba(15, 23, 42, 0.2);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
+/* ============================================================
+ * 全局重置 / 字体回落
+ * ============================================================ */
+html,
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
   min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
+  width: 100%;
 }
 
-body {
-  margin: 0;
+/* ============================================================
+ * 通用工具类（在 Tailwind utility 之外补充少量自定义）
+ * ============================================================ */
+
+/* 等宽数字 + 列宽锁定，避免数字跳动时宽度抖动 */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum", "zero";
 }
 
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
+/* "Display" 大字：用于 Hero 判词。Inter 在大号下视觉收紧 */
+.font-display {
+  font-family: var(--font-display);
+  font-feature-settings: "cv11", "ss01", "ss03";
+  letter-spacing: -0.025em;
+  line-height: 1;
 }
 
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
+/* ============================================================
+ * 动画
+ * ============================================================ */
+
+/* 卡片 / 区块入场（staggered） */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
+.rise-in {
+  animation: rise-in 0.5s cubic-bezier(0.2, 0.7, 0.1, 1) both;
 }
 
-code,
-.counter {
-  font-family: var(--mono);
+/* "live" 在线指示灯：emerald 脉冲 */
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(5, 150, 105, 0);
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+/* 骨架屏：左右扫光 */
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-2) 0%,
+    #ffffff 50%,
+    var(--color-bg-2) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  border-radius: 0.5rem;
+}
+
+/* 抽屉滑入（思维链） */
+@keyframes drawer-in {
+  from {
+    transform: translateX(8%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+.drawer-in {
+  animation: drawer-in 0.32s cubic-bezier(0.2, 0.7, 0.1, 1) both;
+}
+
+/* ============================================================
+ * Tooltip：纯 CSS 实现，避免引入额外依赖
+ *   用法：<span class="tooltip">触发<span class="tooltip-content">提示</span></span>
+ * ============================================================ */
+.tooltip {
+  position: relative;
   display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
+}
+.tooltip > .tooltip-content {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  white-space: nowrap;
+  padding: 6px 10px;
+  background: #0f172a;
+  color: #f8fafc;
+  font-size: 11px;
+  line-height: 1.4;
+  border-radius: 6px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  z-index: 60;
+  box-shadow: 0 4px 14px -2px rgba(15, 23, 42, 0.2);
+}
+.tooltip:hover > .tooltip-content,
+.tooltip:focus-visible > .tooltip-content {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }
 
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+/* ============================================================
+ * 滚动条（webkit）—— 极简灰
+ * ============================================================ */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.1);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.2);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ============================================================
+ * 链接 / 按钮 focus 视觉
+ * ============================================================ */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
 }

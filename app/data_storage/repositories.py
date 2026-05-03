@@ -909,6 +909,166 @@ class Repositories:
             )
         return dict(row) if row else None
 
+    async def fetch_latest_signal_full(
+        self, symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        读取指定 symbol 最近一条信号的"全字段视图"（含 P0 结构化交易计划 + lifecycle）
+        ---------------------------------------------------------------
+        参数：
+            symbol: 合约代码
+        返回：
+            dict（不存在则返回 None），字段包含：
+                - signals 表全部列（id / ts / bias / confidence / reason / risk /
+                  suggestion / factors / source / reasoning_content /
+                  entry_zone / stop_loss / take_profit / risk_reward_ratio /
+                  position_size_pct / timeframe_alignment / invalidation_conditions）
+                - 通过 LEFT JOIN signal_lifecycle 拼上的实战结果列：
+                  lifecycle_status / triggered_at / triggered_price /
+                  exit_at / exit_price / pnl_pct / max_favorable_pct /
+                  max_adverse_pct / lifecycle_expires_at / lifecycle_updated_at
+        说明：
+            - 专供前端"分析卡片 / 详情页"使用，一次拿齐所有可视化字段，
+              避免前端串行多次调用 /signal + /signals/{id}/attribution + lifecycle stats。
+            - LEFT JOIN：未启用 lifecycle_tracking 或 lifecycle 行尚未生成时，
+              JOIN 出来的列会全为 NULL，前端按 None 处理即可。
+        """
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    s.id, s.ts, s.symbol, s.bias, s.confidence,
+                    s.reason, s.risk, s.suggestion,
+                    s.factors, s.source, s.reasoning_content,
+                    s.entry_zone, s.stop_loss, s.take_profit,
+                    s.risk_reward_ratio, s.position_size_pct,
+                    s.timeframe_alignment, s.invalidation_conditions,
+                    sl.status        AS lifecycle_status,
+                    sl.triggered_at  AS lifecycle_triggered_at,
+                    sl.triggered_price,
+                    sl.exit_at       AS lifecycle_exit_at,
+                    sl.exit_price,
+                    sl.pnl_pct,
+                    sl.max_favorable_pct,
+                    sl.max_adverse_pct,
+                    sl.expires_at    AS lifecycle_expires_at,
+                    sl.updated_at    AS lifecycle_updated_at
+                FROM signals s
+                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
+                WHERE s.symbol = $1
+                ORDER BY s.ts DESC
+                LIMIT 1
+                """,
+                symbol,
+            )
+        return dict(row) if row else None
+
+    async def fetch_recent_signals_full(
+        self,
+        symbol: str,
+        limit: int = 20,
+        bias: Optional[str] = None,
+        source_like: Optional[str] = None,
+        only_persisted: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        读取指定 symbol 最近 N 条信号的"全字段视图"（含 lifecycle）
+        ---------------------------------------------------------------
+        参数：
+            symbol         : 合约代码
+            limit          : 返回条数上限（防御性 1~200）
+            bias           : 可选过滤，'long' / 'short' / 'neutral'
+            source_like    : 可选 ILIKE 模式（如 '%llm%' 只看 LLM 路径）
+            only_persisted : 默认 True；仅返回真正落库的信号（即排除掉
+                             根本没插入 signals 表的纯规则缓存路径——但因为
+                             那种信号本来就没入库，这里 "True" 是 No-op，
+                             保留参数语义便于将来扩展过滤策略）。
+        返回：
+            按 ts 倒序的 dict 列表，字段同 fetch_latest_signal_full。
+        说明：
+            - 专供前端"历史列表 / 时间线"使用；体积比 LIMIT N 个独立查询小得多。
+            - factors 列虽是 JSONB，但每条体积可控（< 50KB）；建议 limit ≤ 50。
+        """
+        safe_limit = max(1, min(int(limit), 200))
+        clauses = ["s.symbol = $1"]
+        params: List[Any] = [symbol]
+        if bias in ("long", "short", "neutral"):
+            params.append(bias)
+            clauses.append(f"s.bias = ${len(params)}")
+        if source_like:
+            params.append(source_like)
+            clauses.append(f"s.source ILIKE ${len(params)}")
+        params.append(safe_limit)
+        where_sql = " AND ".join(clauses)
+        sql = f"""
+            SELECT
+                s.id, s.ts, s.symbol, s.bias, s.confidence,
+                s.reason, s.risk, s.suggestion,
+                s.factors, s.source, s.reasoning_content,
+                s.entry_zone, s.stop_loss, s.take_profit,
+                s.risk_reward_ratio, s.position_size_pct,
+                s.timeframe_alignment, s.invalidation_conditions,
+                sl.status        AS lifecycle_status,
+                sl.triggered_at  AS lifecycle_triggered_at,
+                sl.triggered_price,
+                sl.exit_at       AS lifecycle_exit_at,
+                sl.exit_price,
+                sl.pnl_pct,
+                sl.max_favorable_pct,
+                sl.max_adverse_pct,
+                sl.expires_at    AS lifecycle_expires_at,
+                sl.updated_at    AS lifecycle_updated_at
+            FROM signals s
+            LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
+            WHERE {where_sql}
+            ORDER BY s.ts DESC
+            LIMIT ${len(params)}
+        """
+        # only_persisted 当前为 No-op 占位，避免未使用变量告警
+        _ = only_persisted
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [dict(r) for r in rows]
+
+    async def fetch_signal_full_by_id(
+        self, signal_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        按 id 读取单条信号的"全字段视图"（含 lifecycle）
+        ---------------------------------------------------------------
+        参数：
+            signal_id: signals.id
+        返回：
+            字段同 fetch_latest_signal_full；找不到返回 None。
+        """
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    s.id, s.ts, s.symbol, s.bias, s.confidence,
+                    s.reason, s.risk, s.suggestion,
+                    s.factors, s.source, s.reasoning_content,
+                    s.entry_zone, s.stop_loss, s.take_profit,
+                    s.risk_reward_ratio, s.position_size_pct,
+                    s.timeframe_alignment, s.invalidation_conditions,
+                    sl.status        AS lifecycle_status,
+                    sl.triggered_at  AS lifecycle_triggered_at,
+                    sl.triggered_price,
+                    sl.exit_at       AS lifecycle_exit_at,
+                    sl.exit_price,
+                    sl.pnl_pct,
+                    sl.max_favorable_pct,
+                    sl.max_adverse_pct,
+                    sl.expires_at    AS lifecycle_expires_at,
+                    sl.updated_at    AS lifecycle_updated_at
+                FROM signals s
+                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
+                WHERE s.id = $1
+                """,
+                signal_id,
+            )
+        return dict(row) if row else None
+
     async def fetch_latest_signal_judgment(
         self, symbol: str
     ) -> Optional[Dict[str, Any]]:
