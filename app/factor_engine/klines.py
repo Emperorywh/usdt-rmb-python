@@ -15,10 +15,12 @@
 - 不用 LISTEN/NOTIFY：trades 表写入频率高，触发器会成为 PG 瓶颈。
 - 改用应用层定时增量：每个周期一个独立 asyncio task，频率与该周期
   的最小有意义粒度匹配（1m/5m=1s，15m/1h=10s，4h/1d=60s）。
-- 单次聚合保持 < 100ms：只读未封盘 bar 时间窗口内的 trades，索引
-  覆盖；trades 表 24h 保留 + (symbol, ts DESC) 索引足以保证。
-- 性能：每次聚合最多读取一根 bar 内的成交（5m 大约几十~数百条），
-  用 numpy 的 array 累加，避免 dict/list 反复 append。
+- 单次聚合保持 < 100ms：聚合工作完全交给 PG，
+  ``aggregate_trades_in_window`` 走 idx_trades_symbol_ts 区间扫描 +
+  两次 LIMIT 1 索引点查（open/close），单次只回 1 行；行数与 bar 长度、
+  TPS 解耦，4h 高 TPS 合约也不会撞上 asyncpg command_timeout。
+- 性能：网络/反序列化成本固定（1 行），CPU 端只做一次加法（cvd_close
+  = cvd_start + cvd_delta），不再有按成交逐笔的 Python 循环。
 
 线程模型
 ========
@@ -30,9 +32,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from app.config import Settings
 from app.data_storage.repositories import Repositories
@@ -75,47 +76,6 @@ def floor_to_timeframe(ts: datetime, timeframe: str) -> datetime:
     epoch = int(ts.timestamp())
     aligned = (epoch // sec) * sec
     return datetime.fromtimestamp(aligned, tz=timezone.utc)
-
-
-@dataclass
-class _BarAcc:
-    """
-    一根 bar 的累加器
-    -----------------------------------------------------------------
-    在内存里短暂持有 OHLC 状态，并不直接落库；落库由 upsert_kline
-    的 ON CONFLICT DO UPDATE 完成。
-    """
-
-    ts: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float = 0.0
-    buy_volume: float = 0.0
-    sell_volume: float = 0.0
-    trade_count: int = 0
-
-    def update(self, price: float, size: float, side: str) -> None:
-        """
-        把一笔成交并入当前 bar
-        -------------------------------------------------------------
-        参数：
-            price: 成交价
-            size:  成交数量（已乘 ctVal 换算到基础币种）
-            side:  'buy' / 'sell'
-        """
-        if price > self.high:
-            self.high = price
-        if price < self.low:
-            self.low = price
-        self.close = price
-        self.volume += size
-        if side == "buy":
-            self.buy_volume += size
-        else:
-            self.sell_volume += size
-        self.trade_count += 1
 
 
 class KlineAggregator:
@@ -273,9 +233,10 @@ class KlineAggregator:
             timeframe: 周期标签
         逻辑：
             1) 当前时间向下对齐得到"当前未封盘 bar"的开始时间 cur_ts；
-            2) 读 [cur_ts, cur_ts + tf_seconds) 范围内的 trades；
+            2) 让 PG 在服务端对 [cur_ts, cur_ts + tf_seconds) 内的 trades
+               做 OHLC + 量能 + cvd_delta 聚合，单次只回 1 行；
             3) 用 _last_cvd_close[(symbol, tf)] 作为本根 bar 的 cvd 起点，
-               累加 delta 后得到 cvd_close；
+               叠加 cvd_delta 得到 cvd_close；
             4) UPSERT 到 klines_<tf>，closed=FALSE；
             5) 若 DB 里已经存在比 cur_ts 更早且 closed=FALSE 的 bar，
                说明跨过了 bar 边界，把它们补充封盘（closed=TRUE）。
@@ -283,6 +244,14 @@ class KlineAggregator:
             - 进程刚启动时 _last_cvd_close 已由 _warmup_last_cvd 回填；
             - 跨周期边界时，前一根 bar 的最终 cvd_close 通过 fetch_latest_kline
               重新读取，避免内存里残留旧值；之后再以该值为新 bar 的 cvd 起点。
+        性能：
+            - 老实现："读全部成交回 Python 再 for-loop 累加"，行数随 bar 长度
+              和 TPS 线性放大，1h/4h 高 TPS 合约下会触发 asyncpg
+              command_timeout（30s）。
+            - 新实现：单次聚合 SQL，固定回 1 行；走 idx_trades_symbol_ts
+              区间扫描 + 两次 LIMIT 1 索引点查，远低于 100ms。
+            - 数值结果与老实现等价：相同的 max/min/sum/first/last 语义，
+              且全程走 NUMERIC，比原先 float() 还少一次精度损失。
         """
         if timeframe not in TIMEFRAME_SECONDS:
             return
@@ -295,58 +264,43 @@ class KlineAggregator:
         # ---- 跨边界检测：把所有在 cur_ts 之前但 closed=FALSE 的 bar 收尾 ----
         await self._close_stale_bars(symbol, timeframe, cur_ts)
 
-        # ---- 读取当前 bar 范围的成交 ----
-        trades = await self.repos.fetch_trades_in_window(
+        # ---- 在 PG 端聚合当前 bar 范围内的所有成交（只回 1 行）----
+        agg = await self.repos.aggregate_trades_in_window(
             symbol=symbol,
             start=cur_ts,
             end=next_ts,
         )
 
-        # ---- 拿到本根 bar 的 cvd 起点 ----
-        cvd_start = self._last_cvd_close.get((symbol, timeframe), 0.0)
-
-        if not trades:
-            # 当前 bar 内还没有任何成交：不创建空 bar，避免大量空 OHLC 行；
-            # 等出现第一笔成交时再 INSERT。这样 fetch_recent_klines 的"最近 N
-            # 根"语义保持紧凑。
+        # 当前 bar 内还没有任何成交：不创建空 bar，避免大量空 OHLC 行；
+        # 等出现第一笔成交时再 INSERT。这样 fetch_recent_klines 的"最近 N
+        # 根"语义保持紧凑。
+        if agg is None:
             return
 
-        # ---- 单遍累加 ----
-        # 用第一笔成交的 price 作为 open；high/low/close 在 update 中维护
-        first = trades[0]
-        first_price = float(first["price"])
-        bar = _BarAcc(
-            ts=cur_ts,
-            open=first_price,
-            high=first_price,
-            low=first_price,
-            close=first_price,
-        )
-        cvd_delta = 0.0
-        for t in trades:
-            price = float(t["price"])
-            size = float(t["size"])
-            side = str(t["side"])
-            bar.update(price, size, side)
-            cvd_delta += size if side == "buy" else -size
-        cvd_close = cvd_start + cvd_delta
+        # ---- 拿到本根 bar 的 cvd 起点，叠加本窗口的 delta ----
+        cvd_start = self._last_cvd_close.get((symbol, timeframe), 0.0)
+        try:
+            cvd_delta = float(agg["cvd_delta"]) if agg["cvd_delta"] is not None else 0.0
+        except (TypeError, ValueError):
+            cvd_delta = 0.0
+        cvd_close = float(cvd_start) + cvd_delta
 
-        # ---- 落库 ----
+        # ---- 落库（upsert_kline 会自己 _to_dec，原值原样传即可）----
         await self.repos.upsert_kline(
             timeframe=timeframe,
             exchange=self.exchange,
             symbol=symbol,
             ts=cur_ts,
             ohlc={
-                "open": bar.open,
-                "high": bar.high,
-                "low": bar.low,
-                "close": bar.close,
-                "volume": bar.volume,
-                "buy_volume": bar.buy_volume,
-                "sell_volume": bar.sell_volume,
+                "open": agg["open"],
+                "high": agg["high"],
+                "low": agg["low"],
+                "close": agg["close"],
+                "volume": agg["volume"],
+                "buy_volume": agg["buy_volume"],
+                "sell_volume": agg["sell_volume"],
                 "cvd_close": cvd_close,
-                "trade_count": bar.trade_count,
+                "trade_count": int(agg["trade_count"] or 0),
             },
             closed=False,
         )

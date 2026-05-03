@@ -741,38 +741,68 @@ class Repositories:
             )
         return [dict(r) for r in rows]
 
-    async def fetch_trades_in_window(
+    async def aggregate_trades_in_window(
         self,
         symbol: str,
         start: datetime,
         end: datetime,
-    ) -> List[Dict[str, Any]]:
+    ) -> Optional[Dict[str, Any]]:
         """
-        读取 [start, end) 范围内的成交（K 线增量聚合用）
+        在数据库端把 [start, end) 范围内的成交聚合成一行 OHLC + 量能
         --------------------------------------------------------------
         参数：
             symbol: 合约代码
             start:  起始 UTC 时间（含）
             end:    截止 UTC 时间（不含）
         返回：
-            按 ts 升序的成交 dict 列表。
-        说明：
-            - 走 idx_trades_symbol_ts 索引，配合 trades 表 24h 保留策略
-              单次扫描成本可控；< 5m 周期单次 < 100ms。
+            None：窗口内无任何成交；
+            否则返回 dict，键固定为：
+                trade_count : int   - 成交笔数
+                open / high / low / close : Decimal - OHLC（NUMERIC 精度）
+                volume      : Decimal - 总量
+                buy_volume  : Decimal - 主动买量
+                sell_volume : Decimal - 主动卖量
+                cvd_delta   : Decimal - 本窗口 CVD 增量（buy - sell）
+        设计：
+            - 与原先"把成交全部拉回 Python 再做循环累加"等价，但只产生
+              一次网络往返且只传 1 行，不再随窗口长度线性放大。
+            - high/low/sum/count 走单次 ``idx_trades_symbol_ts`` 区间扫描；
+              open/close 用两个 LIMIT 1 子查询，单 row 索引点查，O(log N)。
+            - 窗口为空时聚合函数返回 NULL，count = 0；调用方按"无成交"
+              处理。
+        """
+        sql = """
+            SELECT
+                COUNT(*)::INTEGER                                              AS trade_count,
+                MAX(price)                                                     AS high,
+                MIN(price)                                                     AS low,
+                SUM(size)                                                      AS volume,
+                SUM(CASE WHEN side = 'buy'  THEN size ELSE 0    END)           AS buy_volume,
+                SUM(CASE WHEN side = 'sell' THEN size ELSE 0    END)           AS sell_volume,
+                SUM(CASE WHEN side = 'buy'  THEN size ELSE -size END)          AS cvd_delta,
+                (
+                    SELECT price FROM trades
+                    WHERE symbol = $1 AND ts >= $2 AND ts < $3
+                    ORDER BY ts ASC
+                    LIMIT 1
+                )                                                              AS open,
+                (
+                    SELECT price FROM trades
+                    WHERE symbol = $1 AND ts >= $2 AND ts < $3
+                    ORDER BY ts DESC
+                    LIMIT 1
+                )                                                              AS close
+            FROM trades
+            WHERE symbol = $1 AND ts >= $2 AND ts < $3
         """
         async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT ts, price, size, side
-                FROM trades
-                WHERE symbol = $1 AND ts >= $2 AND ts < $3
-                ORDER BY ts ASC
-                """,
-                symbol,
-                start,
-                end,
-            )
-        return [dict(r) for r in rows]
+            row = await conn.fetchrow(sql, symbol, start, end)
+        if row is None:
+            return None
+        trade_count = int(row["trade_count"] or 0)
+        if trade_count == 0:
+            return None
+        return dict(row)
 
     # ------------------------------------------------------------------
     # signals
