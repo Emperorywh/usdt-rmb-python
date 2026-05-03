@@ -532,16 +532,18 @@ class OKXRestClient(ExchangeRestClient):
     # ------------------------------------------------------------------
     # P1 升级：rubik 持仓比接口（散户多空 / 精英持仓比）
     # ------------------------------------------------------------------
-    # OKX rubik 接口家族：
+    # OKX rubik 接口家族（路径以 OKX 官方 v5 当前版本为准）：
     #   1) /api/v5/rubik/stat/contracts/long-short-account-ratio
     #        - 按 ccy 聚合的"散户层多空账户比"（反指）
     #        - 入参：ccy=ETH&period=5m
     #   2) /api/v5/rubik/stat/contracts/long-short-account-ratio-contract
     #        - 按 instId 聚合的"合约级散户多空账户比"（反指，更精确）
     #        - 入参：instId=ETH-USDT-SWAP&period=5m
-    #   3) /api/v5/rubik/stat/contracts/long-short-position-ratio
-    #        - 按 instId 聚合的"精英账户持仓比"（顺指）
+    #   3) /api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader
+    #        - 按 instId 聚合的"精英大户持仓量多空比"（顺指）
     #        - 入参：instId=ETH-USDT-SWAP&period=5m
+    #        - 注意：旧路径 `/api/v5/rubik/stat/contracts/long-short-position-ratio`
+    #          已被 OKX 移除（直接 404），不要再用。
     # 这些接口返回结构：data 是 [[ts, longShortRatio], ...] 字符串数组。
     # 部分接口返回 [ts, longRatio, shortRatio]；本类做了多种返回兼容。
     @staticmethod
@@ -684,7 +686,7 @@ class OKXRestClient(ExchangeRestClient):
         self, symbol: str, period: str = "5m", limit: int = 24
     ) -> List[Dict[str, Any]]:
         """
-        精英账户持仓比（按 instId）—— 顺指
+        精英大户持仓量多空比（按 instId）—— 顺指
         --------------------------------------------------------------
         参数同上。
         说明：
@@ -693,25 +695,33 @@ class OKXRestClient(ExchangeRestClient):
               （账户数维度容易被批量小号稀释）。
             - 与散户接口的 divergence 是 P1 prompt 里 retail_vs_smart_divergence
               因子的来源。
+            - 当前 OKX v5 路径为 long-short-position-ratio-contract-top-trader；
+              旧的 long-short-position-ratio 端点已下线（直接 404）。
         """
+
+        # OKX v5 当前精英大户持仓比接口路径（按合约维度）
+        endpoint = (
+            "/api/v5/rubik/stat/contracts/"
+            "long-short-position-ratio-contract-top-trader"
+        )
 
         async def _do() -> List[Dict[str, Any]]:
             resp = await self._client.get(
-                "/api/v5/rubik/stat/contracts/long-short-position-ratio",
+                endpoint,
                 params={"instId": symbol, "period": period, "limit": limit},
             )
             resp.raise_for_status()
             body = resp.json()
             if body.get("code") != "0":
                 raise RuntimeError(
-                    f"OKX long-short-position-ratio error: {body}"
+                    f"OKX long-short-position-ratio-contract-top-trader error: {body}"
                 )
             return self._parse_rubik_rows(
                 body.get("data") or [], symbol, self.name, "top_trader_position"
             )
 
         return await self._request_with_retry(
-            f"long-short-position-ratio[{symbol}]", _do
+            f"long-short-position-ratio-contract-top-trader[{symbol}]", _do
         )
 
     async def fetch_liquidation_orders(self, symbol: str) -> List[Dict[str, Any]]:
