@@ -11,10 +11,13 @@ bias 仍然保持 long/short/neutral 英文枚举（与表 CHECK 约束对齐）
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import Settings
 from app.signal_engine.schemas import TradingSignal
+
+logger = logging.getLogger(__name__)
 
 
 class RuleEngine:
@@ -148,26 +151,47 @@ class RuleEngine:
             risk_bits.append("关注资金费率反转与对侧大单墙")
         risk = "；".join(risk_bits)
 
-        # ---- 中文 suggestion ----
-        sup = struct.get("supports") or []
-        res = struct.get("resistances") or []
+        # ---- 中文 suggestion 与结构化交易计划 ----
+        sup = [float(s) for s in (struct.get("supports") or []) if s is not None]
+        res = [float(r) for r in (struct.get("resistances") or []) if r is not None]
         # 兼容新老 schema：market_structure 在新格式里用 last_close
-        entry = struct.get("last_price") or struct.get("last_close")
+        entry_raw = struct.get("last_price") or struct.get("last_close")
+        atr_14 = struct.get("atr_14")
+        try:
+            entry = float(entry_raw) if entry_raw is not None else None
+        except (TypeError, ValueError):
+            entry = None
+        try:
+            atr_val = float(atr_14) if atr_14 is not None else None
+        except (TypeError, ValueError):
+            atr_val = None
+
+        # 结构化交易计划（仅 long / short 时计算；neutral 时全为 None / 空）
+        plan: Optional[Dict[str, Any]] = None
+        if bias != "neutral" and entry is not None and entry > 0:
+            plan = _build_trade_plan(
+                bias=bias,
+                entry=entry,
+                supports=sup,
+                resistances=res,
+                atr=atr_val,
+            )
+
         if bias == "long":
-            stop = sup[0] if sup else None
-            target = res[0] if res else None
+            stop_disp = plan["stop_loss"] if plan else (sup[0] if sup else None)
+            target_disp = plan["take_profit"][0] if plan else (res[0] if res else None)
             suggestion = (
                 f"建议在 {_fmt_price(entry)} 附近分批做多，"
-                f"止损放在支撑 {_fmt_price(stop)} 下方，"
-                f"目标看 {_fmt_price(target)}（仅供参考，不构成交易指令）。"
+                f"止损放在支撑 {_fmt_price(stop_disp)} 下方，"
+                f"目标看 {_fmt_price(target_disp)}（仅供参考，不构成交易指令）。"
             )
         elif bias == "short":
-            stop = res[0] if res else None
-            target = sup[0] if sup else None
+            stop_disp = plan["stop_loss"] if plan else (res[0] if res else None)
+            target_disp = plan["take_profit"][0] if plan else (sup[0] if sup else None)
             suggestion = (
                 f"建议在 {_fmt_price(entry)} 附近分批做空，"
-                f"止损放在阻力 {_fmt_price(stop)} 上方，"
-                f"目标看 {_fmt_price(target)}（仅供参考，不构成交易指令）。"
+                f"止损放在阻力 {_fmt_price(stop_disp)} 上方，"
+                f"目标看 {_fmt_price(target_disp)}（仅供参考，不构成交易指令）。"
             )
         else:
             suggestion = (
@@ -175,13 +199,34 @@ class RuleEngine:
                 "（仅供参考，不构成交易指令）。"
             )
 
-        signal = TradingSignal(
+        # 如果计划构造失败（数据不足 / 价位顺序无法满足），则把 bias 软降级为
+        # neutral，避免在 TradingSignal schema 校验环节因缺字段直接抛 ValueError
+        # 把整轮信号生成打挂。score / contributions 保留原样供 LLM 参考。
+        if bias != "neutral" and plan is None:
+            logger.info(
+                "规则引擎缺少有效价位（entry/sup/res/atr 数据不足），"
+                "bias=%s 软降级为 neutral 以满足 TradingSignal 结构化字段约束",
+                bias,
+            )
+            bias = "neutral"
+            confidence = round(min(abs(score) * 0.5, 1.0), 3)
+
+        signal_kwargs: Dict[str, Any] = dict(
             bias=bias,
             confidence=confidence,
             reason=reason,
             risk=risk,
             suggestion=suggestion,
         )
+        if plan is not None and bias != "neutral":
+            signal_kwargs.update(
+                entry_zone=plan["entry_zone"],
+                stop_loss=plan["stop_loss"],
+                take_profit=plan["take_profit"],
+                risk_reward_ratio=plan["risk_reward_ratio"],
+            )
+
+        signal = TradingSignal(**signal_kwargs)
         return signal, score, contributions
 
 
@@ -223,6 +268,108 @@ class RuleEngine:
             chosen.get("derivatives", {}) or {},
             chosen.get("market_structure", {}) or {},
         )
+
+
+def _build_trade_plan(
+    bias: str,
+    entry: float,
+    supports: List[float],
+    resistances: List[float],
+    atr: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """
+    基于支撑 / 阻力 / ATR 构造一份满足 TradingSignal schema 的粗粒度交易计划
+    -------------------------------------------------------------------
+    参数：
+        bias:        'long' 或 'short'
+        entry:       当前最新成交价（last_close）
+        supports:    支撑位列表（按距 entry 由近到远）
+        resistances: 阻力位列表（按距 entry 由近到远）
+        atr:         14 周期 ATR；缺失时退化为基于价格的百分比波动估计
+    返回：
+        包含 ``entry_zone / stop_loss / take_profit / risk_reward_ratio`` 的 dict；
+        若构造结果不满足 schema 顺序约束（sl / ez / tp 链条单调）或 RR<1.5，
+        返回 None，调用方将信号降级为 neutral。
+    说明：
+        - 入场区间：以 entry 为中心，宽度取 max(0.1×ATR, 0.1% × entry)；
+        - 止损：优先使用最近的支撑/阻力，否则按 1.0×ATR 或 0.5% 兜底；
+        - 止盈 1：优先使用最近的对侧阻力/支撑，否则按 2.0×ATR 或 1.0% 兜底；
+        - 止盈 2：优先取下一档对侧位，否则在 tp1 上再加一档 (1.0×ATR / 1.0%)；
+        - 严格按 schema 顺序约束校验，构造失败返回 None 由上层降级处理。
+    """
+    if entry <= 0:
+        return None
+
+    # ATR 缺失时退化为价格百分比波动；这是 P0 阶段的兜底估计
+    band_unit = atr if atr and atr > 0 else max(entry * 0.005, 1e-6)
+    half_band = max(band_unit * 0.1, entry * 0.001)
+    ez_low = entry - half_band
+    ez_high = entry + half_band
+
+    if bias == "long":
+        valid_sup = [s for s in supports if s < ez_low]
+        if valid_sup:
+            sl = max(valid_sup)
+        else:
+            sl = ez_low - max(band_unit * 1.0, entry * 0.005)
+
+        valid_res = sorted({round(r, 6) for r in resistances if r > ez_high})
+        if len(valid_res) >= 2:
+            tp1, tp2 = float(valid_res[0]), float(valid_res[1])
+        elif len(valid_res) == 1:
+            tp1 = float(valid_res[0])
+            tp2 = tp1 + max(band_unit * 1.0, entry * 0.01)
+        else:
+            tp1 = ez_high + max(band_unit * 2.0, entry * 0.01)
+            tp2 = tp1 + max(band_unit * 1.0, entry * 0.01)
+
+        if not (sl < ez_low <= ez_high < tp1 < tp2):
+            return None
+
+        entry_mid = (ez_low + ez_high) / 2
+        risk_per_unit = abs(entry_mid - sl)
+        reward_per_unit = abs(tp1 - entry_mid)
+    elif bias == "short":
+        valid_res = [r for r in resistances if r > ez_high]
+        if valid_res:
+            sl = min(valid_res)
+        else:
+            sl = ez_high + max(band_unit * 1.0, entry * 0.005)
+
+        valid_sup = sorted({round(s, 6) for s in supports if s < ez_low}, reverse=True)
+        if len(valid_sup) >= 2:
+            tp1, tp2 = float(valid_sup[0]), float(valid_sup[1])
+        elif len(valid_sup) == 1:
+            tp1 = float(valid_sup[0])
+            tp2 = tp1 - max(band_unit * 1.0, entry * 0.01)
+        else:
+            tp1 = ez_low - max(band_unit * 2.0, entry * 0.01)
+            tp2 = tp1 - max(band_unit * 1.0, entry * 0.01)
+
+        if not (sl > ez_high >= ez_low > tp1 > tp2):
+            return None
+
+        entry_mid = (ez_low + ez_high) / 2
+        risk_per_unit = abs(entry_mid - sl)
+        reward_per_unit = abs(tp1 - entry_mid)
+    else:
+        return None
+
+    if risk_per_unit <= 1e-9:
+        return None
+    rr = round(reward_per_unit / risk_per_unit, 4)
+    # schema 内置 RR<1.5 强制降级；这里如果一开始就低于阈值就直接放弃，
+    # 让调用方走 neutral 路径，省去 schema 内部 warning 与字段擦除
+    if rr < 1.5:
+        return None
+
+    # 价位精度统一保留 4 位小数，与 market_structure 输出一致
+    return {
+        "entry_zone": (round(ez_low, 4), round(ez_high, 4)),
+        "stop_loss": round(float(sl), 4),
+        "take_profit": [round(float(tp1), 4), round(float(tp2), 4)],
+        "risk_reward_ratio": rr,
+    }
 
 
 def _trend_zh(trend: str) -> str:

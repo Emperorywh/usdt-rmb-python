@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Dict, Optional
 
 from app.data_storage.repositories import Repositories
@@ -159,39 +160,153 @@ class SignalService:
                 pass
         self._loops.clear()
 
+    async def _wait_until_ready(self, symbol: str, hard_timeout: float) -> None:
+        """
+        探测式 warmup：等到关键表三件套全部就位再返回
+        -----------------------------------------------------------------
+        参数：
+            symbol:       合约代码
+            hard_timeout: 兜底等待秒数；DB 完全空表时最多只等这么久
+        判定"就绪"的条件（三者同时满足）：
+            - 5m K 线根数 ≥ max(6, mtf_lookback_bars // 4)
+              （6 根是 market_structure pivot 的下限；lookback // 4 在
+              默认 80 时给到 20 根，已经够 capital_flow / divergence
+              滚动窗口算出有意义的值。）
+            - 最新 funding_rate 不为空（多数情况下 OKX WS 订阅后 ≤ 60s
+              内会推出第一帧；REST 兜底也是分钟级）
+            - 最新 orderbook_snapshot 不为空（WS 接入后秒级即可拿到）
+        日志策略：
+            - "立即就绪"路径：单条 INFO 说明耗时与各项 ready 状态。
+            - "超时兜底"路径：单条 WARNING 把当时缺失的资源列出来，
+              方便排查 OKX 频道掉线 / DB 为空 / 数据采集挂掉等问题。
+        """
+        settings = self.factor_aggregator.settings
+        min_bars = max(6, int(getattr(settings, "mtf_lookback_bars", 80)) // 4)
+        check_interval = 5.0
+        started_at = time.monotonic()
+        deadline = started_at + max(0.0, float(hard_timeout))
+
+        logger.info(
+            "信号循环 %s 启动探测式 warmup（min_5m_bars=%d，hard_timeout=%ds）",
+            symbol,
+            min_bars,
+            int(hard_timeout),
+        )
+
+        last_status: Dict[str, Any] = {
+            "klines_5m": 0,
+            "has_funding": False,
+            "has_orderbook": False,
+        }
+
+        while not self._stopping.is_set():
+            try:
+                klines_5m = await self.repos.fetch_recent_klines(
+                    timeframe="5m", symbol=symbol, limit=min_bars
+                )
+                funding = await self.repos.fetch_latest_funding(symbol)
+                orderbook = await self.repos.fetch_latest_orderbook(symbol)
+            except Exception:
+                logger.exception("信号循环 %s warmup 探测失败，稍后重试", symbol)
+                klines_5m, funding, orderbook = [], None, None
+
+            last_status = {
+                "klines_5m": len(klines_5m),
+                "has_funding": funding is not None,
+                "has_orderbook": orderbook is not None,
+            }
+
+            if (
+                last_status["klines_5m"] >= min_bars
+                and last_status["has_funding"]
+                and last_status["has_orderbook"]
+            ):
+                elapsed = time.monotonic() - started_at
+                logger.info(
+                    "信号循环 %s 已就绪立即开跑（耗时 %.1fs，5m bars=%d，"
+                    "funding=ok，orderbook=ok）",
+                    symbol,
+                    elapsed,
+                    last_status["klines_5m"],
+                )
+                return
+
+            if time.monotonic() >= deadline:
+                missing = []
+                if last_status["klines_5m"] < min_bars:
+                    missing.append(
+                        f"5m_bars={last_status['klines_5m']}/{min_bars}"
+                    )
+                if not last_status["has_funding"]:
+                    missing.append("funding=missing")
+                if not last_status["has_orderbook"]:
+                    missing.append("orderbook=missing")
+                logger.warning(
+                    "信号循环 %s 超时兜底开跑（hard_timeout=%ds，未就绪项: %s）；"
+                    "首轮信号可能因数据不足被规则引擎/LLM 跳过",
+                    symbol,
+                    int(hard_timeout),
+                    ", ".join(missing) if missing else "none",
+                )
+                return
+
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(), timeout=check_interval
+                )
+            except asyncio.TimeoutError:
+                pass
+
     async def _run_loop(self, symbol: str, interval: int) -> None:
         # ------------------------------------------------------------------
-        # 冷启动 warmup：等到一个完整 factor_window 攒满再触发首轮信号
+        # 冷启动 warmup：分两条路径
         # ------------------------------------------------------------------
-        # 背景：
-        #   原实现只 sleep min(interval, 15)=15s 就开跑，但 factor_window
-        #   默认 1800s（5min 也不够），首轮聚合时窗口里几乎没数据：
-        #   - market_structure 1 根 bar 都凑不齐 → trend=neutral；
-        #   - capital_flow 只反映几十秒成交，却被 LLM 当成 5min/30min 数据；
-        #   - derivatives 在 funding/OI 还没推第一帧时全为 None；
-        #   规则打分常因为 capital_flow 单边贡献越过 ±0.25 阈值生成伪信号，
-        #   还会把这条质量很差的判断写进 signals 表（LLM 真调用过一次）。
+        # 1) enable_mtf_factors=True（默认主路径）
+        #    因子聚合走 _compute_mtf，数据全部来自已经持久化在 PostgreSQL 的
+        #    klines_<tf> / funding_rates / open_interest / orderbook_snapshots
+        #    等表，进程重启后只要 DB 里已经有历史数据，就能立刻算出有意义的
+        #    多周期因子。继续硬等 1860s 是过度的（来自老 legacy 路径的遗留）。
+        #    所以这里改成"探测式 ready"——周期性检查 5m K 线根数、funding、
+        #    orderbook 三件套是否就位，全部就绪立即跑首轮；同时保留一个
+        #    硬上限作为首次部署 / 数据库为空时的兜底。
         #
-        # 解决：
-        #   把 warmup 上限提高到与因子窗口等长，最低不少于 interval。
-        #   factor_window 之外还额外加一段 settle 余量，给 OKX funding-rate
-        #   / open-interest 频道首推留出窗口（funding 大约 1min 推一次）。
-        warmup_seconds = max(
-            interval,
-            int(self.factor_aggregator.settings.factor_window_seconds),
+        # 2) enable_mtf_factors=False（灰度回滚通道）
+        #    老聚合器从 trades 表重采样近 factor_window_seconds 内的成交，
+        #    没有 K 线表可探测，沿用原来的"定时 warmup"逻辑保持行为不变。
+        hard_timeout = (
+            max(interval, int(self.factor_aggregator.settings.factor_window_seconds))
+            + 60
         )
-        # 用配置而不是硬编码常量，方便单测把 factor_window 调小后能立刻
-        # 跑出第一条信号；这里至少额外多等 60s 让 funding-rate 首帧到位。
-        warmup_seconds += 60
-        logger.info(
-            "信号循环 %s 冷启动 warmup %ds（等待因子窗口攒满）",
-            symbol,
-            warmup_seconds,
-        )
+
+        # warmup 阶段任何未捕获的异常都会让整个 signal-{symbol} 任务挂掉，
+        # 而 asyncio.create_task 创建的任务一旦被 self._loops 强引用，异常就
+        # 会被静默吞掉（既不会触发 "Task exception was never retrieved"，也
+        # 进不到下面 generate() 的 try/except）。这里统一兜一层 except，
+        # 让这种"启动即静默死亡"的事故至少能在日志里留下证据。
         try:
-            await asyncio.wait_for(self._stopping.wait(), timeout=warmup_seconds)
-        except asyncio.TimeoutError:
-            pass
+            if bool(
+                getattr(self.factor_aggregator.settings, "enable_mtf_factors", True)
+            ):
+                await self._wait_until_ready(symbol, hard_timeout=hard_timeout)
+            else:
+                logger.info(
+                    "信号循环 %s 冷启动 warmup %ds（legacy 路径，等待因子窗口攒满）",
+                    symbol,
+                    hard_timeout,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._stopping.wait(), timeout=hard_timeout
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "信号循环 %s 冷启动 warmup 阶段抛异常，跳过 warmup 直接进入主循环",
+                symbol,
+            )
 
         while not self._stopping.is_set():
             try:
