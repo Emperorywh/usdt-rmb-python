@@ -17,8 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 复制依赖文件并安装依赖
 COPY requirements.txt .
-# 使用阿里云的 pip 镜像源加速下载
-RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制项目代码
 COPY app/ ./app/
