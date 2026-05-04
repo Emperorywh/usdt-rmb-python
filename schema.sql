@@ -420,3 +420,26 @@ CREATE INDEX IF NOT EXISTS idx_signal_lifecycle_symbol_updated
 CREATE INDEX IF NOT EXISTS idx_signal_lifecycle_open_expires
     ON signal_lifecycle (expires_at)
     WHERE status IN ('pending', 'triggered');
+
+-- ============================================================
+-- 邮件通知收件人表（notification_emails）
+-- ============================================================
+-- 设计要点：
+--   1) 当 LLM 输出明确方向（bias=long / short）且为本轮真实调用时，
+--      系统会向"该表中所有 enabled=TRUE"的邮箱推送一封 HTML 提醒。
+--   2) email 列做 UNIQUE：同一个邮箱不允许重复录入，避免给同一收件人
+--      重复发邮件；CRUD 接口在 INSERT 冲突时会返回 409。
+--   3) enabled 用布尔列做"软启停"，避免删除后失去历史；管理员可以临时
+--      关闭某个邮箱而不丢配置。
+--   4) name 仅作管理员备注用（如"老板邮箱"/"风控小组"），可空。
+CREATE TABLE IF NOT EXISTS notification_emails (
+    id          BIGSERIAL    PRIMARY KEY,
+    email       TEXT         NOT NULL,
+    name        TEXT,
+    enabled     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT notification_emails_unique UNIQUE (email)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_emails_enabled
+    ON notification_emails (enabled);

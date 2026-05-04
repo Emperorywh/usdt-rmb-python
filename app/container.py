@@ -21,6 +21,7 @@ from app.factor_engine.aggregator import FactorAggregator
 from app.factor_engine.ic_calibrator import ICCalibrator
 from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
+from app.notification.email_sender import EmailSender
 from app.signal_engine.lifecycle import LifecycleTracker
 from app.signal_engine.llm_agent import LLMAgent
 from app.signal_engine.rules import RuleEngine
@@ -50,6 +51,7 @@ class AppContainer:
     factor_aggregator: FactorAggregator
     rule_engine: RuleEngine
     llm_agent: LLMAgent
+    email_sender: EmailSender
     signal_service: SignalService
     ingestion_runner: Optional[IngestionRunner] = field(default=None)
     # 启动后台周期刷新合约面值的任务句柄；shutdown 时一并取消，避免泄漏
@@ -135,11 +137,16 @@ class AppContainer:
         # P2：rule_engine 现在持有 repos 用来查 factor_weights 表（带 5min 缓存）
         rule_engine = RuleEngine(settings=settings, repos=repos)
         llm_agent = LLMAgent(settings=settings, repos=repos)
+        # 邮件通知发送器：当 LLM 给出明确方向时（long/short）异步给 notification_emails
+        # 表里所有 enabled=TRUE 的邮箱推送一封 HTML 提醒邮件。
+        # observe / 缓存命中不发；未配置 SMTP 凭据时整体降级为 no-op。
+        email_sender = EmailSender(settings=settings)
         signal_service = SignalService(
             repos=repos,
             factor_aggregator=factor_aggregator,
             rule_engine=rule_engine,
             llm_agent=llm_agent,
+            email_sender=email_sender,
         )
 
         # ---- P0：多周期 K 线增量聚合器 ----
@@ -183,6 +190,7 @@ class AppContainer:
             factor_aggregator=factor_aggregator,
             rule_engine=rule_engine,
             llm_agent=llm_agent,
+            email_sender=email_sender,
             signal_service=signal_service,
             ingestion_runner=runner,
             instrument_refresh_task=instrument_refresh_task,

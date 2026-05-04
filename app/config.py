@@ -262,6 +262,32 @@ class Settings(BaseSettings):
     # LLM 自我反馈：注入到 prompt 的"成绩单"条数
     llm_feedback_recent_n: int = 5
 
+    # ===== 邮件通知（SMTP）=====
+    # ----------------------------------------------------------------
+    # 当 LLM 输出明确方向（bias=long / short）且本次为真正的 LLM 调用
+    # （from_cache=False）时，向 notification_emails 表里所有 enabled=true
+    # 的邮箱发送一封 HTML 格式的提醒。
+    # observe / neutral 不发邮件，避免噪声。
+    #
+    # 主开关：ENABLE_EMAIL_NOTIFICATION=false 时整个邮件通知链路降级
+    # （即使 SMTP 配置齐备也不会发送，方便本地开发屏蔽）。
+    enable_email_notification: bool = False
+    # SMTP 服务器配置（默认走新浪邮箱 smtp.sina.com:465 SSL）
+    smtp_host: str = "smtp.sina.com"
+    smtp_port: int = 465
+    # 是否使用 SSL 直连（True 走 465）；False 走 587 + STARTTLS。
+    smtp_use_ssl: bool = True
+    # SMTP 登录用户名（一般等于发件邮箱）
+    smtp_user: str = ""
+    # SMTP 登录授权码 / 密码（新浪邮箱需要在邮箱后台开启 SMTP 并申请授权码）
+    smtp_password: str = ""
+    # 显示在邮件 From 头里的发件邮箱；留空时回退到 smtp_user
+    smtp_from: str = ""
+    # 显示在邮件 From 头里的发件人名称
+    smtp_from_name: str = "ETH 量化交易系统"
+    # 单封邮件 SMTP 连接 / 发送超时（秒）
+    smtp_timeout: float = 20.0
+
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000

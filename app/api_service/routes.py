@@ -8,10 +8,12 @@ P2 新增接口：
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.api_service.analysis_view import serialize_signal_full
 from app.api_service.deps import (
@@ -24,6 +26,64 @@ from app.factor_engine.aggregator import FactorAggregator
 from app.signal_engine.service import SignalService
 
 router = APIRouter()
+
+
+# 简单的邮箱格式校验：避免引入 email-validator 这一可选依赖。
+# pydantic 的 EmailStr 需要 email-validator 才能工作，作为兜底。
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _validate_email_str(email: str) -> str:
+    """
+    轻量校验邮箱格式，去掉首尾空格并统一小写
+    --------------------------------------------------------------
+    参数：
+        email: 原始邮箱字符串
+    返回：
+        清洗后的邮箱
+    异常：
+        HTTPException(400) - 格式不合法
+    """
+    cleaned = (email or "").strip()
+    if not cleaned or not _EMAIL_RE.match(cleaned):
+        raise HTTPException(status_code=400, detail=f"邮箱格式不合法: {email!r}")
+    return cleaned.lower()
+
+
+class NotificationEmailCreate(BaseModel):
+    """
+    新增邮件收件人入参
+    --------------------------------------------------------------
+    字段：
+        email   : 收件邮箱（必填，UNIQUE）
+        name    : 备注名（可空）
+        enabled : 是否启用（默认 True）
+    """
+
+    email: str = Field(..., description="收件邮箱")
+    name: Optional[str] = Field(default=None, max_length=128, description="备注名")
+    enabled: bool = Field(default=True, description="是否启用")
+
+
+class NotificationEmailUpdate(BaseModel):
+    """
+    更新邮件收件人入参
+    --------------------------------------------------------------
+    所有字段都是可空的（PATCH 语义）；显式置空 name 请传空字符串以外的标记，
+    本接口暂不支持把 name 重置回 NULL。
+    """
+
+    email: Optional[str] = Field(default=None, description="收件邮箱")
+    name: Optional[str] = Field(default=None, max_length=128, description="备注名")
+    enabled: Optional[bool] = Field(default=None, description="是否启用")
+
+
+class TestEmailRequest(BaseModel):
+    """
+    /emails/test 入参：发送一封测试邮件到指定地址
+    """
+
+    email: str = Field(..., description="测试邮箱地址")
 
 
 @router.get("/health", tags=["meta"])
@@ -513,3 +573,187 @@ async def admin_calibrate_ic(
         "groups_skipped_low_sample": report.groups_skipped_low_sample,
         "weights_written": report.weights_written,
     }
+
+
+# ======================================================================
+# 邮件通知收件人 CRUD（notification_emails）
+# ----------------------------------------------------------------------
+# 设计原则：
+#   - 路径 /emails 而非 /admin/emails，方便前端配置页直接调用；
+#   - 所有写操作都做"邮箱格式预校验 + 唯一约束错误友好转换"；
+#   - 输出统一走 _serialize_notification_email_row，前端拿到的字段固定。
+# ======================================================================
+def _serialize_notification_email_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    把 notification_emails 表行序列化为前端友好的 dict
+    --------------------------------------------------------------
+    参数：
+        row : repos 返回的 dict（包含 datetime / bool 等原始字段）
+    返回：
+        统一格式的 dict（datetime 统一 ISO8601 字符串）
+    """
+    created_at = row.get("created_at")
+    updated_at = row.get("updated_at")
+    return {
+        "id": row.get("id"),
+        "email": row.get("email"),
+        "name": row.get("name"),
+        "enabled": bool(row.get("enabled")),
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else None,
+        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else None,
+    }
+
+
+@router.get("/emails", tags=["notification"])
+async def list_notification_emails(
+    only_enabled: bool = Query(default=False, description="仅返回启用的收件人"),
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    列出所有邮件通知收件人
+    --------------------------------------------------------------
+    参数：
+        only_enabled : True 时仅返回 enabled=TRUE 的行；默认 False 看全部
+    返回：
+        {"count": N, "items": [...]}
+    """
+    rows = await container.repos.list_notification_emails(only_enabled=only_enabled)
+    items = [_serialize_notification_email_row(r) for r in rows]
+    return {"count": len(items), "items": items}
+
+
+@router.post("/emails", tags=["notification"], status_code=201)
+async def create_notification_email(
+    payload: NotificationEmailCreate,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    新增一条邮件通知收件人
+    --------------------------------------------------------------
+    入参（JSON Body）：
+        email   : 收件邮箱（必填）
+        name    : 备注名（可空）
+        enabled : 是否启用（默认 True）
+    返回：
+        新建行的完整 dict
+    错误：
+        400 - 邮箱格式非法
+        409 - 邮箱已存在
+    """
+    email = _validate_email_str(payload.email)
+    try:
+        row = await container.repos.insert_notification_email(
+            email=email,
+            name=(payload.name or None),
+            enabled=bool(payload.enabled),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # asyncpg 的 UniqueViolationError 路径
+        msg = str(exc)
+        if "notification_emails_unique" in msg or "duplicate key" in msg.lower():
+            raise HTTPException(
+                status_code=409, detail=f"邮箱已存在：{email}"
+            ) from exc
+        raise HTTPException(status_code=500, detail=f"新增邮箱失败：{msg}") from exc
+    return _serialize_notification_email_row(row)
+
+
+@router.get("/emails/{email_id}", tags=["notification"])
+async def get_notification_email(
+    email_id: int,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    按 id 查询单条邮件通知收件人详情
+    --------------------------------------------------------------
+    错误：
+        404 - id 不存在
+    """
+    row = await container.repos.fetch_notification_email_by_id(email_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="未找到对应邮箱")
+    return _serialize_notification_email_row(row)
+
+
+@router.put("/emails/{email_id}", tags=["notification"])
+async def update_notification_email(
+    email_id: int,
+    payload: NotificationEmailUpdate,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    更新一条邮件通知收件人（PATCH 语义：未提供的字段保持不变）
+    --------------------------------------------------------------
+    错误：
+        400 - 邮箱格式非法
+        404 - id 不存在
+        409 - 修改后的邮箱与他人冲突
+    """
+    new_email: Optional[str] = None
+    if payload.email is not None:
+        new_email = _validate_email_str(payload.email)
+    try:
+        row = await container.repos.update_notification_email(
+            email_id,
+            email=new_email,
+            name=payload.name,
+            enabled=payload.enabled,
+        )
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "notification_emails_unique" in msg or "duplicate key" in msg.lower():
+            raise HTTPException(
+                status_code=409, detail=f"邮箱与他人冲突：{new_email}"
+            ) from exc
+        raise HTTPException(status_code=500, detail=f"更新邮箱失败：{msg}") from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="未找到对应邮箱")
+    return _serialize_notification_email_row(row)
+
+
+@router.delete("/emails/{email_id}", tags=["notification"])
+async def delete_notification_email(
+    email_id: int,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    删除一条邮件通知收件人
+    --------------------------------------------------------------
+    错误：
+        404 - id 不存在
+    """
+    ok = await container.repos.delete_notification_email(email_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="未找到对应邮箱")
+    return {"ok": True, "id": email_id}
+
+
+@router.post("/emails/test", tags=["notification"])
+async def send_test_notification_email(
+    payload: TestEmailRequest,
+    container: AppContainer = Depends(get_container),
+) -> Dict[str, Any]:
+    """
+    发送一封测试邮件（用于校验 SMTP 配置是否正确）
+    --------------------------------------------------------------
+    入参：
+        email : 测试收件邮箱
+    错误：
+        400 - 邮箱格式非法
+        503 - 邮件通知未启用 / SMTP 凭据缺失
+        500 - SMTP 实际发送失败
+    """
+    email = _validate_email_str(payload.email)
+    sender = container.email_sender
+    if sender is None or not sender.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="邮件通知未启用或 SMTP 凭据未配置（检查 ENABLE_EMAIL_NOTIFICATION / SMTP_USER / SMTP_PASSWORD）",
+        )
+    try:
+        await sender.send_test_email(email)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"测试邮件发送失败：{exc}"
+        ) from exc
+    return {"ok": True, "to": email}

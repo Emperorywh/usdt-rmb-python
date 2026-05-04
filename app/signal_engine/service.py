@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
 from app.logging_config import get_logger
+from app.notification.email_sender import EmailSender
 from app.signal_engine.lifecycle import compute_expires_at
 from app.signal_engine.llm_agent import LLMAgent, LLMAnalysisResult
 from app.signal_engine.rules import RuleEngine
@@ -31,12 +32,19 @@ class SignalService:
         factor_aggregator: FactorAggregator,
         rule_engine: RuleEngine,
         llm_agent: LLMAgent,
+        email_sender: Optional[EmailSender] = None,
     ):
         self.repos = repos
         self.factor_aggregator = factor_aggregator
         self.rule_engine = rule_engine
         self.llm_agent = llm_agent
+        # 邮件通知发送器：当 LLM 给出明确方向（long/short）且本轮为真实 LLM 调用
+        # （from_cache=False）时调用；未注入或未启用时整个邮件链路降级为 no-op。
+        self.email_sender = email_sender
         self._loops: Dict[str, asyncio.Task[Any]] = {}
+        # 后台邮件发送任务集合：仅作"防 GC"强引用，避免 asyncio.create_task
+        # 创建的任务在 loop 还没调度前被垃圾回收掉。任务结束后从集合中移除。
+        self._email_tasks: set[asyncio.Task[Any]] = set()
         self._stopping = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -174,6 +182,34 @@ class SignalService:
                 llm_result.from_cache if llm_result is not None else None,
             )
 
+        # ----------------------------------------------------------------
+        # 邮件提醒：仅在以下三个条件**同时**满足时触发
+        #   1) 本轮真正发起了 LLM 调用并落库（should_persist=True）
+        #   2) LLM 输出方向明确（bias ∈ {long, short}）—— 观望不发
+        #   3) email_sender 已注入且启用（SMTP 凭据齐备）
+        # 走 asyncio.create_task 后台发送，绝不阻塞信号生成主路径；任意失败
+        # 都不会向上抛错，仅打 warning 日志。
+        # ----------------------------------------------------------------
+        if (
+            should_persist
+            and final.bias in ("long", "short")
+            and self.email_sender is not None
+            and self.email_sender.enabled
+        ):
+            task = asyncio.create_task(
+                self._dispatch_signal_email(
+                    symbol=symbol,
+                    signal=final,
+                    rule_score=rule_score,
+                    factors=factors,
+                    signal_id=signal_id,
+                ),
+                name=f"signal-email-{symbol}-{signal_id}",
+            )
+            # 防止任务在 loop 还没调度前被 GC 回收：保持强引用直到任务完成。
+            self._email_tasks.add(task)
+            task.add_done_callback(self._email_tasks.discard)
+
         return {
             "id": signal_id,
             "symbol": symbol,
@@ -188,6 +224,85 @@ class SignalService:
             # 避免污染 signal 主体；未启用思考模式或纯规则路径时为 None。
             "reasoning_content": reasoning_content,
         }
+
+    async def _dispatch_signal_email(
+        self,
+        *,
+        symbol: str,
+        signal: TradingSignal,
+        rule_score: float,
+        factors: Dict[str, Any],
+        signal_id: Optional[int],
+    ) -> None:
+        """
+        异步给所有已启用收件人发送一封"明确方向"的交易信号 HTML 邮件
+        ---------------------------------------------------------------
+        参数：
+            symbol     ：合约代码
+            signal     ：完整 TradingSignal（已通过 schema 强约束）
+            rule_score ：规则引擎打分（[-1, 1] 区间）
+            factors    ：本轮因子聚合 dict（用于 HTML 摘要 regime / current_price）
+            signal_id  ：signals.id，用于在邮件页脚展示与未来排错
+        说明：
+            - 本方法在 generate() 的 fire-and-forget 任务里跑，**不允许**抛异常；
+              任何 DB / SMTP 错误都吞掉只打日志，避免拖累信号循环。
+            - 收件人列表实时从 notification_emails 表里查（only_enabled=True），
+              支持运维通过 API 临时禁用某个收件人即时生效。
+            - 表为空 / EmailSender 未启用 / signal.bias=neutral 时直接返回，
+              EmailSender 内部还会再做一次防御性校验。
+        """
+        if self.email_sender is None or not self.email_sender.enabled:
+            return
+        if signal.bias not in ("long", "short"):
+            return
+        try:
+            recipients_rows = await self.repos.list_notification_emails(
+                only_enabled=True
+            )
+        except Exception:
+            logger.warning(
+                "查询 notification_emails 失败，跳过本次邮件提醒（symbol=%s）",
+                symbol,
+                exc_info=True,
+            )
+            return
+
+        recipients: List[str] = [
+            str(r["email"]).strip()
+            for r in recipients_rows
+            if r.get("email") and str(r["email"]).strip()
+        ]
+        if not recipients:
+            logger.info(
+                "notification_emails 中没有任何启用的收件人，跳过本次邮件提醒（symbol=%s）",
+                symbol,
+            )
+            return
+
+        try:
+            stats = await self.email_sender.send_signal_alert(
+                recipients=recipients,
+                symbol=symbol,
+                signal=signal,
+                rule_score=rule_score,
+                factors=factors,
+                signal_id=signal_id,
+            )
+            logger.info(
+                "信号邮件提醒派发完成 symbol=%s bias=%s 收件人=%d 已发=%d 失败=%d",
+                symbol,
+                signal.bias,
+                len(recipients),
+                stats.get("sent", 0),
+                stats.get("failed", 0),
+            )
+        except Exception:
+            logger.warning(
+                "信号邮件派发异常（symbol=%s，bias=%s）",
+                symbol,
+                signal.bias,
+                exc_info=True,
+            )
 
     async def _fetch_lifecycle_feedback(
         self, symbol: str
@@ -254,6 +369,16 @@ class SignalService:
             except (asyncio.CancelledError, Exception):
                 pass
         self._loops.clear()
+        # 等待所有挂起的邮件任务收尾，避免 shutdown 时报
+        # "Task was destroyed but it is pending"。SMTP 默认 20s 超时，最多等
+        # 个位数秒级别即可回收。
+        pending_emails = [t for t in self._email_tasks if not t.done()]
+        for t in pending_emails:
+            try:
+                await t
+            except Exception:  # noqa: BLE001
+                pass
+        self._email_tasks.clear()
 
     async def _wait_until_ready(self, symbol: str, hard_timeout: float) -> None:
         """
