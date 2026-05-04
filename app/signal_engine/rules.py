@@ -305,14 +305,33 @@ class RuleEngine:
             atr_val = None
 
         plan: Optional[Dict[str, Any]] = None
-        if bias != "neutral" and entry is not None and entry > 0:
-            plan = _build_trade_plan(
-                bias=bias,
-                entry=entry,
-                supports=sup,
-                resistances=res,
-                atr=atr_val,
-            )
+        # plan_fail_reason 用于在软降级日志里写明"为什么 plan 没构造出来"。
+        # 取值含义：
+        #   - "ok"                 : 成功构造出 plan（不会触发软降级）
+        #   - "missing_entry_atr"  : 入场价 / ATR 缺失，根本没去算 plan
+        #   - "missing_levels"     : 该方向上一侧没有可用的支撑或阻力位
+        #   - "level_order"        : 价位排序不满足 sl/ez/tp 的几何约束
+        #   - "rr_below_min"       : 几何上能算出 plan，但 RR < 最低门槛 1.5
+        #   - "invalid_entry"      : entry <= 0
+        plan_fail_reason: str = "ok"
+        plan_fail_detail: Dict[str, Any] = {}
+        if bias != "neutral":
+            if entry is None or entry <= 0 or atr_val is None or atr_val <= 0:
+                plan_fail_reason = "missing_entry_atr"
+                plan_fail_detail = {
+                    "entry": entry,
+                    "atr": atr_val,
+                    "sup_count": len(sup),
+                    "res_count": len(res),
+                }
+            else:
+                plan, plan_fail_reason, plan_fail_detail = _build_trade_plan(
+                    bias=bias,
+                    entry=entry,
+                    supports=sup,
+                    resistances=res,
+                    atr=atr_val,
+                )
 
         if bias == "long":
             stop_disp = plan["stop_loss"] if plan else (sup[0] if sup else None)
@@ -337,9 +356,23 @@ class RuleEngine:
             )
 
         if bias != "neutral" and plan is None:
+            # 把"为什么没构造出 plan"的真实分支带进日志，避免一直误以为是
+            # 因子数据缺失。常见的实际原因是 RR 不足 / 价位顺序不合，
+            # 这两类情况下因子和价位其实都齐全，只是当前结构不适合按
+            # |TP1 - mid| / |mid - SL| ≥ 1.5 的硬门槛落地一份计划。
+            reason_zh = {
+                "missing_entry_atr": "入场价或 ATR 缺失",
+                "invalid_entry": "入场价非法（entry<=0）",
+                "missing_levels": "该方向缺少可用的支撑/阻力位",
+                "level_order": "支撑/阻力顺序不满足 sl/ez/tp 几何约束",
+                "rr_below_min": "可构造的最优 RR 低于 1.5 阈值",
+            }.get(plan_fail_reason, plan_fail_reason)
             logger.info(
-                "规则引擎缺少有效价位（entry/sup/res/atr 数据不足），"
+                "规则引擎 trade plan 落地失败（原因=%s: %s, detail=%s），"
                 "bias=%s 软降级为 neutral 以满足 TradingSignal 结构化字段约束",
+                plan_fail_reason,
+                reason_zh,
+                plan_fail_detail,
                 bias,
             )
             bias = "neutral"
@@ -642,16 +675,25 @@ def _build_trade_plan(
     supports: List[float],
     resistances: List[float],
     atr: Optional[float],
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
     """
     基于支撑 / 阻力 / ATR 构造一份满足 TradingSignal schema 的粗粒度交易计划
     -------------------------------------------------------------------
+    返回：
+        (plan, fail_reason, detail)
+            plan         : 构造成功时为字典；失败时为 None
+            fail_reason  : "ok" / "invalid_entry" / "missing_levels" /
+                           "level_order" / "rr_below_min"
+            detail       : 失败时附带的关键诊断字段（rr/sl/tp1/...），
+                           成功时为空 dict
     说明：
-        与 P0/P1 完全一致，未做任何调整；P2 升级只改打分通路，不改交易
-        计划构造逻辑，避免一次性引入两个变化导致回归难度上升。
+        历史版本只返回 Optional[Dict]，调用方无法区分"几何不合规"和
+        "RR 不足"；这里把失败原因和关键中间值一起带回去，方便上层在日志
+        里写出真实分支，避免一直被那条"数据不足"的兜底文案误导。
+        几何 / RR 计算逻辑本身保持与 P0/P1 完全一致，未改动。
     """
     if entry <= 0:
-        return None
+        return None, "invalid_entry", {"entry": entry}
     band_unit = atr if atr and atr > 0 else max(entry * 0.005, 1e-6)
     half_band = max(band_unit * 0.1, entry * 0.001)
     ez_low = entry - half_band
@@ -673,7 +715,10 @@ def _build_trade_plan(
             tp1 = ez_high + max(band_unit * 2.0, entry * 0.01)
             tp2 = tp1 + max(band_unit * 1.0, entry * 0.01)
         if not (sl < ez_low <= ez_high < tp1 < tp2):
-            return None
+            return None, "level_order", {
+                "sl": sl, "ez_low": ez_low, "ez_high": ez_high,
+                "tp1": tp1, "tp2": tp2,
+            }
         entry_mid = (ez_low + ez_high) / 2
         risk_per_unit = abs(entry_mid - sl)
         reward_per_unit = abs(tp1 - entry_mid)
@@ -693,24 +738,38 @@ def _build_trade_plan(
             tp1 = ez_low - max(band_unit * 2.0, entry * 0.01)
             tp2 = tp1 - max(band_unit * 1.0, entry * 0.01)
         if not (sl > ez_high >= ez_low > tp1 > tp2):
-            return None
+            return None, "level_order", {
+                "sl": sl, "ez_low": ez_low, "ez_high": ez_high,
+                "tp1": tp1, "tp2": tp2,
+            }
         entry_mid = (ez_low + ez_high) / 2
         risk_per_unit = abs(entry_mid - sl)
         reward_per_unit = abs(tp1 - entry_mid)
     else:
-        return None
+        # 当前 evaluate 已经过滤掉 neutral 才进入本函数，这里是 defensive
+        return None, "missing_levels", {"bias": bias}
 
     if risk_per_unit <= 1e-9:
-        return None
+        return None, "level_order", {
+            "sl": sl, "ez_low": ez_low, "ez_high": ez_high, "risk": risk_per_unit,
+        }
     rr = round(reward_per_unit / risk_per_unit, 4)
     if rr < 1.5:
-        return None
-    return {
-        "entry_zone": (round(ez_low, 4), round(ez_high, 4)),
-        "stop_loss": round(float(sl), 4),
-        "take_profit": [round(float(tp1), 4), round(float(tp2), 4)],
-        "risk_reward_ratio": rr,
-    }
+        return None, "rr_below_min", {
+            "rr": rr, "sl": round(float(sl), 4),
+            "tp1": round(float(tp1), 4), "tp2": round(float(tp2), 4),
+            "ez_low": round(ez_low, 4), "ez_high": round(ez_high, 4),
+        }
+    return (
+        {
+            "entry_zone": (round(ez_low, 4), round(ez_high, 4)),
+            "stop_loss": round(float(sl), 4),
+            "take_profit": [round(float(tp1), 4), round(float(tp2), 4)],
+            "risk_reward_ratio": rr,
+        },
+        "ok",
+        {},
+    )
 
 
 def _trend_zh(trend: str) -> str:

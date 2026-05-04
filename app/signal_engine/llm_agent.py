@@ -179,8 +179,26 @@ SYSTEM_PROMPT = """\
   例如："4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
 
 【降级规则】
-- 如果不满足 RR ≥ 1.5、或多周期方向严重冲突（alignment_score 绝对值 < 0.4
-  且 dominant_bias=neutral），必须输出 neutral，不得硬给方向。
+- 当 RR < 1.5 时，禁止给出趋势性 long/short 方向；可以走"区间策略"
+  （见下方），或在区间策略也不成立时输出 neutral。
+- 多周期方向严重冲突（alignment_score 绝对值 < 0.4 且 dominant_bias=neutral）
+  时，**不再强制 neutral**。优先级如下：
+    1) 若 5m / 15m 之间存在 supports[0] < last_close < resistances[0] 的清晰
+       区间（区间宽度 ≥ 0.6 × ATR(15m) 即可视为可交易），允许走"区间策略"：
+         * bias 取"距离更近"的那一侧（贴近 supports → bias=long 做多反弹；
+           贴近 resistances → bias=short 做空回踩）；如果价格几乎在区间正中
+           且没有明显单边动能（CVD slope / 资金流 / 订单簿失衡都不指向同侧），
+           才允许输出 neutral。
+         * entry_zone 必须落在距对应边界 ≤ 0.3 × ATR(15m) 范围内；
+         * stop_loss 必须落在该边界另一侧 0.5 × ATR(15m) buffer 之外；
+         * take_profit[0] 取区间另一侧关键位附近（≥ 0.7 倍区间宽度），
+           take_profit[1] 取区间另一侧 + 一档流动性池节点；
+         * RR 仍必须 ≥ 1.5；做不到就退回 neutral。
+         * **position_size_pct 必须 ≤ 0.05**（强制小仓位）；
+         * reason 必须显式写出"区间策略"四个字 + 区间上下沿的具体价位 +
+           为什么不做趋势单的核心因子证据。
+    2) 若区间不清晰（例如 supports/resistances 缺位、价格刚刚扫过区间一侧）
+       才输出 neutral，并在 reason 中明确说明"区间不可交易：<具体原因>"。
 - neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct
   全部置 null（schema 强约束）。
 - reason 字段务必引用具体数值（净流入 USD、CVD slope、OI 变动百分比、
@@ -188,6 +206,21 @@ SYSTEM_PROMPT = """\
   "似乎"等模糊表述。
 - suggestion 字段为面向用户的简体中文建议段落，文末必须注明
   "仅供参考，不构成交易指令"。
+
+【区间策略示例（参考，不要照抄数值）】
+当 4h/1d trend=neutral、1h/15m trend=range、当前价 = 2320，
+supports[15m]=[2320.3, 2319.13, 2313.02]，resistances[15m]=[2327.5, 2332.58]，
+ATR(15m) ≈ 9.6 时：
+- 区间宽度 ≈ 14.5 ≈ 1.5 × ATR(15m)，可交易；
+- 当前价贴近下沿（距离 supports[0] ≈ 0.3，距离 resistances[0] ≈ 7.5），
+  优先 bias=long（做多反弹）；
+- entry_zone ≈ [2318.0, 2321.0]（覆盖 supports 簇）；
+- stop_loss ≈ 2310.5（< 2313.02 - 0.5 × ATR）；
+- take_profit ≈ [2327.5, 2332.5]（区间上沿 + 第二档阻力）；
+- RR ≈ (2327.5 - 2319.5) / (2319.5 - 2310.5) ≈ 0.89 → **不达 1.5，退回 neutral**；
+  否则按上述结构出单，position_size_pct ≤ 0.05。
+此处展示了"先按区间策略尝试、RR 不够再退 neutral"的判断顺序，
+不要因为 alignment_score 低就直接 neutral 而不做这一步尝试。
 
 【P1 强约束（必须严格遵守）】
 1) 当 regime=ranging 时禁止给 trending 仓位建议：必须降为 neutral，
