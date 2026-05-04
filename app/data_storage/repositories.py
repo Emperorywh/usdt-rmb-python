@@ -1073,7 +1073,7 @@ class Repositories:
         self, symbol: str
     ) -> Optional[Dict[str, Any]]:
         """
-        轻量读取指定 symbol 最近一条信号的"判断字段"
+        轻量读取指定 symbol 最近一条信号的"判断字段 + 结构化交易计划"
         ---------------------------------------------------------------
         说明：
             - 与 ``fetch_latest_signal`` 的区别：**故意不读取 factors 列**。
@@ -1082,21 +1082,34 @@ class Repositories:
             - 该方法专供 LLMAgent 的"DB 节流"使用：
                 1) 拿 ts 判断距上次 LLM 分析是否 ≥ min_interval；
                 2) 命中节流时用 bias / confidence / reason / risk / suggestion
-                   重建 TradingSignal，连同 reasoning_content 一起返回给上层。
+                   + 结构化交易计划（entry_zone / SL / TP / RR / 仓位 / 多周期
+                   投票 / 失效条件）完整重建 TradingSignal，连同
+                   reasoning_content 一起返回给上层。
             - 走的是 idx_signals_symbol_ts (symbol, ts DESC) 索引，单点查询，
               成本远低于 LLM 调用，不会成为热路径瓶颈。
+
+        P0 Quant 修复 #3：以前只 SELECT 5 个文本字段，导致缓存命中重建出来
+        的 TradingSignal 在 bias=long 时 entry_zone/SL/TP 全空、被迫绕过
+        model_validator 强约束，前端会拿到一条"我是 long、可是没有任何
+        入场计划"的脏信号。这里把 P0 升级新增的 7 个结构化列也拉出来。
         参数：
             symbol: 合约代码
         返回：
             最新一条 signals 行的判断字段字典；不存在则返回 None。
             字段：ts / bias / confidence / reason / risk / suggestion /
-                  reasoning_content。
+                  reasoning_content / entry_zone(JSONB) / stop_loss(NUMERIC) /
+                  take_profit(JSONB) / risk_reward_ratio(NUMERIC) /
+                  position_size_pct(NUMERIC) / timeframe_alignment(JSONB) /
+                  invalidation_conditions(JSONB)。
         """
         async with self.db.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT ts, bias, confidence, reason, risk, suggestion,
-                       reasoning_content
+                       reasoning_content,
+                       entry_zone, stop_loss, take_profit,
+                       risk_reward_ratio, position_size_pct,
+                       timeframe_alignment, invalidation_conditions
                 FROM signals
                 WHERE symbol = $1
                 ORDER BY ts DESC

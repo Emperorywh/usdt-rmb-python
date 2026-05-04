@@ -578,6 +578,85 @@ class LLMAgent:
             self._locks[symbol] = lock
         return lock
 
+    @staticmethod
+    def _collect_cached_plan_kwargs(row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        把 signals 表行里的"结构化交易计划"列规整成 TradingSignal 构造 kwargs
+        --------------------------------------------------------------
+        P0 Quant 修复 #3 的辅助函数。
+
+        类型转换说明：
+            - NUMERIC 列经 asyncpg 默认返回 ``decimal.Decimal``；TradingSignal
+              的字段是 float，这里统一转 float（精度损失对交易计划无影响）。
+            - JSONB 列在 database._init_connection 里已经注册了 codec，
+              直接拿到 list / dict / None。
+            - 任何字段为 None / 空 / 类型不符时，原样不放进 kwargs，
+              让 TradingSignal 走默认值；如果 bias != neutral 又凑不齐
+              entry_zone / stop_loss / 2 档 take_profit，model_validator
+              会抛 ValueError，调用方 catch 后会让本轮走真 LLM 调用。
+
+        参数：
+            row: fetch_latest_signal_judgment 返回的 dict
+        返回：
+            可直接 **kwargs 解包给 TradingSignal(...) 的字典；
+            缺什么字段就不放什么键，不会硬塞 None 进去。
+        """
+
+        def _to_float(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        kwargs: Dict[str, Any] = {}
+
+        # entry_zone：JSONB 存成 [low, high]，TradingSignal 期望 tuple
+        ez = row.get("entry_zone")
+        if isinstance(ez, (list, tuple)) and len(ez) == 2:
+            ez_low = _to_float(ez[0])
+            ez_high = _to_float(ez[1])
+            if ez_low is not None and ez_high is not None:
+                kwargs["entry_zone"] = (ez_low, ez_high)
+
+        sl = _to_float(row.get("stop_loss"))
+        if sl is not None:
+            kwargs["stop_loss"] = sl
+
+        tp_raw = row.get("take_profit")
+        if isinstance(tp_raw, (list, tuple)) and tp_raw:
+            tp_list: List[float] = []
+            for t in tp_raw:
+                tv = _to_float(t)
+                if tv is not None:
+                    tp_list.append(tv)
+            if tp_list:
+                kwargs["take_profit"] = tp_list
+
+        rr = _to_float(row.get("risk_reward_ratio"))
+        if rr is not None:
+            kwargs["risk_reward_ratio"] = rr
+
+        psp = _to_float(row.get("position_size_pct"))
+        if psp is not None:
+            kwargs["position_size_pct"] = psp
+
+        tfa = row.get("timeframe_alignment")
+        if isinstance(tfa, dict) and tfa:
+            # 仅保留 value 是 str 的项，避免脏数据破坏 schema
+            kwargs["timeframe_alignment"] = {
+                str(k): str(v) for k, v in tfa.items() if isinstance(v, str)
+            }
+
+        ic = row.get("invalidation_conditions")
+        if isinstance(ic, list) and ic:
+            kwargs["invalidation_conditions"] = [
+                str(x) for x in ic if isinstance(x, str)
+            ]
+
+        return kwargs
+
     async def _load_recent_judgment(
         self,
         symbol: str,
@@ -634,30 +713,37 @@ class LLMAgent:
         if elapsed >= effective_interval:
             return None
 
+        # P0 Quant 修复 #3：完整重建 TradingSignal（含结构化交易计划）
+        # ------------------------------------------------------------
+        # 旧版逻辑：先用 bias="neutral" 构造让 model_validator 通过，
+        # 再 object.__setattr__ 覆盖 bias 回真实值。这绕过了 schema 强约束，
+        # 会向上游透出"bias=long、entry_zone=None、take_profit=[]"的脏信号
+        # （前端 service.generate 里 final.model_dump() 是无差别透出的）。
+        #
+        # 新版逻辑：从 row 里把 P0 升级新增的 7 个结构化列一并取出来，
+        # 完整构造 TradingSignal 让 model_validator 真实通过。
+        # 副作用：
+        #   - 历史脏行（旧版 LLM 没产 plan 就入库的）会触发 ValueError，
+        #     我们 catch 后返回 None，让本轮去真打一次 LLM 重新建判断；
+        #     这恰恰是我们想要的行为：宁可多调一次 LLM，也不能透出脏 plan。
+        #   - schema 里 RR < 1.5 会强制降级为 neutral 并清空 plan，
+        #     与"真正调用 LLM 时的语义"保持一致。
+        cached_plan_kwargs = self._collect_cached_plan_kwargs(row)
         try:
-            # 缓存重建只为了"跳过本轮 LLM 调用"，本身不会影响下游交易计划
-            # （结构化字段 entry_zone / SL / TP 等在节流命中时不会被透出执行）。
-            # P0 升级后 model_validator 对 long/short 强约束 entry_zone/SL/TP 必填，
-            # 但历史 signals 行可能没有这些列；为了不破坏节流通路，缓存重建时
-            # 一律把 bias 当作"展示用 bias"，并强制走 neutral 路径让校验通过：
-            #   - 如果上层只读 bias / confidence 用于日志，结果是一致的；
-            #   - 真正的执行计划只来自"真正调用 LLM 的那次"，缓存命中本来就不入库。
             cached_signal = TradingSignal(
-                bias="neutral",
+                bias=row.get("bias") or "neutral",
                 confidence=float(row["confidence"]),
                 reason=row.get("reason") or "",
                 risk=row.get("risk") or "",
                 suggestion=row.get("suggestion") or "",
+                **cached_plan_kwargs,
             )
-            # 然后把真实 bias 透出来供日志展示（model_validator 已通过，
-            # 这里直接 setattr 不会再触发约束）。
-            object.__setattr__(cached_signal, "bias", row["bias"])
         except Exception:
-            # 历史脏数据 / schema 不匹配时，不强行卡死节流通道；记日志后
-            # 当作没有缓存处理，让本轮去真打一次 LLM 重建判断。
+            # 历史脏数据 / schema 不匹配 / 几何不合规：不强行卡死节流通道；
+            # 记日志后当作没有缓存处理，让本轮去真打一次 LLM 重建判断。
             logger.warning(
-                "无法从 signals 表行重建 %s 的 TradingSignal；"
-                "将按未命中缓存重新调用 LLM",
+                "无法从 signals 表行重建 %s 的 TradingSignal（多半是历史脏行/"
+                "结构化字段缺失）；将按未命中缓存重新调用 LLM",
                 symbol,
                 exc_info=True,
             )

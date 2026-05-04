@@ -81,14 +81,40 @@ _BREAKOUT_TF_WEIGHTS: Dict[str, Dict[str, float]] = {
     "1d": {"net_flow_usd": 0.00, "imbalance": 0.00, "oi_change_pct": 0.00, "trend": 0.00},
 }
 
+# ----------------------------------------------------------------------
+# "overall" 中性权重（P1 Quant 修复 #3：fallback 不再借用 trending）
+# ----------------------------------------------------------------------
+# 设计意图：
+#   - "overall" 是 _lookup_weight 的最后一档兜底维度：
+#       (regime, tf) 没找到 → ('overall', tf) → 0
+#     如果 IC 校准任务还没来得及把某个 (regime, tf, factor_name) 写进
+#     factor_weights 表，规则引擎就会经过这条路径打分。
+#   - 旧版 _BASELINE_WEIGHTS["overall"] = _TRENDING_TF_WEIGHTS，
+#     等同于"未知 regime → 默认按 trending 处理"。在真正的 ranging
+#     行情里，这会持续输出趋势单、扛单到价格回到区间正中再止损。
+#   - 新设计：4 类因子在 5 个 timeframe 内**等权**，sum = 1（与
+#     IC 校准约定的"同一 (regime, tf) 内权重和 = 1"对齐）。
+#     这样兜底打出来的 score 不偏向任何 regime，只是对所有信号做
+#     无偏的加权和，行为相当于"我不知道现在是什么市场，先客观看
+#     每个因子各说什么"。
+_NEUTRAL_TF_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "5m":  {"net_flow_usd": 0.25, "imbalance": 0.25, "oi_change_pct": 0.25, "trend": 0.25},
+    "15m": {"net_flow_usd": 0.25, "imbalance": 0.25, "oi_change_pct": 0.25, "trend": 0.25},
+    "1h":  {"net_flow_usd": 0.25, "imbalance": 0.25, "oi_change_pct": 0.25, "trend": 0.25},
+    "4h":  {"net_flow_usd": 0.25, "imbalance": 0.25, "oi_change_pct": 0.25, "trend": 0.25},
+    "1d":  {"net_flow_usd": 0.25, "imbalance": 0.25, "oi_change_pct": 0.25, "trend": 0.25},
+}
+
 _BASELINE_WEIGHTS: Dict[str, Dict[str, Dict[str, float]]] = {
     "trending_up": _TRENDING_TF_WEIGHTS,
     "trending_down": _TRENDING_TF_WEIGHTS,
     "breakout": _BREAKOUT_TF_WEIGHTS,
     "breakdown": _BREAKOUT_TF_WEIGHTS,
     "ranging": _RANGING_TF_WEIGHTS,
-    "transitional": _TRENDING_TF_WEIGHTS,
-    "overall": _TRENDING_TF_WEIGHTS,
+    # transitional 作为"两类 regime 切换中"的中间态，让它走中性表，
+    # 比硬塞 trending 更接近真实意图（旧版会把所有切换期都误判成趋势）。
+    "transitional": _NEUTRAL_TF_WEIGHTS,
+    "overall": _NEUTRAL_TF_WEIGHTS,
 }
 
 # 因子归一化"参考量纲"：用 sigmoid(value / scale) × 2 - 1 把任意值压到 (-1, 1)。
@@ -121,6 +147,38 @@ _TREND_VALUE_MAP: Dict[str, float] = {
     "range": 0.0,
     "neutral": 0.0,
 }
+
+
+# ----------------------------------------------------------------------
+# 反指因子白名单（P0 Quant 修复 #2）
+# ----------------------------------------------------------------------
+# 这些因子的取值方向与"看多/看空"的常识方向相反：
+#   - funding_rate / funding_rate_now：极正 = 多头愿意付费持仓 = 多头拥挤
+#     → 短期反指（long squeeze 风险）；极负同理（short squeeze）。
+#   - account_long_short_ratio / account_contract_ratio：散户多空比 / 散户合约比，
+#     极高 = 散户狂多 = 顶部反指；极低 = 散户狂空 = 底部反指。
+# 进入 _signed_normalize 时会被取反，让"值越偏正→signed 越偏负"的反指语义生效。
+# 注意：top_trader_position_ratio（精英持仓）是顺指因子，不在本集合内。
+_INVERSE_FACTORS: set[str] = {
+    "account_long_short_ratio",
+    "account_contract_ratio",
+    "funding_rate",
+    "funding_rate_now",
+}
+
+
+# ----------------------------------------------------------------------
+# 需要"借同周期其他因子取方向"的复合因子白名单
+# ----------------------------------------------------------------------
+# OI 变动单独看没有方向（四种组合反向）：
+#   ΔOI↑ + 价格↑ = 多头加仓 → bullish
+#   ΔOI↑ + 价格↓ = 空头加仓 → bearish
+#   ΔOI↓ + 价格↑ = 空头平仓 → bullish
+#   ΔOI↓ + 价格↓ = 多头平仓 → bearish
+# 所以 oi_change_pct 的"强度"由 |normalize(oi_change_pct)| 决定，
+# 但"方向"必须由同周期 derivatives.oi_price_relation 字段决定
+# （uptrend → +1，downtrend → -1，其他 → 0 直接跳过）。
+_OI_CHANGE_FACTORS: set[str] = {"oi_change_pct", "oi_change"}
 
 
 def _normalize_factor(name: str, value: Any) -> Optional[float]:
@@ -159,24 +217,49 @@ def _normalize_factor(name: str, value: Any) -> Optional[float]:
     return math.tanh(v / scale)
 
 
-def _direction_sign(name: str, value: Any) -> float:
+def _signed_normalize(name: str, value: Any) -> float:
     """
-    估算"该因子在多空两个方向上的有效贡献符号"
+    把单个原子因子转成"带方向 + 强度"的实数 ∈ [-1, 1]
     --------------------------------------------------------------
-    多数因子是"值越大越偏多、越小越偏空"，符号 = sign(normalize(value))；
-    少数特殊因子会反过来（例如 retail_long_short_ratio 极高 = 散户狂多 = 反指）。
-    本函数集中处理这些方向反转，避免在 evaluate 里散落 if-else。
+    P0 Quant 修复 #1：取代旧版 _direction_sign。
+    旧版 _direction_sign 只返回 ±1.0 / 0.0，把强度信息全部抹平：
+        net_flow_usd = +5e4 USD  与  +5e7 USD  对 score 的贡献相等。
+    这与模块顶部 docstring "score = Σ weight × normalize(value)" 描述
+    直接矛盾，也是 P2 升级里"原子粒度归因"最容易被怀疑的地方
+    （contributions 全是 ±weight 的离散值，分不出强弱）。
+
+    本函数直接保留 normalize 的输出（含正负与强度），
+    并把"反指语义"前置在这里集中处理：
+        - _INVERSE_FACTORS 列出的因子，最终结果取负（值越偏正 → 越偏空）。
+
     返回：
-        +1.0 / -1.0 / 0.0
+        ∈ [-1, 1] 的浮点；无法解析时返回 0.0（评估循环会跳过）。
     """
     norm = _normalize_factor(name, value)
     if norm is None:
         return 0.0
-    sign = 1.0 if norm > 0 else (-1.0 if norm < 0 else 0.0)
-    # 反指因子：散户多空比 / 散户合约比（顶 ↔ 底反相关）
-    if name in ("account_long_short_ratio", "account_contract_ratio"):
-        return -sign
-    return sign
+    if name in _INVERSE_FACTORS:
+        return -norm
+    return norm
+
+
+def _resolve_oi_direction(rel: Any) -> float:
+    """
+    把 oi_price_relation 字段映射到 ±1 / 0
+    --------------------------------------------------------------
+    P0 Quant 修复 #2 的辅助函数：oi_change_pct 的方向取自 oi_price_relation。
+    映射规则：
+        uptrend   → +1.0 （多头加仓 / 空头平仓 → bullish）
+        downtrend → -1.0 （空头加仓 / 多头平仓 → bearish）
+        其他      →  0.0 （方向不明，调用方应跳过该因子）
+    """
+    if not isinstance(rel, str):
+        return 0.0
+    if rel == "uptrend":
+        return 1.0
+    if rel == "downtrend":
+        return -1.0
+    return 0.0
 
 
 class RuleEngine:
@@ -239,6 +322,10 @@ class RuleEngine:
         cap_layer, ob_layer, deriv_layer, struct_layer = self._extract_legacy_layers(factors)
 
         # ---- 计算 contributions（原子因子粒度）+ 总分 ----
+        # P0 Quant 修复 #1：用 signed_normalize（含强度）替代 sign，
+        # 让 contributions 体现"因子强弱"，与 docstring 公式一致。
+        # P0 Quant 修复 #2：oi_change_pct 单独看没方向，需要借同周期
+        # 的 oi_price_relation 取方向（强度仍取 |normalize(oi_change_pct)|）。
         contributions: Dict[str, float] = {}
         score = 0.0
         weight_lookup_count = 0
@@ -246,10 +333,25 @@ class RuleEngine:
             weight = self._lookup_weight(regime=regime, tf=tf, factor_name=name)
             if weight <= 0:
                 continue
-            sign = _direction_sign(name, value)
-            if sign == 0.0:
-                continue
-            contrib = sign * weight
+
+            if name in _OI_CHANGE_FACTORS:
+                # 复合方向因子：方向来自同周期 derivatives.oi_price_relation
+                rel = atomic_values.get((tf, "derivatives", "oi_price_relation"))
+                oi_dir = _resolve_oi_direction(rel)
+                if oi_dir == 0.0:
+                    # 方向未知（range / neutral / 缺失）：直接跳过，
+                    # 避免把"OI 涨"误读成"看多"。
+                    continue
+                magnitude = _normalize_factor(name, value)
+                if magnitude is None or magnitude == 0.0:
+                    continue
+                contrib = oi_dir * abs(magnitude) * weight
+            else:
+                signed = _signed_normalize(name, value)
+                if signed == 0.0:
+                    continue
+                contrib = signed * weight
+
             score += contrib
             contributions[f"{tf}:{group}.{name}"] = round(contrib, 6)
             weight_lookup_count += 1
@@ -667,8 +769,28 @@ class RuleEngine:
 
 
 # ----------------------------------------------------------------------
-# 与 P0/P1 完全相同的交易计划构造（保持兼容；逻辑未改动）
+# 交易计划构造常量（P1 Quant 修复 #1 + #2）
 # ----------------------------------------------------------------------
+# 把"魔法数字"集中放在这里，方便回测调参 / 后续接入 settings 灰度。
+#
+# _SL_BUFFER_ATR_MULT
+#   止损"防插针"缓冲：拿到最近支撑/阻力后，再向远离价格方向多推一段
+#   buffer = 该倍数 × band_unit。
+#   旧版逻辑：sl = max(valid_sup)（long 时直接贴在支撑价）—— ETH 永续上
+#   插针扫支撑/阻力是常态，这种 SL 是被精准扫损的结构。0.3 × ATR 是
+#   业内常用经验值（既不会让 SL 退太远以至 RR 跌破 1.5，也能挡掉
+#   绝大部分单根上下影插针）。
+#
+# _BAND_UNIT_FALLBACK_PCT
+#   ATR 缺失时按"入场价 × 该比例"作为 band_unit 兜底。
+#   旧值 0.005（0.5%）对 ETH 偏小：ETH 1h ATR 通常 30–80 USD，
+#   对 3000 价位 ≈ 1.0%–2.7%。0.5% 会让 entry_zone 过窄、SL 离价过近，
+#   频繁触发 schema 里 (ez_high < tp1) 与 RR 校验失败 → 一路降级 neutral。
+#   1.5% 取在 ETH 实测 ATR 占比的中间偏低位，更接近真实波动。
+_SL_BUFFER_ATR_MULT: float = 0.3
+_BAND_UNIT_FALLBACK_PCT: float = 0.015
+
+
 def _build_trade_plan(
     bias: str,
     entry: float,
@@ -690,19 +812,31 @@ def _build_trade_plan(
         历史版本只返回 Optional[Dict]，调用方无法区分"几何不合规"和
         "RR 不足"；这里把失败原因和关键中间值一起带回去，方便上层在日志
         里写出真实分支，避免一直被那条"数据不足"的兜底文案误导。
-        几何 / RR 计算逻辑本身保持与 P0/P1 完全一致，未改动。
+
+    P1 Quant 修复：
+        #1 band_unit 在 ATR 缺失时从 0.5% 上调到 1.5%（ETH 实测中位）
+        #2 long  SL = max(valid_sup) - 0.3 × ATR（防插针 buffer）
+           short SL = min(valid_res) + 0.3 × ATR（同理）
+        TP 不加 buffer：贴价 TP 反而是优势（早一点止盈），加 buffer 会让
+        RR 大量跌破 1.5 直接降 neutral，得不偿失。
     """
     if entry <= 0:
         return None, "invalid_entry", {"entry": entry}
-    band_unit = atr if atr and atr > 0 else max(entry * 0.005, 1e-6)
+    band_unit = atr if atr and atr > 0 else max(entry * _BAND_UNIT_FALLBACK_PCT, 1e-6)
     half_band = max(band_unit * 0.1, entry * 0.001)
     ez_low = entry - half_band
     ez_high = entry + half_band
 
+    # P1 Quant 修复 #2：对接价位的 SL 加 0.3 × band_unit 防插针缓冲，
+    # 让"贴在支撑/阻力价"的旧行为升级为"在支撑/阻力价之外再退 0.3 ATR"。
+    sl_buffer = band_unit * _SL_BUFFER_ATR_MULT
+
     if bias == "long":
         valid_sup = [s for s in supports if s < ez_low]
         if valid_sup:
-            sl = max(valid_sup)
+            # 旧：sl = max(valid_sup)（贴价容易插针扫损）
+            # 新：sl = 最近支撑 - 0.3 × ATR buffer，仍保证 sl < ez_low
+            sl = max(valid_sup) - sl_buffer
         else:
             sl = ez_low - max(band_unit * 1.0, entry * 0.005)
         valid_res = sorted({round(r, 6) for r in resistances if r > ez_high})
@@ -725,7 +859,8 @@ def _build_trade_plan(
     elif bias == "short":
         valid_res = [r for r in resistances if r > ez_high]
         if valid_res:
-            sl = min(valid_res)
+            # 旧：sl = min(valid_res)。新：再往上推 0.3 × ATR buffer。
+            sl = min(valid_res) + sl_buffer
         else:
             sl = ez_high + max(band_unit * 1.0, entry * 0.005)
         valid_sup = sorted({round(s, 6) for s in supports if s < ez_low}, reverse=True)

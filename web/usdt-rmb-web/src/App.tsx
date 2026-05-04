@@ -380,13 +380,6 @@ function App() {
     }
   }, [loadLatest, loadHistory])
 
-  /** 30 秒一次轮询（仅 latest，节省后端压力） */
-  useEffect(() => {
-    const t = window.setInterval(() => {
-      void loadLatest()
-    }, 30_000)
-    return () => window.clearInterval(t)
-  }, [loadLatest])
 
   /** 手动触发一次新分析（POST /signal/refresh），完成后刷新视图 */
   const handleRefresh = useCallback(async () => {
@@ -923,7 +916,7 @@ function BrandMark() {
 function ErrorBanner({
   message,
   onClose,
-}: {
+}: { 
   message: string
   onClose: () => void
 }) {
