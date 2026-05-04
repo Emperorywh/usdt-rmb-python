@@ -502,7 +502,7 @@ class LLMAgent:
             return self.min_interval
         try:
             base_default = int(self.min_interval) if self.min_interval > 0 else 1800
-            lo = int(getattr(self.settings, "llm_min_interval_seconds_min", 180))
+            lo = int(getattr(self.settings, "llm_min_interval_seconds_min", 900))
             hi = int(getattr(self.settings, "llm_min_interval_seconds_max", 1800))
             if not factors or not isinstance(factors, dict):
                 return self._clamp_interval(base_default, lo, hi)
@@ -530,7 +530,7 @@ class LLMAgent:
                 "breakout",
                 "breakdown",
             ):
-                interval = 180
+                interval = 900
             elif (
                 volatility_ratio is not None and volatility_ratio >= 1.2
             ) or alignment_score >= 0.75:

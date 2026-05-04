@@ -184,7 +184,7 @@ class Settings(BaseSettings):
     funding_pct_rank_window_seconds: int = 7 * 86_400
 
     # 自适应 LLM 节流上下限（秒），与 P0 的 llm_min_interval_seconds 配合
-    llm_min_interval_seconds_min: int = 180   # 3 分钟，暴动行情下限
+    llm_min_interval_seconds_min: int = 900   # 10 分钟，暴动行情下限
     llm_min_interval_seconds_max: int = 1800  # 30 分钟，平静期上限
 
     # regime 判定阈值；公开成 setting 是为了未来可调，不要在代码里硬编码。
