@@ -34,3 +34,9 @@ numpy>=2.3.2,<3
 # Logging
 # 结构化日志：纯 Python 实现，对解释器版本无要求。
 structlog>=24.4.0,<26
+
+# Test
+# 单元测试框架：pytest 8.x 支持 Py3.14；pytest-asyncio 用于 async 测试。
+# 仅在 dev / CI 安装即可，运行时不依赖。
+pytest>=8.3.0,<9
+pytest-asyncio>=0.24.0,<1

@@ -55,10 +55,14 @@ class SignalService:
         # P2：rule_engine.evaluate 现在是 async（要查 factor_weights 表）
         rule_signal, rule_score, contributions = await self.rule_engine.evaluate(factors)
 
-        # P2：在调 LLM 之前从 signal_lifecycle 读"近 5 条已结算 + 未结算占用"，
-        # 作为 recent_settled / open_lifecycle 透传给 LLMAgent；
-        # llm_agent 不直接依赖 repos，避免双向耦合。
-        recent_settled, open_lifecycle = await self._fetch_lifecycle_feedback(symbol)
+        # P2：在调 LLM 之前从 signal_lifecycle 读"近 N 条已结算"作为
+        # recent_settled 透传给 LLMAgent；llm_agent 不直接依赖 repos，
+        # 避免双向耦合。
+        # 注：原先一并读取的 open_lifecycle（未结算的最近一条）已废弃——
+        # 信号引擎只产建议、不掌握用户实际持仓，把 lifecycle 的 open 行
+        # 当成"持仓"是概念错位，会导致 LLM 被自己的旧判断绑架。方向冲突
+        # 应由后续持仓管理层处理（见 generate() 末尾 TODO 注释块）。
+        recent_settled = await self._fetch_lifecycle_feedback(symbol)
 
         # llm_agent.analyze 返回 LLMAnalysisResult（包装了 TradingSignal +
         # 思考模式下的 reasoning_content）；调用失败 / 未启用时返回 None。
@@ -69,7 +73,6 @@ class SignalService:
             rule_score=rule_score,
             rule_contributions=contributions,
             recent_settled=recent_settled,
-            open_lifecycle=open_lifecycle,
         )
 
         if llm_result is not None:
@@ -146,14 +149,50 @@ class SignalService:
                 getattr(self.factor_aggregator.settings, "enable_lifecycle_tracking", False)
             ):
                 try:
-                    ttl_hours = int(
-                        getattr(
-                            self.factor_aggregator.settings,
-                            "lifecycle_default_ttl_hours",
-                            24,
-                        )
+                    # 优先用分钟单位的 TTL（默认 90 分钟，与 LLM 生成节奏匹配）；
+                    # 老配置走 hours 兼容通道。compute_expires_at 内部按
+                    # "minutes 优先于 hours，都缺则默认 90 分钟"的规则解析。
+                    ttl_minutes = getattr(
+                        self.factor_aggregator.settings,
+                        "lifecycle_default_ttl_minutes",
+                        None,
                     )
-                    expires_at = compute_expires_at(ttl_hours=ttl_hours)
+                    ttl_hours = getattr(
+                        self.factor_aggregator.settings,
+                        "lifecycle_default_ttl_hours",
+                        None,
+                    )
+                    expires_at = compute_expires_at(
+                        ttl_minutes=int(ttl_minutes) if ttl_minutes is not None else None,
+                        ttl_hours=int(ttl_hours) if ttl_hours is not None else None,
+                    )
+                    # supersede：在写入新 pending 行之前，把同 symbol 下所有
+                    # 旧的 status='pending' 行批量改成 invalidated。
+                    # ----------------------------------------------------
+                    # 这一步是"新建议作废旧建议"的语义落地——
+                    # 旧 pending 行的 entry_zone 在生成几分钟后就已经偏离当前价，
+                    # 即便价格回去也已经没有"当时那个 ATR / 结构"的语义；
+                    # 留着它们只会等到 TTL 后批量 expired，污染近 N 次成绩单
+                    # 的胜率统计。triggered 行不动——那是真正入过场、仍在跟踪
+                    # SL/TP 的样本，必须等它自然到 SL/TP/expired 终态。
+                    try:
+                        invalidated_n = (
+                            await self.repos.invalidate_pending_lifecycles_for_symbol(
+                                symbol
+                            )
+                        )
+                        if invalidated_n:
+                            logger.info(
+                                "supersede 旧 pending lifecycle 行 symbol=%s 影响=%d 条",
+                                symbol,
+                                invalidated_n,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "supersede 旧 pending lifecycle 失败 symbol=%s（不阻塞主路径）",
+                            symbol,
+                            exc_info=True,
+                        )
                     await self.repos.insert_signal_lifecycle(
                         signal_id=signal_id,
                         symbol=symbol,
@@ -209,6 +248,24 @@ class SignalService:
             # 防止任务在 loop 还没调度前被 GC 回收：保持强引用直到任务完成。
             self._email_tasks.add(task)
             task.add_done_callback(self._email_tasks.discard)
+
+        # ----------------------------------------------------------------
+        # TODO（持仓管理层 / portfolio sizing 占位）
+        # ----------------------------------------------------------------
+        # 当前 SignalService 仅产"独立的交易建议"，不维护任何持仓状态：
+        #   - LLM 每次基于当前因子矩阵独立判断方向，不会被自己 30 分钟前
+        #     的旧 lifecycle 绑架（这是本轮重构的核心目标）；
+        #   - 同 symbol 下连续两条信号方向相反完全合法。
+        # 但生产实盘 / paper-trading 场景下，需要在**信号下游**接入一层
+        # portfolio 模块来处理：
+        #   1) 净敞口控制：已有 long 仓时收到新的 long 建议应降低加仓比例；
+        #      已有 long 仓时收到 short 建议应优先平仓而不是反向开仓；
+        #   2) 风险预算：单 symbol / 全账户的最大同时开仓数与杠杆约束；
+        #   3) 成交跟踪：把"实际下单价 / 实际持仓"反馈给 lifecycle 任务，
+        #      使 triggered_price 接近真实成交而非 mark price。
+        # 留作后续模块（计划路径建议 app/portfolio/）。当前发布版本以"建议"
+        # 为唯一交付物，方向冲突由用户/运维判断；此 TODO 不影响信号生成主路径。
+        # ----------------------------------------------------------------
 
         return {
             "id": signal_id,
@@ -306,47 +363,42 @@ class SignalService:
 
     async def _fetch_lifecycle_feedback(
         self, symbol: str
-    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    ) -> List[Dict[str, Any]]:
         """
-        拉取 P2 自我反馈所需的 lifecycle 数据
+        拉取 P2 自我反馈所需的"近 N 条已结算"数据
         ---------------------------------------------------------------
         参数：
             symbol: 合约
         返回：
-            (recent_settled, open_lifecycle)
-                recent_settled : 近 N 条已结算行（含 join 出来的 signals 字段）
-                open_lifecycle : 当前未结算的最近一条；找不到时为 None
+            近 N 条已结算 lifecycle 行（含 join 出来的 signals 字段）。
+            空列表 = 自我反馈关闭 / 表为空 / 查询失败。
         说明：
             - enable_llm_self_feedback=False / enable_lifecycle_tracking=False
               时直接返回空，避免无意义查表；
-            - 任意一项查询失败都吞掉异常返回空：自我反馈是"锦上添花"，
-              不能因为它把整轮 LLM 调用打挂。
+            - 查询失败吞掉异常返回空：自我反馈是"锦上添花"，不能因为它把
+              整轮 LLM 调用打挂。
+            - 不再读取"未结算的最近一条 open_lifecycle"——历史版本里它被
+              注入 prompt 当成"持仓"，但本系统只产建议、不掌握用户是否实际
+              下单，是概念错位。方向冲突 / 净敞口控制由后续持仓管理层处理
+              （见 generate() 末尾 TODO 注释块）。
         """
         settings = self.factor_aggregator.settings
         if not bool(getattr(settings, "enable_llm_self_feedback", False)):
-            return [], None
+            return []
         if not bool(getattr(settings, "enable_lifecycle_tracking", False)):
-            return [], None
+            return []
         recent_n = int(getattr(settings, "llm_feedback_recent_n", 5))
-        recent: List[Dict[str, Any]] = []
-        open_one: Optional[Dict[str, Any]] = None
         try:
-            recent = await self.repos.fetch_recent_settled_lifecycles(
+            return await self.repos.fetch_recent_settled_lifecycles(
                 symbol=symbol, limit=max(1, recent_n)
             )
         except Exception:
             logger.warning(
-                "读取 %s 最近成绩单失败，本次 LLM 自我反馈降级为空", symbol, exc_info=True
-            )
-        try:
-            open_one = await self.repos.fetch_open_signal_lifecycle_for_symbol(symbol)
-        except Exception:
-            logger.warning(
-                "读取 %s 未结算 lifecycle 失败，本次 LLM 自我反馈忽略未结算告警",
+                "读取 %s 最近成绩单失败，本次 LLM 自我反馈降级为空",
                 symbol,
                 exc_info=True,
             )
-        return recent, open_one
+            return []
 
     # ------------------------------------------------------------------
     # periodic background loop (started from FastAPI lifespan)

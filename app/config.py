@@ -254,7 +254,24 @@ class Settings(BaseSettings):
     # 生命周期跟踪任务运行节奏（秒）。30s 与 signal_interval 对齐，
     # 不会在新信号入库后等过久才进入"pending → triggered"。
     lifecycle_tick_seconds: int = 30
-    # 信号默认有效期（小时）：超过后强制按当前价 exit + 置 expired。
+    # 信号默认有效期（**分钟**）：超过后强制按当前价 exit + 置 expired。
+    # ----------------------------------------------------------------
+    # 设计意图：
+    #   原值 24 小时（lifecycle_default_ttl_hours=24）与 LLM 节流的 15–30 分钟
+    #   生成节奏严重错配——24 小时内会有 48–96 条 lifecycle 行同时未结算，
+    #   绝大多数 pending 信号的 entry_zone 在生成几分钟后就已经"过期"
+    #   （价格走开后 entry_zone 不会随之漂移），最后只能等 24 小时后批量 expired，
+    #   导致"近 5 次成绩单"长期被 expired 占满，胜率假性归零。
+    # 90 分钟取舍：
+    #   - 上限 = ~3 个 LLM 信号生成周期（默认 30 min × 3 = 90 min），
+    #     给 entry_zone 一个合理的"等待预算"；
+    #   - 配合 service.py 在新信号生成时 supersede 同 symbol 旧 pending 行
+    #     （置 invalidated），让"未触发就作废"成为常态而非异常。
+    # 兼容：保留 lifecycle_default_ttl_hours 字段读取，仅当显式配置为非默认值
+    #       时才仍走小时通道；优先级 minutes > hours。
+    lifecycle_default_ttl_minutes: int = 90
+    # （deprecated）信号默认有效期（小时）—— 保留供历史 .env / 配置覆盖；
+    # 新代码请使用 lifecycle_default_ttl_minutes。
     lifecycle_default_ttl_hours: int = 24
     # mark price 数据源的最大年龄（秒）：超过此值跳过本轮，避免 K 线断流误结算。
     lifecycle_mark_price_max_age_seconds: float = 60.0

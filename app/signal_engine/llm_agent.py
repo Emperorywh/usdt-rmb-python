@@ -239,21 +239,25 @@ ATR(15m) ≈ 9.6 时：
    vacuum_below + 'short' 同理。
 
 【P2 强约束（自我反馈机制 - 必须严格遵守）】
-1) 你将看到自己最近 N 次判断的实际 PnL（来自 signal_lifecycle 表，含
-   sl_hit / tp1_hit / tp2_hit / expired 四类终态）。如果近 5 次中有
-   ≥ 3 次为 sl_hit 或 expired（即胜率 ≤ 40%），必须显著降低本次 confidence
-   到 < 0.5；同时在 reason 字段中明确反思失败模式（例如：
-   "近 5 次中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"
-   或 "近 5 次 4 次 expired，入场区间过窄导致始终未触发"）。
-2) 如果上一条信号仍处于 triggered 状态（未结算），新判断方向**不能**
-   与其相反。除非有明显的反转证据（例如同时出现 swept_high +
-   cvd_price_divergence + 大周期趋势翻转），否则你应输出 neutral
-   等待上一条结算，并在 reason 中显式提到 "上一条信号 #<id> 仍持仓中"。
-3) 当近 5 次判断的 sample_count < 3（冷启动期）时不应用上述硬约束，
-   但 reason 中要注明 "样本不足，未触发自我反馈降权"。
-4) 对历史成绩的解释必须客观：不要因为 1 次大额胜利就过度自信，
-   也不要因为 1 次最大不利波动就强行翻转方向；优先看胜率 / 平均 RR
+1) 你将看到自己最近 N 次判断的实际成绩单，且会**按"是否曾入场"分两段**：
+   - 【判断质量段】：仅统计 triggered_at 非空（价格曾走进 entry_zone）的样本。
+     胜率定义为 wins / (wins + losses)，wins = tp1/tp2_hit，losses = sl_hit。
+     "曾入场但超时（expired-after-triggered）"不计入胜率分母。
+     **硬约束**：当 (wins + losses) ≥ 3 且胜率 ≤ 40% 时，必须显著降低本次
+     confidence 到 < 0.5，并在 reason 中具体反思失败模式（例如：
+     "近 5 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"）。
+   - 【触发率段】：fill_rate = 曾入场样本 / 总样本，反映 entry_zone 设计是否合理。
+     **软约束**：fill_rate < 30% 时，应在 reason 中反思"入场区间过窄/过远 /
+     方向偏移过早"等，但**不要**因此降低 confidence——价格没回到入场区间
+     与判断方向准不准是两件事，不应混为一谈。
+2) 当 (wins + losses) < 3（即"判断质量段"样本不足，无法形成统计意义）时
+   不应用上述硬约束；但 reason 中要注明 "曾入场样本不足，未触发自我反馈降权"。
+3) 对历史成绩的解释必须客观：不要因为 1 次大额胜利就过度自信，
+   也不要因为 1 次最大不利波动就强行翻转方向；优先看胜率 / 平均 PnL
    / 最大回撤三者的组合。
+4) 本系统是"信号建议"层，不持仓、不下单。**不要**因为成绩单里出现某条
+   方向就认为"还在仓位里"或被它绑架——每一次判断都应基于当前因子矩阵
+   独立做出，方向冲突 / 净敞口控制是后续持仓管理层的职责，不在你的范围。
 """
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -774,7 +778,6 @@ class LLMAgent:
         rule_score: float,
         rule_contributions: Dict[str, float],
         recent_settled: Optional[List[Dict[str, Any]]] = None,
-        open_lifecycle: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         把多周期因子矩阵渲染成紧凑中文表格，作为 ChatPromptTemplate 输入
@@ -782,6 +785,12 @@ class LLMAgent:
         参数：
             symbol / factors / rule_signal / rule_score / rule_contributions:
                 同 analyze() 形参
+            recent_settled:
+                近 N 条已结算 lifecycle 行（可选）。**注意**：这里不再接收
+                "上一条未结算"作为输入——本系统只产建议、不掌握用户是否
+                实际下单，把 lifecycle 的 open 行当成"持仓"是概念错位，
+                会导致 LLM 被自己 30 分钟前的旧判断绑架。方向冲突 / 净敞口
+                控制属于后续持仓管理层职责，已从 prompt 中彻底移除。
         返回：
             ChatPromptTemplate.format 所需的全部 key-value 字典。
         说明：
@@ -818,13 +827,13 @@ class LLMAgent:
 
         # P2：自我反馈段（注入到 HUMAN_PROMPT 的最前面）
         # ----------------------------------------------------------
-        # 只有 enable_llm_self_feedback=True 且 recent_settled / open_lifecycle
-        # 至少一项非空时，才渲染该段；否则给空字符串占位（不破坏模板）。
+        # 仅当 enable_llm_self_feedback=True 时渲染；
+        # recent_settled 为空时 _render_self_feedback 自身会输出"样本不足"段。
+        # open_lifecycle 注入链路已彻底移除（详见 _build_prompt_inputs docstring）。
         if bool(getattr(self.settings, "enable_llm_self_feedback", False)):
             self_feedback_block = self._render_self_feedback(
                 symbol=symbol,
                 recent_settled=recent_settled or [],
-                open_lifecycle=open_lifecycle,
             )
         else:
             self_feedback_block = ""
@@ -854,37 +863,70 @@ class LLMAgent:
         cls,
         symbol: str,
         recent_settled: List[Dict[str, Any]],
-        open_lifecycle: Optional[Dict[str, Any]],
     ) -> str:
         """
-        渲染"近 5 次成绩单 + 未结算持仓"段（P2 自我反馈）
+        渲染近 N 次成绩单（P2 自我反馈，aggressive 修订版）
         ---------------------------------------------------------------
         参数：
-            symbol           : 合约
-            recent_settled   : 近 N 条已结算 lifecycle（含 join 出来的 signals 字段）
-            open_lifecycle   : 当前未结算的最近一条；可选
+            symbol         : 合约
+            recent_settled : 近 N 条已结算 lifecycle（含 join 出来的 signals 字段）
         返回：
-            紧凑中文表格（含统计摘要 + 未结算告警）；总长度严格控制在
-            ~1500 token 以内（用 markdown 表格而非 JSON），避免反复推高
-            prompt 成本（详见模块顶部 P2 强约束）。
+            紧凑中文表格 + 统计摘要；总长度严格控制在 ~1500 token 以内。
+
+        修订点（相对历史版本）：
+            1) 不再渲染"⚠️ 上一条信号 #N 仍未结算"段：信号引擎只产建议，
+               不掌握用户实际持仓。方向冲突属于持仓管理层职责，不应在
+               LLM prompt 里强制 neutral。
+            2) 把成绩单按"是否真正入过场"拆成两段：
+                 - 判断质量段（triggered_at IS NOT NULL）：仅统计
+                   wins / (wins + losses)，expired-after-triggered（曾入场
+                   但超时退出）单独列出，不污染胜率分母；
+                 - 触发率段（fill rate）：triggered_count / total，反映
+                   入场区间是否合理；fill_rate 偏低提示 reason 自我反思
+                   "区间过窄/过远"，但不强制降置信度。
+            3) 这样既保留"判断方向准不准"信号给 LLM，又不会把"价格没回到
+               入场区间"误判成"判断错"，避免历史版本"5次全 expired→胜率0%
+               →强压 confidence 至 0.3"的吸收态。
         """
         lines: List[str] = []
-        lines.append(f"===== 你最近 {len(recent_settled)} 次判断的实际成绩（{symbol}）=====")
+        n = len(recent_settled)
+        lines.append(f"===== 你最近 {n} 次判断的成绩单（{symbol}）=====")
 
         if not recent_settled:
             lines.append("（样本不足：lifecycle 表里还没有该 symbol 的已结算记录）")
+            lines.append("")
+            return "\n".join(lines) + "\n"
+
+        # 按"是否曾入场"切分两组
+        triggered_rows: List[Dict[str, Any]] = []
+        untriggered_rows: List[Dict[str, Any]] = []
+        for row in recent_settled:
+            if row.get("triggered_at") is not None:
+                triggered_rows.append(row)
+            else:
+                untriggered_rows.append(row)
+
+        # ----------------------------------------------------------------
+        # 第 1 段：判断质量（仅曾入场的样本）
+        # ----------------------------------------------------------------
+        lines.append("")
+        lines.append(
+            f"【判断质量段】曾入场样本 = {len(triggered_rows)} / {n}"
+        )
+        wins = 0
+        losses = 0
+        expired_after_triggered = 0
+        pnl_acc: List[float] = []
+        if not triggered_rows:
+            lines.append("（无曾入场样本：所有信号均未触发，无法评估方向准确性）")
         else:
             lines.append(
-                "| ts | bias | conf | regime | 入场区间 | 触发价 | 退出原因 | PnL% | 最大有利% | 最大不利% |"
+                "| ts | bias | conf | regime | 入场区间 | 触发价 | 终态 | PnL% | 最大有利% | 最大不利% |"
             )
             lines.append(
-                "|----|------|------|--------|----------|--------|----------|------|-----------|-----------|"
+                "|----|------|------|--------|----------|--------|------|------|-----------|-----------|"
             )
-            wins = 0
-            losses = 0
-            expired_cnt = 0
-            pnl_acc: List[float] = []
-            for row in recent_settled:
+            for row in triggered_rows:
                 ts = row.get("signal_ts")
                 ts_str = ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else "-"
                 bias = row.get("bias") or "-"
@@ -916,29 +958,36 @@ class LLMAgent:
                 elif status == "sl_hit":
                     losses += 1
                 elif status == "expired":
-                    expired_cnt += 1
+                    expired_after_triggered += 1
                 if pnl is not None:
                     pnl_acc.append(float(pnl))
-            total = len(recent_settled)
-            win_rate = wins / total if total else 0.0
+
+            decided = wins + losses
+            win_rate = (wins / decided) if decided > 0 else 0.0
             avg_pnl = sum(pnl_acc) / len(pnl_acc) if pnl_acc else 0.0
             lines.append(
-                f"统计：胜率={win_rate:.0%}（{wins}赢/{losses}输/{expired_cnt}超时） "
-                f"平均PnL={avg_pnl * 100:+.2f}%"
+                f"统计（仅曾入场）：胜率={win_rate:.0%}（{wins}赢 / {losses}输；"
+                f"另有 {expired_after_triggered} 笔曾入场但超时未到 SL/TP，不计入分母）"
+                f"  平均PnL={avg_pnl * 100:+.2f}%  样本={decided}"
             )
 
-        # 未结算持仓提醒（P2 强约束 #2）
-        if open_lifecycle:
-            sid = open_lifecycle.get("signal_id")
-            ob = open_lifecycle.get("bias")
-            ostat = open_lifecycle.get("status")
-            otrig = open_lifecycle.get("triggered_price")
-            otrig_str = f"@{float(otrig):.2f}" if otrig is not None else ""
+        # ----------------------------------------------------------------
+        # 第 2 段：触发率（fill rate）—— 衡量入场区间设置是否合理
+        # ----------------------------------------------------------------
+        lines.append("")
+        triggered_total = len(triggered_rows)
+        fill_rate = triggered_total / n if n > 0 else 0.0
+        lines.append(
+            f"【触发率段】fill_rate={fill_rate:.0%}（{triggered_total}/{n} 触发入场）；"
+            f"未触发 {len(untriggered_rows)} 笔（价格从未回到 entry_zone 即超时/作废）"
+        )
+        if untriggered_rows and fill_rate < 0.3:
             lines.append(
-                f"⚠️ 上一条信号 #{sid} ({ob}, {ostat}{otrig_str}) **仍未结算**：除非你有明确反转证据，"
-                "否则应保持同向或输出 neutral 等待结算。"
+                "提示：fill_rate 偏低（< 30%）通常意味着入场区间过窄或方向偏移过早，"
+                "建议在 reason 中反思入场设计，但不必单方面降低 confidence。"
             )
-        lines.append("")  # 空行作为段落分隔
+
+        lines.append("")
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -1310,7 +1359,6 @@ class LLMAgent:
         rule_score: float,
         rule_contributions: Dict[str, float],
         recent_settled: Optional[List[Dict[str, Any]]] = None,
-        open_lifecycle: Optional[Dict[str, Any]] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         执行一次 LLM 分析，带按 symbol 的节流缓存。
@@ -1321,6 +1369,9 @@ class LLMAgent:
             rule_signal        ：规则引擎的初判 TradingSignal
             rule_score         ：规则引擎打分（[-1, 1] 区间）
             rule_contributions ：各因子对规则打分的贡献度
+            recent_settled     ：近 N 条已结算 lifecycle（自我反馈用，可选）。
+                                 注意：不再接收"上一条未结算"参数——见
+                                 _build_prompt_inputs docstring。
         返回：
             LLMAnalysisResult  ：包含 TradingSignal 与 reasoning_content
                                  （来自缓存时同样会带回首次调用的思维链原文）
@@ -1377,7 +1428,6 @@ class LLMAgent:
                     rule_score=rule_score,
                     rule_contributions=rule_contributions,
                     recent_settled=recent_settled,
-                    open_lifecycle=open_lifecycle,
                 )
                 result = await self._chain.ainvoke(prompt_inputs)
             except Exception:

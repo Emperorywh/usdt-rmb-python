@@ -374,19 +374,32 @@ class LifecycleTracker:
 # 模块级辅助函数
 # ----------------------------------------------------------------------
 def compute_expires_at(
-    now: Optional[datetime] = None, ttl_hours: int = 24
+    now: Optional[datetime] = None,
+    ttl_hours: Optional[int] = None,
+    ttl_minutes: Optional[int] = None,
 ) -> datetime:
     """
-    给一条新信号计算 expires_at（一般 = now + ttl_hours 小时）
+    给一条新信号计算 expires_at
     ---------------------------------------------------------------
     参数：
-        now       : 基准时间；None 取当前 UTC
-        ttl_hours : 默认 24h
+        now         : 基准时间；None 取当前 UTC
+        ttl_hours   : （deprecated）信号有效期（小时）；与 ttl_minutes 互斥
+        ttl_minutes : 信号有效期（分钟），优先于 ttl_hours
     返回：
         UTC datetime
+    选择规则：
+        1) 同时给了 ttl_minutes 和 ttl_hours：优先使用 ttl_minutes；
+        2) 只给 ttl_hours：按小时换算；
+        3) 都没给：默认 90 分钟（与 settings.lifecycle_default_ttl_minutes 对齐）。
+    边界保护：
+        ttl_minutes 至少 1 分钟，ttl_hours 至少 1 小时；负数或 0 都被 clamp。
     """
     base = now or datetime.now(timezone.utc)
-    return base + timedelta(hours=max(1, int(ttl_hours)))
+    if ttl_minutes is not None:
+        return base + timedelta(minutes=max(1, int(ttl_minutes)))
+    if ttl_hours is not None:
+        return base + timedelta(hours=max(1, int(ttl_hours)))
+    return base + timedelta(minutes=90)
 
 
 def _to_float(v: Any) -> Optional[float]:

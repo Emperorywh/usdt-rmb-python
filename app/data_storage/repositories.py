@@ -1437,6 +1437,53 @@ class Repositories:
 
         await self.db.run_with_retry(_do, op_name="update_signal_lifecycle")
 
+    async def invalidate_pending_lifecycles_for_symbol(
+        self, symbol: str
+    ) -> int:
+        """
+        把同 symbol 下所有 status='pending' 的 lifecycle 行批量 supersede 为 invalidated
+        --------------------------------------------------------------
+        参数：
+            symbol : 合约代码
+        返回：
+            实际被改动的行数（用于日志 / 监控）。
+        语义：
+            - 在 service 写入新一条 pending lifecycle **之前**调用：
+              用"新建议"作废"旧建议"，避免旧的、价格已经走开的 entry_zone 仍
+              堆在表里，等到 24h（旧）/ 90 分钟（新）后批量 expired，污染
+              "近 N 次成绩单"的胜率统计。
+            - 仅作用于 status='pending'（从未入场的）；triggered 行不动，
+              那些是已经入过场、还在跟踪 SL/TP 的真实判断成绩，不能擅自作废。
+            - exit_at 设为 NOW()、exit_price 留空（pending 阶段没有触发价
+              可参考），pnl_pct / 极值字段不写——只是"被新信号取代"，
+              不参与盈亏统计。
+            - 走偏序索引 idx_signal_lifecycle_open_expires，即使表里堆了
+              成千上万的历史行也只扫"未结算"那一小段，成本可控。
+        """
+
+        async def _do() -> int:
+            async with self.db.acquire() as conn:
+                tag = await conn.execute(
+                    """
+                    UPDATE signal_lifecycle
+                       SET status     = 'invalidated',
+                           exit_at    = NOW(),
+                           updated_at = NOW()
+                     WHERE symbol = $1
+                       AND status = 'pending'
+                    """,
+                    symbol,
+                )
+            try:
+                # asyncpg 的 execute 返回类似 'UPDATE 3' 的字符串
+                return int(tag.split()[-1]) if tag else 0
+            except (ValueError, IndexError):
+                return 0
+
+        return await self.db.run_with_retry(
+            _do, op_name="invalidate_pending_lifecycles_for_symbol"
+        )
+
     async def fetch_recent_settled_lifecycles(
         self,
         symbol: str,
