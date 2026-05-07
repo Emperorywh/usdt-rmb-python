@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -28,6 +31,17 @@ from app.logging_config import get_logger
 from app.signal_engine.schemas import TradingSignal
 
 logger = get_logger(__name__)
+
+
+# --------------------------------------------------------------------
+# 防 prompt injection 的 symbol 白名单
+# --------------------------------------------------------------------
+# 业务上当前只支持 OKX 永续合约形如 ``ETH-USDT-SWAP``：
+#   * 首字符必须是字母或数字；
+#   * 仅允许 [A-Z0-9_-]，长度 3–32；
+# 任何越界字符都被拒绝，避免用户控制的 symbol 被拼到 prompt 里
+# 进行 prompt injection（参考：OWASP LLM Top 10 2025 #1）。
+_SYMBOL_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
 
 
 def _to_float_safe(v: Any) -> Optional[float]:
@@ -157,205 +171,354 @@ class LLMAnalysisResult:
 
 SYSTEM_PROMPT = """\
 你是一名资深加密衍生品量化交易分析师。系统会给你一份多周期因子矩阵
-（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口、多周期关键价位列表，
-以及（P1 升级新增）：market regime（市场状态）、流动性地图、订单簿时序指标、
-散户/精英多空比；（P2 升级新增）你最近 N 次判断的成绩单；（P3 升级新增）
-近 24h 系统级评估指标（方向翻转率 / 胜率 / Sharpe / Brier）。
+（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口、多周期关键价位列表、
+market regime（市场状态）、流动性地图、订单簿时序指标、散户/精英多空比，
+以及你最近 N 次判断的成绩单和近 24h 系统级评估指标
+（方向翻转率 / 胜率 / Sharpe / Brier）。
 
-请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为
-完整可执行的交易计划。该信号仅作交易建议，不会被自动下单。
+请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为完整可执行的
+交易计划。该信号仅作交易建议，不会被自动下单。
 
 【输出语言要求】
 - reason / risk / suggestion 三个字段必须使用**简体中文**。
 - bias 字段保持 long / short / neutral 三个英文枚举值之一，**不要翻译**。
 - timeframe_alignment 的 value 也保持 long/short/neutral 英文枚举。
 
-【因子使用要点】
-- 综合考虑四类因子：资金流（capital_flow）、订单簿（orderbook）、
-  衍生品（derivatives）、市场结构（market_structure）。
-- 注意：当前没有链上数据与参与者画像，请勿引用任何 on-chain / whale /
-  smart money 相关信息，也不要编造。
+【决策优先级（自上而下，前者覆盖后者；冲突必须按此顺序仲裁）】
+不允许以"低层证据更强"为由覆盖高层约束。
+  级别 1 ── P3 系统级评估硬约束（24h flip_rate / Sharpe / Brier / avg_pnl）
+  级别 2 ── P2 自我反馈硬约束（近 N 次判断质量段胜率、fill_rate）
+  级别 3 ── 风控硬下限（RR / SL / 仓位 / 失效条件数量；服务端 deterministic
+            post-check 会复算，违反必被强制 neutral）
+  级别 4 ── P1 regime 强约束（regime / retail_smart / funding_extreme / liquidity_vacuum）
+  级别 5 ── 多周期共振（alignment_score / dominant_bias）
+  级别 6 ── 单周期因子证据（net_flow / CVD / OI / 订单簿失衡等）
 
-【多周期共振原则】
-- 因子数据按 5m / 15m / 1h / 4h / 1d 五个周期分层提供。
-  周期越大权重越高：4h、1d 决定主方向，1h 决定波段，
-  15m、5m 决定入场时机。
-- 出现冲突时，优先信任高周期，并在 reason 中显式说明你为什么
-  舍弃了哪些低周期信号。
+【因子使用要点】
+- 综合考虑四类因子：资金流（capital_flow）、订单簿（orderbook）、衍生品（derivatives）、
+  市场结构（market_structure）。
+- 当前没有链上数据与参与者画像，请勿引用任何 on-chain / whale / smart money
+  相关信息，也不要编造。
+- 多周期权重：4h / 1d 决定主方向，1h 决定波段，15m / 5m 决定入场时机。
+  冲突时优先信任高周期，并在 reason 中显式说明你为什么舍弃了哪些低周期信号。
 - timeframe_alignment 必须把 5 个周期的方向都填上，缺一不可。
 
-【可执行交易计划】（P3 升级：SL / RR / size 全部抬高门槛）
-你必须输出完整可执行交易计划：
-- entry_zone：**区间，不是单点**，宽度建议 0.2 × ATR(15m) ~ 0.5 × ATR(15m)。
-- stop_loss：必须落在结构关键位（HH/HL swing 点 / 4h 支撑或阻力）的另一侧，
-  并同时满足以下两条最小距离约束（取较大者）：
-    a) |entry_mid - stop_loss| ≥ **1.5 × ATR(15m)**（旧值 1×ATR，已上调）；
-    b) |entry_mid - stop_loss| / entry_mid ≥ **0.5%**（绝对百分比下限）。
-  动机：ETH 永续 1m 随机噪声常见 0.05–0.15%，0.2–0.3% 的 SL 是高频陷阱。
+【可执行交易计划核心硬约束】
+- entry_zone：**区间**，宽度建议 0.2 × ATR(15m) ~ 0.5 × ATR(15m)。
+- stop_loss：必须落在结构关键位另一侧，且同时满足两条最小距离约束（取较大者）：
+    a) |entry_mid - sl| ≥ **1.5 × ATR(15m)**
+    b) |entry_mid - sl| / entry_mid ≥ **0.5%**
+  理由：ETH 永续 1m 随机噪声常见 0.05–0.15%，过窄 SL 是高频陷阱。
 - take_profit：至少 2 档，对应附近的对侧关键位 / 流动性池
-  （例如：tp1 = 1h 阻力，tp2 = 4h 阻力 / 上一波等量目标）。
-- risk_reward_ratio：必须 ≥ **2.0**（旧值 1.5，已上调）。
-  按 |tp1 − entry_mid| / |entry_mid − sl| 计算。
-- position_size_pct：建议值上限 **0.10**（旧 cap 0.25，已下调）。
-  请基于 1% 账户风险预算计算 = 0.01 / (|entry_mid - stop_loss| / entry_mid)，
-  再按 conf 缩放（conf ≤ 0.5 给 0；conf ∈ (0.5, 0.7] 上限 0.05；
-  conf > 0.7 上限 0.10）。
-  注意：服务端会基于历史胜率 + 半凯利对该值再做最终 clamp，
-  你的输出只是"上限建议"，不是最终下单仓位。
-- invalidation_conditions：≥ 2 条**量化**失效条件（必须含具体价位 / 阈值），
-  例如："4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
+  （tp1 ~ 1h 阻力、tp2 ~ 4h 阻力 / 上一波等量目标）。
+- risk_reward_ratio：必须 ≥ **2.0**，按 |tp1 − entry_mid| / |entry_mid − sl| 计算。
+  服务端 post-check 会用同一公式 cross-check，自报与复算偏差 > 5% 也强制 neutral。
+- position_size_pct：上限建议 **0.10**（按 1% 账户风险预算 = 0.01 / (|entry_mid - sl| / entry_mid)
+  并按 conf 缩放：conf ≤ 0.5 给 0；conf ∈ (0.5, 0.7] 上限 0.05；conf > 0.7 上限 0.10）。
+  服务端会基于历史胜率 + 半凯利对该值再做最终 clamp，你的输出只是"上限建议"。
+- invalidation_conditions：≥ 2 条**量化**失效条件，必须含具体价位 / 阈值，
+  例如 "4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
+- neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct 全部置 null。
+- reason 必须引用具体数值（净流入 USD / CVD slope / OI 变动 % / funding / 关键价位等），
+  不要写"看起来""似乎"等模糊表述。
+- suggestion 文末必须注明"仅供参考，不构成交易指令"。
 
 【降级规则】
-- 当 RR < 2.0 时，禁止给出趋势性 long/short 方向；可以走"区间策略"
-  （见下方），或在区间策略也不成立时输出 neutral。
-- 多周期方向严重冲突（alignment_score 绝对值 < 0.4 且 dominant_bias=neutral）
-  时，**不再强制 neutral**。优先级如下：
-    1) 必须先按下方【区间策略检查清单】逐项核对 5m **与** 15m 两个周期是否
-       存在可交易区间；任一周期检查通过即允许走"区间策略"，并按区间策略
-       约束输出。
-    2) 若两个周期检查清单都不通过，才输出 neutral，并在 reason 中明确说明
-       "区间不可交易：<5m 失败原因> / <15m 失败原因>"（必须分别给出，
-       不允许笼统写"无区间"）。
+- RR < 2.0 时禁止给出趋势性 long/short 方向；可走"区间策略"，否则输出 neutral。
+- 多周期方向严重冲突（alignment_score 绝对值 < 0.4 且 dominant_bias=neutral）时，
+  优先尝试区间策略，仍不成立才 neutral。
 
-【区间策略检查清单（强制结构化校验，禁止跳过任何一项）】
-当满足"alignment_score 绝对值 < 0.4 且 dominant_bias=neutral"或
-"regime ∈ {{ranging, transitional}}"时，你必须在 reason 中**按下表逐行**
-列出 5m 与 15m 两个周期的检查结果，缺一不可（缺数据的字段写"N/A"）：
+【区间策略（regime ∈ {{ranging, transitional}} 或多周期共振崩溃时）】
+逐项核对 5m **与** 15m 是否存在可交易区间：
+- 闸 A（区间内）：sup[0] < last_close < res[0]
+- 闸 B（宽度足够）：res[0] - sup[0] ≥ 0.6 × ATR(15m)（ATR(15m) 缺失时用
+  ATR(5m) × √3 估算，禁止以"ATR(15m) 缺失"为由跳过该闸）
+- 闸 C（更近一侧）：哪个边界更近就向哪一侧反弹/回踩
 
-| 周期 | sup[0] | res[0] | last_close | 闸 A: sup[0]<close<res[0] | 区间宽度 W | 0.6×ATR(15m) | 闸 B: W ≥ 0.6×ATR(15m) | 距离上沿 | 距离下沿 | 闸 C: 哪一侧更近 |
-|------|--------|--------|------------|---------------------------|------------|---------------|------------------------|----------|----------|------------------|
-| 5m   |        |        |            |                           |            |               |                        |          |          |                  |
-| 15m  |        |        |            |                           |            |               |                        |          |          |                  |
+**边界来源白名单**：sup[0] / res[0] 必须取自因子矩阵
+``by_timeframe.<tf>.market_structure.supports / resistances`` 列表的首元素；
+**严禁**使用 liquidity_pool_above / liquidity_pool_below 中的 round_level / weak
+节点作为区间边界（流动性池仅可作为 take_profit[1] 的辅助参考）。
 
-判定规则：
-- **闸 A 与 闸 B 同时通过**的周期 = 该周期"区间可交易"，可作为区间策略的
-  边界来源；如果 5m / 15m 都通过，**优先选 15m 作为边界来源**（更稳定），
-  仅当 15m 缺数据时才回退到 5m。
-- 闸 A 不通过的常见原因：res[0] 缺失（resistances=[]）/ sup[0] 缺失 /
-  last_close 已经位于区间外（sweep 已发生）。直接写出哪一项缺。
-- 闸 B 不通过的常见原因：区间太窄。即使 ATR(15m) 缺失，也必须用
-  ATR(5m) × √3 估算 ATR(15m) 后再比较，**禁止以"ATR(15m) 缺失"为由
-  跳过该闸**。
-- **边界来源白名单**：sup[0] / res[0] 必须取自因子矩阵中
-  by_timeframe.<tf>.market_structure.supports / resistances 列表的首元素。
-  **严禁**使用 liquidity_pool_above / liquidity_pool_below 中的
-  round_level / weak 节点作为区间边界（流动性池仅可作为 take_profit[1]
-  的辅助参考，不能用来替代结构关键位）。
+5m / 15m 都通过时**优先选 15m**（更稳定）；任一通过即可走区间策略：
+- 距对侧边界 ≥ 0.4 × 区间宽度（**禁止贴边**）；
+- stop_loss 距边界 ≥ 1.5 × ATR(15m) buffer，仍满足绝对 0.5% 下限；
+- take_profit[0] 取另一侧边界附近（≥ 0.7 倍区间宽度），take_profit[1] 取另一侧 + 一档流动性池；
+- RR 仍必须 ≥ 2.0；做不到就退回 neutral 并显式写
+  "区间策略 RR=<计算值> < 2.0，退回 neutral"
+  （**禁止**改写为"区间不清晰"，混淆会让自我反馈机制无法识别真正瓶颈）；
+- **position_size_pct ≤ 0.05**（强制小仓位）；
+- reason 必须显式写出 "区间策略" + 选用周期（5m/15m）+ 区间上下沿具体价位 +
+  不做趋势单的核心因子证据。
 
-如果"5m 通过"或"15m 通过"任一成立，按下列约束输出区间策略：
-  * bias 取"距离更近"的那一侧（贴近 supports → bias=long 做多反弹；
-    贴近 resistances → bias=short 做空回踩）；如果价格几乎在区间正中
-    且没有明显单边动能（CVD slope / 资金流 / 订单簿失衡都不指向同侧），
-    才允许输出 neutral。
-  * **禁止贴边**：entry_zone 必须距对侧边界 ≥ 0.4 × 区间宽度
-    （避免"贴在支撑一侧做多 → 1 根插针就到 SL"的结构性陷阱）。
-  * stop_loss 必须落在该边界另一侧 ≥ 1.5 × ATR(15m) buffer 之外，
-    同时仍满足"|entry_mid - SL| / entry_mid ≥ 0.5%"。
-  * take_profit[0] 取区间另一侧关键位附近（≥ 0.7 倍区间宽度），
-    take_profit[1] 取区间另一侧 + 一档流动性池节点；
-  * RR 仍必须 ≥ 2.0；做不到就退回 neutral，并在 reason 中显式写出
-    "区间策略 RR=<计算值> < 2.0，退回 neutral"，**不要再写"区间不清晰"**——
-    这两种失败原因不同，混淆会让自我反馈机制无法识别真正瓶颈。
-  * **position_size_pct 必须 ≤ 0.05**（强制小仓位）；
-  * reason 必须显式写出"区间策略"四个字 + 选用了哪个周期（5m/15m）的
-    边界 + 区间上下沿的具体价位 + 为什么不做趋势单的核心因子证据。
-- neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct
-  全部置 null（schema 强约束）。
-- reason 字段务必引用具体数值（净流入 USD、CVD slope、OI 变动百分比、
-  funding_rate、爆仓 imbalance、关键价位等），不要写"看起来"、
-  "似乎"等模糊表述。
-- suggestion 字段为面向用户的简体中文建议段落，文末必须注明
-  "仅供参考，不构成交易指令"。
+5m / 15m 都不通过时输出 neutral，并按格式
+"区间不可交易：5m 失败原因=<具体>；15m 失败原因=<具体>" 分别列出
+（不允许笼统写"无区间"，混淆会让自我反馈机制无法识别瓶颈）。
 
-【区间策略示例 A：检查清单通过 + RR 不达标 → 退回 neutral（参考写法，不要照抄数值）】
-当 regime=transitional、当前价 = 2330.72、
-5m supports=[2321.8, 2318.88, 2314.3]、5m resistances=[2331.3, 2385.67]、
-15m supports=[2314.3]、15m resistances=[]、
-5m ATR(14)=5.305（→ ATR(15m) 估算 ≈ 5.305 × √3 ≈ 9.19）时，
-reason 中必须先写出检查清单（示意，省略表格框）：
-  - 5m: sup[0]=2321.8, res[0]=2331.3, close=2330.72,
-        闸A 2321.8<2330.72<2331.3 ✅, W=9.5, 0.6×ATR(15m)≈5.51,
-        闸B 9.5≥5.51 ✅, 距上沿 0.58, 距下沿 8.92, 闸C → 贴近上沿
-  - 15m: sup[0]=2314.3, res[0]=N/A, 闸A ❌（resistances 为空）→ 该周期不可用
-  - 边界来源选 5m，bias=short（贴近上沿做回踩）
-然后按区间策略约束算 RR：
-  - 区间宽度 9.5 × 0.4 = 3.8 → EZ 必须距下沿 ≥ 3.8 + sup[0]=2321.8,
-    即 EZ 下沿 ≥ 2325.6；实际取 EZ ≈ [2329.0, 2331.0]，中点 2330.0；
-  - stop_loss ≥ res[0] + 1.5 × ATR(15m) = 2331.3 + 13.79 ≈ 2345.1，
-    同时 |2330 - 2345.1| / 2330 = 0.65% > 0.5% ✅，取 SL = 2345.1；
-  - take_profit[0] 取下沿附近 ≈ 2321.8（≥ 0.7 × 宽度 = 6.65 ✅）；
-  - RR = |2321.8 - 2330| / |2330 - 2345.1| = 8.2 / 15.1 ≈ 0.54。
-  - **RR=0.54 < 2.0 → 退回 neutral**，reason 必须显式写
-    "区间策略 RR=0.54 < 2.0，退回 neutral"（**禁止改写为"区间不清晰"**）。
-此例展示了 P3 升级后的"严格 RR + SL 距离 + EZ 不贴边"三重约束在窄幅震荡里
-多数会推回 neutral，这是预期行为：与其频繁亏损不如不交易。
-
-【区间策略示例 B：检查清单两侧均不通过 → 输出 neutral】
-当 5m/15m 的 supports 或 resistances 都为空、或最近一根 K 已经扫破区间一侧
-（swept_high_recent=true / swept_low_recent=true）时，两个周期闸 A 都失败，
-reason 必须写：
-  "区间不可交易：5m 失败原因=<具体>（如 res 为空 / 价格已突破 res[0]）；
-   15m 失败原因=<具体>"。
-**禁止**只写一句"区间不清晰"——必须把两个周期的失败原因分别列出，
-便于事后通过 fill_rate / 评估器复盘"是结构缺位还是 RR 不足"。
-
-【P1 强约束（必须严格遵守）】
-1) 当 regime ∈ {{ranging, transitional}} 时禁止给 trending 仓位建议：必须降为
-   neutral，或在最近 supports/resistances 之间做"区间策略"，并把
+【P1 强约束】
+1) regime ∈ {{ranging, transitional}} → 禁止 trending 仓位建议；区间策略时
    position_size_pct ≤ 0.05；reason 必须显式提到 "regime=<值>"。
-   （P3 升级把 transitional 与 ranging 同等对待——切换期同样不该重仓趋势单。）
-2) 当 regime=breakout 或 regime=breakdown 时，stop_loss 必须放在
-   "被突破的结构位另一侧"（breakout → SL 放在被刺破的 swing high 下方少量
-   buffer；breakdown → SL 放在被刺破的 swing low 上方）。
-3) 当 retail_vs_smart_divergence='bearish_warning' 时（散户狂多 + 精英反向）：
-   confidence ≤ 0.6；risk 字段必须明确写出"散户/精英背离风险"。
-   bullish_warning 同理处理（不准盲目追多）。
-4) 当 funding_extreme='long_squeeze_risk' 且 bias='long' 时，confidence ≤ 0.5；
-   反之 'short_squeeze_risk' + bias='short' 同理。
-5) 当 liquidity_vacuum_above=true 且 bias='long' 时，take_profit 至少
-   一档要落在"上方流动性池中第一档 strong/medium 节点"附近 ±0.3% 范围内；
-   vacuum_below + 'short' 同理。
+2) regime ∈ {{breakout, breakdown}} → stop_loss 必须放在被突破的结构位另一侧少量 buffer
+   （breakout → SL 放被刺破 swing high 下方；breakdown → SL 放被刺破 swing low 上方）。
+3) retail_vs_smart_divergence='bearish_warning'（散户狂多 + 精英反向）→ confidence ≤ 0.6；
+   risk 字段必须明确写出"散户/精英背离风险"。bullish_warning 同理（不准盲目追多）。
+4) funding_extreme='long_squeeze_risk' + bias='long' → confidence ≤ 0.5；
+   short_squeeze_risk + 'short' 同理。
+5) liquidity_vacuum_above=true + bias='long' → take_profit 至少一档落在
+   "上方流动性池中第一档 strong/medium 节点" 附近 ±0.3% 范围内；vacuum_below + 'short' 同理。
 
-【P2 强约束（自我反馈机制 - P3 升级版，必须严格遵守）】
-1) 你将看到自己最近 N 次判断的实际成绩单，且会**按"是否曾入场"分两段**：
-   - 【判断质量段】：仅统计 triggered_at 非空（价格曾走进 entry_zone）的样本。
-     胜率定义为 wins / (wins + losses)，wins = tp1/tp2_hit，losses = sl_hit。
-     "曾入场但超时（expired-after-triggered）"不计入胜率分母。
-     **硬约束（P3 收紧）**：
-       (a) 当 (wins + losses) ≥ 2 且胜率 ≤ 50% 时，必须显著降低本次
-           confidence 到 < 0.5，并在 reason 中具体反思失败模式（例如：
-           "近 4 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging
-            时强行做趋势"）；
-       (b) 当 (wins + losses) ≥ 1 且胜率 = 0% 时，confidence 上限 0.4。
-   - 【触发率段】：fill_rate = 曾入场样本 / 总样本，反映 entry_zone 设计。
-     **硬约束（P3 升级）**：fill_rate < 30% 时，本次 entry_zone 中点必须距
-     当前价 ≤ 0.3%（不再仅"反思"，必须收紧入场区间），同时在 reason 中
-     说明"上 N 笔 fill_rate < 30%，本次贴近当前价挂单"。
-2) 当 (wins + losses) < 2（"判断质量段"样本不足，无统计意义）时不应用
-   上述硬约束；但 reason 中要注明 "曾入场样本不足，未触发自我反馈降权"。
-3) 对历史成绩的解释必须客观：不要因为 1 次大额胜利就过度自信，
-   也不要因为 1 次最大不利波动就强行翻转方向；优先看胜率 / 平均 PnL
-   / 最大回撤三者的组合。
-4) 本系统是"信号建议"层，不持仓、不下单。**不要**因为成绩单里出现某条
-   方向就认为"还在仓位里"或被它绑架——每一次判断都应基于当前因子矩阵
-   独立做出，方向冲突 / 净敞口控制是后续持仓管理层的职责，不在你的范围。
+【P2 强约束（自我反馈）】
+你将看到自己最近 N 次判断的成绩单，按"是否曾入场"分两段：
+- 【判断质量段】仅统计 triggered_at 非空样本，胜率 = wins / (wins + losses)，
+  wins=tp1/tp2_hit，losses=sl_hit。"曾入场但超时"不计入分母。
+  (a) (wins + losses) ≥ 2 且胜率 ≤ 50% → confidence < 0.5，并在 reason 中具体反思失败模式
+      （例如"近 4 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"）；
+  (b) (wins + losses) ≥ 1 且胜率 = 0% → confidence 上限 0.4。
+- 【触发率段】fill_rate < 30% 时本次 entry_zone 中点必须距当前价 ≤ 0.3%，
+  并在 reason 中说明"上 N 笔 fill_rate < 30%，本次贴近当前价挂单"。
+- (wins + losses) < 2 时不应用上述硬约束，但 reason 注明
+  "曾入场样本不足，未触发自我反馈降权"。
+- 不要因为 1 次大额胜利过度自信，也不要因为 1 次最大不利波动强行翻转方向；
+  优先看胜率 / 平均 PnL / 最大回撤三者的组合。
+- 本系统是"信号建议"层，不持仓、不下单。每次判断都应基于当前因子矩阵独立做出，
+  不要被成绩单里的旧方向绑架——方向冲突 / 净敞口控制是后续持仓管理层的职责。
 
-【P3 强约束（系统级评估指标 - 必须严格遵守）】
-你将看到一段近 24h 的系统级评估摘要，包括：方向翻转率、触发率、胜率、
-平均 PnL、估算 Sharpe、Brier score。它代表"系统**整体**最近一天的判断
-质量"，比单条成绩单更宏观。使用规则：
-1) 当 direction_flip_rate > 30% 时，市场近 24h 偏震荡 / 系统在 whipsaw，
-   本次判断必须**明显倾向 neutral 或区间策略**：禁止 trending 单且
-   position_size_pct ≤ 0.05；如果选择 long/short，confidence 上限 0.5。
-2) 当 sharpe_estimated < 0 或 avg_pnl_pct < 0 时，系统近 24h 是**净亏损**
-   状态，本次 confidence 上限 0.5；如果同时 brier_score > 0.30
-   （置信度严重失校），confidence 上限 0.4 且必须在 reason 中明确写出
-   "系统近 24h 处于负期望，本次降权"。
-3) 当评估摘要为"无数据"（评估器尚未跑过 / 该窗口无样本）时，跳过本节
-   约束，但要在 reason 中注明"尚无系统级评估数据，按因子原始结论输出"。
-4) 上述系统级反馈优先级**高于**因子矩阵——即使因子矩阵看起来非常一致，
+【P3 强约束（系统级评估，优先级最高）】
+1) direction_flip_rate > 30% → 市场近 24h whipsaw，本次必须**明显倾向 neutral 或区间策略**：
+   禁止 trending 单且 position_size_pct ≤ 0.05；若选 long/short，confidence 上限 0.5。
+2) sharpe_estimated < 0 或 avg_pnl_pct < 0 → 系统近 24h 净亏损，confidence 上限 0.5；
+   同时 brier_score > 0.30 时 confidence 上限 0.4，
+   reason 明确写"系统近 24h 处于负期望，本次降权"。
+3) 评估摘要为"无数据" → 跳过本节约束，但 reason 注明
+   "尚无系统级评估数据，按因子原始结论输出"。
+4) 系统级反馈优先级**高于**因子矩阵——即使因子矩阵看起来非常一致，
    只要 24h 系统状态恶劣，必须降权或转 neutral。
+
+【confidence 校准锚点】
+本系统使用 Brier score 评估 confidence 校准（见 P3 评估摘要）；输出前请按下表自检
+confidence 是否匹配证据强度，避免均值回归到 0.6-0.7（Brier 失校的主因）：
+
+| 证据强度 | confidence 区间 | 入场条件 |
+|----------|-----------------|----------|
+| 极强 | 0.80-0.95 | 5/5 周期共振 + 主因子(net_flow/CVD/OI/结构) ≥ 3 类同向 + 衍生品(funding/精英比)不矛盾 + 流动性地图无 vacuum 反向 + P3 评估全部健康 + P2 胜率 ≥ 60% |
+| 强 | 0.65-0.79 | 4/5 周期共振 + 主因子 ≥ 2 类同向 + regime ≠ ranging + 无任何降权约束触发 |
+| 中 | 0.50-0.64 | 3/5 周期共振 + 主因子 ≥ 1 类同向；属"投机性方向"，建议小仓位 |
+| 弱 | 0.30-0.49 | 方向有证据但被衍生品 / 散户精英背离 / 历史胜率削弱 |
+| 极弱 | < 0.30 | 不要硬撑方向，直接 neutral |
+
+校准红线（违反任一条都属"过度自信"）：
+- reason 中没有列出 ≥ 3 条具体数值证据时，禁止 confidence > 0.7。
+- 任一 P1/P2/P3 降权约束触发时，必须按该约束规定的上限输出。
+- reason 中出现"看起来 / 似乎 / 可能 / 或许 / 大概"等模糊措辞时，confidence 上限 0.5。
+- regime ∈ {{ranging, transitional}} 时，trending 方向 confidence 上限 0.5；
+  区间策略下 confidence 上限 0.65。
+- P3 brier_score > 0.30 时本次 confidence 上限 0.4。
+
+【输出前自检（任一项不通过 → 修正后再输出，反复修不过 → 直接 neutral）】
+1. **RR 复算诚实性 + 业务下限**：自报 risk_reward_ratio 与
+   |tp1-entry_mid|/|entry_mid-sl| 复算偏差 < 5%，且 ≥ 2.0。
+2. **SL 双重距离下限**：|entry_mid - sl| 同时满足 ≥ 1.5×ATR(15m) 与 ≥ 0.5%×entry_mid。
+3. **价位顺序**：long → sl < ez_low ≤ ez_high < tp1 < tp2；short 反向。
+4. **必填字段**：take_profit ≥ 2 档；invalidation_conditions ≥ 2 条且每条都含具体价位 / 阈值；
+   timeframe_alignment 5 个周期填齐。
+5. **confidence 与【校准锚点】证据强度匹配**，所有触发的降权约束已按上限缩小。
+6. **reason 引用 ≥ 3 条具体数值证据，无模糊词**；
+   **【决策优先级】仲裁顺序正确**（P3 > P2 > 风控 > P1 > 共振 > 单周期）。
+
+通过所有自检后输出 JSON。下面通过几个 few-shot 示例演示合格的输入 / 输出形态，
+仅供参考结构与字段填法，**不要照抄数值**。
 """
+
+
+# --------------------------------------------------------------------
+# few-shot 示例（C: trending long，D: 区间策略 RR 不达标退回 neutral，
+# E: short 因 funding_extreme=long_squeeze_risk + bullish_warning）
+# --------------------------------------------------------------------
+# 设计要点（最佳实践来源：Anthropic Few-Shot Best Practices 2024、
+# LangChain FewShotChatMessagePromptTemplate 文档）：
+#   1) 以 (human, ai) message pair 形式注入 ChatPromptTemplate.from_messages，
+#      避免"system 里给数值锚点"导致 LLM 把示例数值当 anchor（Brier 失校主因）。
+#   2) AI message 仅保留**纯 JSON**，不夹杂 "本示例展示了..." 这类元注释，
+#      防止模型学会在自己输出里也写元注释。
+#   3) human_text 结构尽量贴近运行时 HUMAN_PROMPT，便于模型迁移；
+#      但内容压缩到必要字段，不复述训练时已有的格式。
+#   4) 数值经过校验：通过本系统的 schema / post-check（RR ≥ 2.0、
+#      SL 双重距离下限、价位顺序）。
+FEW_SHOT_EXAMPLES: List[Tuple[str, str]] = [
+    (
+        # human C：trending long（4/5 共振 + breakout）
+        """合约: ETH-USDT-SWAP
+时间: 2026-04-15 09:00
+
+规则引擎: bias=long score=0.62 confidence=0.55
+
+===== 多周期因子矩阵（节选）=====
+4h trend=up + 1h trend=up + 15m trend=up + 5m trend=up（4/5 共振）
+1h CVD slope=+0.0023; net_flow_5m=+1.20M USD; oi_change_4h=+1.8%（OI 与价同升）
+ATR(15m)=15.2; last_close=3530
+
+===== 多周期共振 =====
+alignment_score=+0.72; dominant_bias=long
+
+===== 衍生品 =====
+funding_rate=0.00012（中性偏多但远未挤压）
+
+===== 关键价位 =====
+4h supports=[3505, 3470]; 4h resistances=[3625, 3680]
+1h supports=[3518, 3505]; 1h resistances=[3585, 3625]
+
+===== 市场状态 =====
+regime: breakout
+
+===== 主力 / 散户 =====
+account_long_short_ratio=1.45（散户偏空 → 反指利多）
+top_trader_position_ratio=2.10（精英偏多）
+divergence=neutral
+
+===== 流动性地图 =====
+liquidity_pool_above=[strong:3625, medium:3680]; vacuum_above=false
+
+===== 系统级评估（近 24h）=====
+win_rate=0.55; flip_rate=0.18; avg_pnl=+0.42%; Sharpe=0.85; Brier=0.22（健康）
+
+===== 自我反馈 =====
+近 5 笔曾入场 3 笔，胜率 67%（2赢 1输），无降权
+""",
+        # ai C：trending long
+        """{
+  "bias": "long",
+  "confidence": 0.75,
+  "reason": "4/5 周期共振（5m/15m/1h/4h 同向，1d 中性），alignment=+0.72；主因子三类同向：net_flow_5m=+1.2M USD、CVD slope(1h)=+0.0023、OI(4h) +1.8% 与价同升；衍生品端 funding=1.2bp 未挤压、精英持仓 2.10 偏多、散户 1.45 反指利多；regime=breakout，SL=3475 落在被刺破 4h swing high 3505 下方 ≈ 3.24×ATR(15m) buffer，|entry_mid-sl|/entry_mid = 49.25/3524.25 = 1.40% > 0.5%；RR 复算 = |3625-3524.25|/|3524.25-3475| = 100.75/49.25 = 2.05 ≥ 2.0；P3 评估健康（Brier=0.22 < 0.25 校准良好），P2 近 5 笔胜率 67% 无降权。",
+  "risk": "若 1h CVD slope 转负且 funding 上行至 0.03% 以上需警惕 long_squeeze_risk；4h 收盘跌破 3505 即 breakout 失败回踩。",
+  "suggestion": "建议在 [3520.5, 3528.0] 区间分批入场跟随 long；tp1=3625（4h 阻力 + 强档流动性池）、tp2=3680（4h 量度目标 + 中档流动性池）；SL=3475。仅供参考，不构成交易指令。",
+  "entry_zone": [3520.5, 3528.0],
+  "stop_loss": 3475.0,
+  "take_profit": [3625.0, 3680.0],
+  "risk_reward_ratio": 2.05,
+  "position_size_pct": 0.075,
+  "timeframe_alignment": {"5m": "long", "15m": "long", "1h": "long", "4h": "long", "1d": "neutral"},
+  "invalidation_conditions": [
+    "4h 收盘跌破 3505（breakout 回踩失败）",
+    "1h CVD slope 转负且持续 ≥ 30 分钟"
+  ]
+}""",
+    ),
+    (
+        # human D：transitional + 共振崩溃 + bearish_warning + flip_rate 警戒 → 区间策略 RR 不达标
+        """合约: ETH-USDT-SWAP
+时间: 2026-04-16 14:30
+
+规则引擎: bias=neutral score=0.05 confidence=0.30
+
+===== 多周期因子矩阵（节选）=====
+4h trend=up; 1h trend=down; 15m trend=up; 5m trend=down（共振崩溃）
+net_flow_5m=-0.30M（弱空）; CVD slope(15m)=+0.0011（弱多）; OI(1h)=-0.4%（缩量）
+ATR(15m)=14.5; last_close=2342
+
+===== 多周期共振 =====
+alignment_score=+0.10; dominant_bias=neutral
+
+===== 衍生品 =====
+funding_rate=0.00045（多头资金费偏高）
+
+===== 关键价位 =====
+4h supports=[2310, 2290]; 4h resistances=[2360]
+5m supports=[2310]; 5m resistances=[2360]; close=2342（W=50）
+
+===== 市场状态 =====
+regime: transitional
+
+===== 主力 / 散户 =====
+account_long_short_ratio=2.45（散户狂多）
+top_trader_position_ratio=0.78（精英偏空）
+divergence=bearish_warning
+
+===== 流动性地图 =====
+liquidity_pool_above=[weak:2360]; vacuum_above=true
+
+===== 系统级评估（近 24h）=====
+flip_rate=0.34（> 30% whipsaw 警戒）; avg_pnl=-0.12%; Brier=0.31（失校警戒）
+
+===== 自我反馈 =====
+近 5 笔曾入场 4 笔，2 win 2 sl_hit，胜率 50%（命中硬约束阈值）
+""",
+        # ai D：区间策略 RR 不达标 → neutral
+        """{
+  "bias": "neutral",
+  "confidence": 0.0,
+  "reason": "多周期共振崩溃（4h up / 1h down / 15m up / 5m down，alignment=+0.10 < 0.4），按降级规则尝试区间策略：5m sup[0]=2310 / res[0]=2360 / close=2342（W=50），闸 A、闸 B 均通过；距上沿 18 / 距下沿 32 → bias=short 贴上沿。区间策略 RR 复算：取 EZ=[2348,2353]、entry_mid=2350.5、SL=res[0]+1.5×ATR(15m)=2360+22=2382（|entry_mid-sl|=31.5，比例 1.34% 满足下限）、tp1=2310（≥0.7×W=35 满足）→ RR=|2310-2350.5|/|2350.5-2382|=40.5/31.5≈1.29 < 2.0，**区间策略 RR=1.29 < 2.0，退回 neutral**；同时 P3 flip_rate=34% > 30% 触发级别 1 降权、retail_vs_smart=bearish_warning 触发级别 4 降权、P2 胜率 50% 命中级别 2 阈值 (wins+losses)=4 ≥ 2，三层降权叠加进一步强化 neutral。",
+  "risk": "transitional + flip_rate 高 + Brier 失校 = whipsaw 高发期，任何方向交易都属于负期望博弈。",
+  "suggestion": "本周期建议观望，等待：(a) 4h 收盘明确选边（站上 2360 或跌破 2310）；(b) 24h flip_rate 回落至 25% 以下；(c) Brier 回落至 0.25 以下，至少满足两项再考虑出手。仅供参考，不构成交易指令。",
+  "entry_zone": null,
+  "stop_loss": null,
+  "take_profit": [],
+  "risk_reward_ratio": null,
+  "position_size_pct": null,
+  "timeframe_alignment": {"5m": "short", "15m": "long", "1h": "short", "4h": "long", "1d": "neutral"},
+  "invalidation_conditions": []
+}""",
+    ),
+    (
+        # human E：trending short（4/5 共振 + funding_extreme=long_squeeze_risk + bullish_warning）
+        """合约: ETH-USDT-SWAP
+时间: 2026-04-17 07:15
+
+规则引擎: bias=short score=-0.55 confidence=0.50
+
+===== 多周期因子矩阵（节选）=====
+4h trend=down + 1h trend=down + 15m trend=down + 5m trend=neutral（4/5 共振空）
+CVD slope(1h)=-0.0031（持续抛压）; net_flow_5m=-0.85M USD（净流出）
+ATR(15m)=14.5; last_close=3296
+
+===== 多周期共振 =====
+alignment_score=-0.68; dominant_bias=short
+
+===== 衍生品 =====
+funding_rate=0.00038（连续 6 个结算 > 0.03% 偏高）
+funding_extreme=long_squeeze_risk
+
+===== 关键价位 =====
+4h supports=[3245, 3180]; 4h resistances=[3340]
+
+===== 市场状态 =====
+regime: trending（4h down 已持续 3 根）
+
+===== 主力 / 散户 =====
+account_long_short_ratio=2.85（散户极度多头）
+top_trader_position_ratio=0.62（精英偏空）
+divergence=bullish_warning（散户狂多 + 精英反向）
+
+===== 流动性地图 =====
+liquidity_pool_below=[strong:3245, medium:3180]
+
+===== 系统级评估（近 24h）=====
+win_rate=0.60; flip_rate=0.15; avg_pnl=+0.55%; Brier=0.21（健康）
+
+===== 自我反馈 =====
+近 5 笔曾入场 3 笔，胜率 67%，无降权
+""",
+        # ai E：trending short
+        """{
+  "bias": "short",
+  "confidence": 0.55,
+  "reason": "4/5 周期共振空（仅 5m 中性），alignment=-0.68 强；CVD slope(1h)=-0.0031 + net_flow_5m=-0.85M 双重抛压；funding 连续 6 个结算 > 0.03% 触发 long_squeeze_risk；retail=2.85 极度多头 / 精英 0.62 偏空 → retail_vs_smart=bullish_warning。按 P1-3：bullish_warning 时 confidence ≤ 0.6；按 P1-4：long_squeeze_risk + bias=short 同向不触发降权；综合校准锚点 4/5 共振 + 主因子两类同向 = 强证据档但被 bullish_warning 削弱一档 → 0.55。SL=3322 落在 4h 阻力 3340 下方，|entry_mid-sl|=25.5 = 1.76×ATR(15m) 满足结构距离，比例 25.5/3296.5=0.77% 满足 0.5% 下限；RR 复算 = |3245-3296.5|/|3296.5-3322| = 51.5/25.5 = 2.02 ≥ 2.0。",
+  "risk": "极端多头持仓被强平时短期反弹也很激烈，若 1h 出现 > 1×ATR(1h) 的反向跳空需立即按 invalidation 退出；funding 转负代表 squeeze 完成，趋势可能反转。",
+  "suggestion": "建议在 [3293.0, 3300.0] 区间逢反弹做空；tp1=3245（4h support 强档流动性池）、tp2=3180（量度目标 + 第二档流动性池）；SL=3322。注意：position_size_pct 已按 conf=0.55 落入 (0.5, 0.7] 上限 0.05。仅供参考，不构成交易指令。",
+  "entry_zone": [3293.0, 3300.0],
+  "stop_loss": 3322.0,
+  "take_profit": [3245.0, 3180.0],
+  "risk_reward_ratio": 2.02,
+  "position_size_pct": 0.05,
+  "timeframe_alignment": {"5m": "neutral", "15m": "short", "1h": "short", "4h": "short", "1d": "short"},
+  "invalidation_conditions": [
+    "1h 收盘站上 3322（趋势结构破坏）",
+    "funding 转负且 retail_long_short_ratio 跌破 1.0（squeeze 完成，反向反指消失）"
+  ]
+}""",
+    ),
+]
+
+
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
 # 注意 schema 占位符里的 `{` / `}` 会被 ChatPromptTemplate 当成变量解析，
@@ -408,11 +571,6 @@ HUMAN_PROMPT = """\
 
 ===== 流动性地图 =====
 {liquidity_text}
-
-请输出完整的 TradingSignal JSON，必须包含：
-bias / confidence / reason / risk / suggestion / entry_zone /
-stop_loss / take_profit（≥2 档）/ risk_reward_ratio / position_size_pct /
-timeframe_alignment（5 个周期都填）/ invalidation_conditions（≥2 条）。
 """
 
 
@@ -534,16 +692,36 @@ class LLMAgent:
 
         llm = chat_openai_cls(**llm_kwargs)
 
+        # ----------------------------------------------------------------
+        # few-shot 示例以 message history 注入（最佳实践）
+        # ----------------------------------------------------------------
+        # 把 FEW_SHOT_EXAMPLES 的 (human_text, ai_text) 二元组转成
+        # HumanMessage / AIMessage 实例，**插在 system 与运行期 human
+        # 之间**。直接用 BaseMessage 实例可以跳过 ChatPromptTemplate 的
+        # f-string 渲染（不需要把 JSON 中的 ``{`` ``}`` 双写转义），
+        # 也不会被 partial(format_instructions=...) 注入污染。
+        # 设计来源：LangChain FewShotChatMessagePromptTemplate 文档
+        # + Anthropic Few-Shot Best Practices 2024。
+        few_shot_messages: List[Any] = []
+        for human_text, ai_text in FEW_SHOT_EXAMPLES:
+            few_shot_messages.append(HumanMessage(content=human_text))
+            few_shot_messages.append(AIMessage(content=ai_text))
+
+        # 思考模式 / 非思考模式都共用同一份 few-shot；两条分支只在
+        # 是否追加 THINKING_OUTPUT_INSTRUCTIONS 与是否走 function_calling
+        # 上有差别。
+        base_messages: List[Any] = [("system", SYSTEM_PROMPT), *few_shot_messages]
+
         if thinking_enabled:
             # 思考模式：deepseek-reasoner 不支持 tool_choice，走 prompt + 手动解析。
             parser = PydanticOutputParser(pydantic_object=TradingSignal)
-            system_messages = [
-                ("system", SYSTEM_PROMPT),
+            messages = base_messages + [
                 ("system", THINKING_OUTPUT_INSTRUCTIONS),
+                ("human", HUMAN_PROMPT),
             ]
-            prompt = ChatPromptTemplate.from_messages(
-                system_messages + [("human", HUMAN_PROMPT)]
-            ).partial(format_instructions=parser.get_format_instructions())
+            prompt = ChatPromptTemplate.from_messages(messages).partial(
+                format_instructions=parser.get_format_instructions()
+            )
             self._chain_thinking_mode = True
             # 直接返回 AIMessage（不挂解析器），analyze() 里负责 reasoning_content
             # 抽取 + JSON 解析；如果在链上挂解析器，解析失败会在 chain 内抛错，
@@ -556,7 +734,7 @@ class LLMAgent:
             TradingSignal, method="function_calling", include_raw=True
         )
         prompt = ChatPromptTemplate.from_messages(
-            [("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)]
+            base_messages + [("human", HUMAN_PROMPT)]
         )
         self._chain_thinking_mode = False
         return prompt | structured
@@ -914,7 +1092,17 @@ class LLMAgent:
             - 多周期模式下逐周期渲染表格行；缺失字段统一显示 '-'。
             - 老格式（无 by_timeframe）下，自动降级为单行 / 单段表格，
               保证回滚通道 LLM 仍然能拿到结构化输入。
+            - symbol 必须通过 ``_SYMBOL_PATTERN`` 白名单校验；否则直接抛
+              ``ValueError``。这是防 prompt injection 的轻量保护——symbol
+              会被原样拼到 system / human 文本与下游 reason 中，必须保证
+              不含任何控制字符 / 多行符 / 注入语义。
         """
+        if not _SYMBOL_PATTERN.match(symbol):
+            raise ValueError(
+                f"非法 symbol={symbol!r}：仅允许 [A-Z0-9_-]，"
+                f"长度 3–32（首字符必须为字母或数字）"
+            )
+
         is_mtf = "by_timeframe" in factors
 
         ts = factors.get("computed_at") or ""
@@ -1475,6 +1663,66 @@ class LLMAgent:
         )
 
     @staticmethod
+    def _extract_token_usage(raw_message: Any) -> Tuple[int, int, int]:
+        """
+        从 LangChain AIMessage 中提取 (input_tokens, output_tokens, total_tokens)
+        --------------------------------------------------------------
+        参数：
+            raw_message: 思考模式下 chain 返回的 AIMessage；非思考模式下
+                         ``with_structured_output`` 返回 dict 的 ``raw`` 字段。
+        返回：
+            三元组 (in_tok, out_tok, total_tok)。任一字段缺失时填 -1，
+            不抛异常——可观测性是非侵入式增强，不能阻塞主决策路径。
+        说明：
+            兼容两套常见来源（langchain-openai 0.3+ 同时透传两套）：
+            1) ``AIMessage.usage_metadata``（langchain 标准化字段）：
+               ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}``。
+            2) ``AIMessage.response_metadata["token_usage"]``（OpenAI 协议原貌）：
+               ``{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}``。
+            优先取 (1)；缺失时回退到 (2)。
+        """
+        if raw_message is None:
+            return (-1, -1, -1)
+
+        in_tok = -1
+        out_tok = -1
+        total_tok = -1
+
+        # langchain 标准化字段
+        usage_meta = getattr(raw_message, "usage_metadata", None)
+        if isinstance(usage_meta, dict):
+            in_tok_v = usage_meta.get("input_tokens")
+            out_tok_v = usage_meta.get("output_tokens")
+            total_v = usage_meta.get("total_tokens")
+            if isinstance(in_tok_v, (int, float)):
+                in_tok = int(in_tok_v)
+            if isinstance(out_tok_v, (int, float)):
+                out_tok = int(out_tok_v)
+            if isinstance(total_v, (int, float)):
+                total_tok = int(total_v)
+
+        # 回退到 OpenAI 协议原貌
+        if in_tok < 0 or out_tok < 0 or total_tok < 0:
+            response_meta = getattr(raw_message, "response_metadata", None)
+            if isinstance(response_meta, dict):
+                tu = response_meta.get("token_usage")
+                if isinstance(tu, dict):
+                    if in_tok < 0:
+                        v = tu.get("prompt_tokens")
+                        if isinstance(v, (int, float)):
+                            in_tok = int(v)
+                    if out_tok < 0:
+                        v = tu.get("completion_tokens")
+                        if isinstance(v, (int, float)):
+                            out_tok = int(v)
+                    if total_tok < 0:
+                        v = tu.get("total_tokens")
+                        if isinstance(v, (int, float)):
+                            total_tok = int(v)
+
+        return (in_tok, out_tok, total_tok)
+
+    @staticmethod
     def _extract_reasoning(raw_message: Any) -> Optional[str]:
         """
         从 LangChain AIMessage / dict 中抽取 DeepSeek 思考模式的思维链原文
@@ -1573,6 +1821,243 @@ class LLMAgent:
         )
         return None
 
+    # ------------------------------------------------------------------
+    # P0-5：LLM 输出的 deterministic post-validation
+    # ------------------------------------------------------------------
+    # Post-check 默认值（与 rules.py / settings 默认值保持同源）
+    # ----------------------------------------------------------
+    # 这些常量是 LLM 输出"内部一致性"的兜底门槛，不是市场宏观闸门
+    # （宏观闸门在 service.py 里实现：ATR 太低 / 冷静期 / 方向稳定性 /
+    # 规则冲突）。两套机制目的不同，**不重叠**：
+    #   service 层闸门 → 决定"要不要让 LLM 出手 / 出手后是否覆盖结论"
+    #   llm_agent post-check → 决定"LLM 已出手的这一条输出是否数值自洽"
+    _POST_CHECK_DEFAULT_MIN_RR_RATIO: float = 2.0
+    _POST_CHECK_DEFAULT_MIN_SL_ATR_MULT: float = 1.5
+    _POST_CHECK_DEFAULT_MIN_SL_PCT: float = 0.005
+    # RR 自报 vs 复算的容忍偏差（默认 5%）
+    # 业务含义：LLM 自报 risk_reward_ratio 与按
+    #   |tp1 - entry_mid| / |entry_mid - sl|
+    # 复算结果偏差 > 该阈值时，视为"自报失真"——这是 prompt 自检清单第 1 条
+    # 的 deterministic 强制版本，避免 LLM 在 RR 字段上"四舍五入造数"。
+    _POST_CHECK_DEFAULT_RR_TOLERANCE: float = 0.05
+
+    @classmethod
+    def _post_check_signal(
+        cls,
+        signal: TradingSignal,
+        factors: Dict[str, Any],
+        settings: Settings,
+    ) -> Tuple[TradingSignal, List[str]]:
+        """
+        对 LLM 输出做 deterministic post-validation（P0-5）
+        --------------------------------------------------------------
+        参数：
+            signal   : LLM 已通过 schema 校验的 TradingSignal
+            factors  : 当前因子矩阵（用于取 ATR(15m)）
+            settings : 全局配置（用于读门槛阈值）
+        返回：
+            (final_signal, issues)
+            - issues 为空：原 signal 透传，未做修改
+            - issues 非空：返回被强制降级为 neutral 的新 signal，原 reason
+              被替换为"[LLM post-check 强制降级] + issues 列表"
+
+        校验项（hard）—— 任一不通过 → 强制 neutral：
+          1) RR 自报诚实性：|self - recalc| / self > tolerance（默认 5%）
+          2) RR 业务下限：复算 RR < decision_min_rr_ratio（默认 2.0）
+          3) SL 距离 ATR 倍数：|entry_mid-sl| < min_sl_atr_mult × ATR(15m)
+          4) SL 距离绝对百分比：|entry_mid-sl|/entry_mid < min_sl_pct
+          5) take_profit 数量 < 2（schema 已强约束，这里做防御）
+
+        校验项（soft）—— 仅记录，不触发降级（避免误伤）：
+          6) invalidation_conditions 数量 < 2（prompt 要求但 schema 未强约束）
+          7) timeframe_alignment 缺周期（不齐 5 个）
+
+        设计取舍：
+          - 与 service 层 4 道决策闸门**不重叠**：service 层关注"市场宏观状态
+            是否值得让 LLM 出手"，本方法关注"LLM 既已出手的这条输出是否内部
+            自洽"。
+          - ATR(15m) 缺失时跳过第 3 项校验，因为我们不应用"缺数据"惩罚 LLM
+            （这种情况主路径会有别的告警）。
+          - issues 即便是 soft 也写日志 / 拼到新 reason，便于事后回溯
+            "LLM 输出哪些项不达标"。
+        """
+        if signal.bias == "neutral":
+            return signal, []
+
+        hard_issues: List[str] = []
+        soft_issues: List[str] = []
+
+        ez = signal.entry_zone
+        sl = signal.stop_loss
+        tps = list(signal.take_profit or [])
+
+        # 防御性：schema 已经在 bias != neutral 时强约束齐 ez/sl/2 档 tp，
+        # 但缓存重建 / 旁路构造可能存在边界情况，这里再兜底一次。
+        if ez is None or sl is None or len(tps) < 2:
+            hard_issues.append(
+                f"plan 字段不完整：entry_zone={ez} stop_loss={sl} take_profit_n={len(tps)}"
+            )
+            return cls._force_neutral_for_post_check(signal, hard_issues), hard_issues
+
+        entry_mid = (float(ez[0]) + float(ez[1])) / 2.0
+        sl_f = float(sl)
+        tp1 = float(tps[0])
+        risk = abs(entry_mid - sl_f)
+        reward = abs(tp1 - entry_mid)
+
+        if risk < 1e-9:
+            hard_issues.append(
+                f"entry_mid({entry_mid:.4f}) ≈ stop_loss({sl_f:.4f})，无效计划"
+            )
+            return cls._force_neutral_for_post_check(signal, hard_issues), hard_issues
+
+        rr_recalc = reward / risk
+        rr_self = signal.risk_reward_ratio
+
+        # ---- 1) RR 自报诚实性 ---------------------------------------
+        rr_tolerance = float(
+            getattr(
+                settings,
+                "llm_post_check_rr_tolerance",
+                cls._POST_CHECK_DEFAULT_RR_TOLERANCE,
+            )
+        )
+        if (
+            rr_self is not None
+            and rr_self > 0
+            and abs(rr_recalc - float(rr_self)) / float(rr_self) > rr_tolerance
+        ):
+            hard_issues.append(
+                f"自报 RR={float(rr_self):.3f} 与复算 RR={rr_recalc:.3f} 偏差 "
+                f"{abs(rr_recalc - float(rr_self)) / float(rr_self) * 100:.1f}% "
+                f"> 容忍 {rr_tolerance * 100:.0f}%"
+            )
+
+        # ---- 2) RR 业务下限 -----------------------------------------
+        min_rr = float(
+            getattr(settings, "decision_min_rr_ratio", cls._POST_CHECK_DEFAULT_MIN_RR_RATIO)
+        )
+        if rr_recalc < min_rr:
+            hard_issues.append(
+                f"复算 RR={rr_recalc:.3f} < 业务下限 {min_rr:.2f}"
+            )
+
+        # ---- 3) SL 距离 ATR 倍数 ------------------------------------
+        # ATR(15m) 缺失时跳过：不应用"数据缺失"惩罚 LLM。
+        by_tf = (factors or {}).get("by_timeframe") or {}
+        ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
+        atr_15m = _to_float_safe(ms_15m.get("atr_14"))
+        min_atr_mult = float(
+            getattr(
+                settings,
+                "decision_min_sl_distance_atr_15m",
+                cls._POST_CHECK_DEFAULT_MIN_SL_ATR_MULT,
+            )
+        )
+        if atr_15m is not None and atr_15m > 0 and risk < min_atr_mult * atr_15m:
+            hard_issues.append(
+                f"SL 距离 {risk:.4f} < {min_atr_mult:.2f}×ATR(15m)="
+                f"{min_atr_mult * atr_15m:.4f}"
+            )
+
+        # ---- 4) SL 距离绝对百分比 -----------------------------------
+        min_pct = float(
+            getattr(
+                settings,
+                "decision_min_sl_distance_pct",
+                cls._POST_CHECK_DEFAULT_MIN_SL_PCT,
+            )
+        )
+        if entry_mid > 0:
+            ratio = risk / entry_mid
+            if ratio < min_pct:
+                hard_issues.append(
+                    f"SL 比例 {ratio * 100:.3f}% < 下限 {min_pct * 100:.2f}%"
+                )
+
+        # ---- 5) take_profit 数量（schema 已强约束，防御）-----------
+        if len(tps) < 2:
+            hard_issues.append(f"take_profit 仅 {len(tps)} 档 < 2")
+
+        # ---- 6) invalidation_conditions（soft，仅记录）-------------
+        if len(signal.invalidation_conditions) < 2:
+            soft_issues.append(
+                f"invalidation_conditions 仅 {len(signal.invalidation_conditions)} 条 < 2 "
+                "（prompt 要求 ≥ 2 条，但不触发强制降级）"
+            )
+
+        # ---- 7) timeframe_alignment 完整性（soft，仅记录）---------
+        tfa = signal.timeframe_alignment or {}
+        missing_tf = [tf for tf in ("5m", "15m", "1h", "4h", "1d") if tf not in tfa]
+        if missing_tf:
+            soft_issues.append(
+                f"timeframe_alignment 缺周期 {missing_tf}（不触发强制降级）"
+            )
+
+        if soft_issues:
+            logger.warning(
+                "LLM post-check soft issues（不强制降级，仅记录）: bias=%s issues=%s",
+                signal.bias,
+                soft_issues,
+            )
+
+        if hard_issues:
+            logger.warning(
+                "LLM post-check 强制降级 neutral: bias=%s issues=%s",
+                signal.bias,
+                hard_issues,
+            )
+            return cls._force_neutral_for_post_check(signal, hard_issues), hard_issues
+
+        return signal, soft_issues
+
+    @staticmethod
+    def _force_neutral_for_post_check(
+        signal: TradingSignal,
+        issues: List[str],
+    ) -> TradingSignal:
+        """
+        把 LLM 的 long/short 输出强制降级为 neutral，并把 issues 写进 reason
+        --------------------------------------------------------------
+        参数：
+            signal : 原 LLM 输出（bias ∈ {long, short}）
+            issues : post-check 触发的 hard 校验失败原因
+        返回：
+            一条 neutral TradingSignal：
+                - bias=neutral，schema 自动清空 plan 字段
+                - confidence=0.0（被守门员拦截，下游不应据此估算仓位）
+                - reason 拼接 [LLM post-check 强制降级] 前缀 + issues 列表
+                - risk / suggestion 显式提示用户"本周期不下单"
+                - timeframe_alignment 保留原始 5 周期投票（事后审计有用）
+                - invalidation_conditions 清空（neutral 时无意义）
+        说明：
+            与 service 层 _make_gated_neutral_signal 的区别：
+              - 那个是"LLM 调用前就拦下来"的全新 neutral 信号，没有 LLM 文本
+              - 这个是"LLM 已出手但内部不自洽"的事后降级，原始文本会被覆写
+                到 reason 里供 reasoning_content 不可用时排查
+        """
+        issues_text = "；".join(issues) if issues else "未知"
+        new_reason = (
+            f"[LLM post-check 强制降级] 触发 {len(issues)} 项校验失败："
+            f"{issues_text}。原 LLM reason 已截断到 reasoning_content（思考模式）"
+            f" / 日志（非思考模式）以便排查。"
+        )
+        return TradingSignal(
+            bias="neutral",
+            confidence=0.0,
+            reason=new_reason,
+            risk=(
+                f"原 LLM 输出 bias={signal.bias}，但因 deterministic post-check 校验失败"
+                "强制降级观望。原 risk 字段：" + (signal.risk or "（空）")
+            ),
+            suggestion=(
+                "本周期 LLM 输出未通过内部一致性校验（RR / SL / TP），"
+                "强制降级观望，等待下一轮重新判断。仅供参考，不构成交易指令"
+            ),
+            timeframe_alignment=dict(signal.timeframe_alignment or {}),
+            invalidation_conditions=[],
+        )
+
     async def analyze(
         self,
         symbol: str,
@@ -1670,7 +2155,13 @@ class LLMAgent:
                     recent_settled=recent_settled,
                     evaluation_summary=evaluation_summary,
                 )
+                # P0-3：端到端延迟测量，外层 try 内只测 ainvoke 部分
+                # （prompt 构建错误本身不算 LLM 延迟）。
+                _llm_call_start = time.monotonic()
                 result = await self._chain.ainvoke(prompt_inputs)
+                _llm_call_latency_ms = int(
+                    (time.monotonic() - _llm_call_start) * 1000
+                )
             except Exception:
                 logger.exception("LangChain 调用失败，回退到规则引擎")
                 return None
@@ -1722,6 +2213,24 @@ class LLMAgent:
                 return None
 
             reasoning_content = self._extract_reasoning(raw_message)
+            # ----------------------------------------------------------
+            # P0-3：LLM 调用可观测性（成本 + 延迟）
+            # ----------------------------------------------------------
+            # 单行结构化日志，便于 ELK / Loki 聚合统计 token 花费与
+            # P50 / P99 延迟（参考：OpenAI Production Best Practices §
+            # "Cost & Latency"）。任一字段缺失记 -1，不抛异常。
+            in_tok, out_tok, total_tok = self._extract_token_usage(raw_message)
+            logger.info(
+                "LLM 调用完成 symbol=%s latency_ms=%d in_tok=%d out_tok=%d total_tok=%d "
+                "thinking=%s reasoning_len=%d",
+                symbol,
+                _llm_call_latency_ms,
+                in_tok,
+                out_tok,
+                total_tok,
+                self._chain_thinking_mode,
+                len(reasoning_content) if reasoning_content else 0,
+            )
             if reasoning_content:
                 logger.debug(
                     "已捕获 LLM 思维链 %s（%d 字符）",
@@ -1733,6 +2242,42 @@ class LLMAgent:
                 # 没把该字段透传过来；不致命，但记一行日志便于排查。
                 logger.debug(
                     "思考模式已启用，但 %s 的原始消息中未找到 reasoning_content",
+                    symbol,
+                )
+
+            # ----------------------------------------------------------
+            # P0-5：deterministic post-validation
+            # ----------------------------------------------------------
+            # schema 已经校验过字段顺序、价位单调性、RR ≥ 1.5；
+            # 这里再做"业务级"的内部一致性校验：
+            #   - RR 自报 vs 复算偏差（防 LLM 编造 RR 字段）
+            #   - RR ≥ 业务下限（默认 2.0，比 schema 的 1.5 严）
+            #   - SL ≥ 1.5×ATR(15m) 与 ≥ 0.5%×entry_mid 双重距离下限
+            #   - take_profit ≥ 2 档（防御）
+            # 任一 hard 校验失败 → 强制降级 neutral，原 LLM 输出落到日志 +
+            # （思考模式时）reasoning_content；下游 service 层无需改动。
+            #
+            # 与 service 层 4 道决策闸门**正交不重叠**：
+            #   - service 闸门：LLM 调用前的市场宏观条件审查
+            #   - 本 post-check：LLM 已出手后的输出内部自洽性审查
+            try:
+                signal, post_check_issues = self._post_check_signal(
+                    signal=signal,
+                    factors=factors,
+                    settings=self.settings,
+                )
+                if post_check_issues:
+                    logger.info(
+                        "LLM post-check 命中 %s：原 bias=%s 校验失败 %d 项 → 已处理",
+                        symbol,
+                        signal.bias,
+                        len(post_check_issues),
+                    )
+            except Exception:
+                # post-check 自身异常不应阻塞主路径：宁可放过一条边界信号，
+                # 也不能因为校验代码 bug 把整条 LLM 链路打挂。
+                logger.exception(
+                    "LLM post-check 异常 symbol=%s（信号原样透传）",
                     symbol,
                 )
 

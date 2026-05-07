@@ -22,8 +22,10 @@
    ``stop_loss < entry_zone[0] <= entry_zone[1] < take_profit[0] < take_profit[1]``。
 3. ``bias == "short"`` 时方向反过来：
    ``stop_loss > entry_zone[0] >= entry_zone[1] > take_profit[0] > take_profit[1]``。
-4. ``risk_reward_ratio < 1.5`` 时把 bias 强制降级为 neutral 并清空 entry/SL/TP，
-   并在日志里 warning。
+4. ``risk_reward_ratio < 2.0`` 时把 bias 强制降级为 neutral 并清空 entry/SL/TP，
+   并在日志里 warning。该阈值与 ``decision_min_rr_ratio`` /
+   ``LLMAgent._POST_CHECK_DEFAULT_MIN_RR_RATIO`` 保持同源；如未来灰度调整，
+   三处必须同步修改，否则会出现 silent inconsistency。
 5. ``position_size_pct ∈ [0, 0.25]``。
 """
 from __future__ import annotations
@@ -169,18 +171,19 @@ class TradingSignal(BaseModel):
                     f"实际：sl={sl}, ez=({ez_low},{ez_high}), tps={tps[:2]}"
                 )
 
-        # 4) RR 校验：< 1.5 直接降级 neutral，避免拿低 EV 计划下场
+        # 4) RR 校验：< 2.0 直接降级 neutral，避免拿低 EV 计划下场
         # ----------------------------------------------------------------
-        # 关于 1.5 vs 2.0 的分层约束：
-        #   - schema 这里保留 1.5 是"最后安全网"——任何路径（LLM 直接构造 /
-        #     缓存重建 / 单元测试桩）只要 RR < 1.5 就一定降为 neutral，
-        #     这是结构性约束，不依赖运行期配置。
-        #   - 业务门槛 2.0 由 service 层 + rules.py 在打分阶段就执行：
-        #     decision_min_rr_ratio 默认 2.0，这意味着实际打到 schema 的信号
-        #     RR 都 ≥ 2.0；schema 的 1.5 不会被真实触发，仅在配置被人手调到
-        #     极激进或代码改坏时兜底。
-        #   - 不把 schema 的硬下限直接抬到 2.0，是为了让 service 层未来下调
-        #     到 1.8 / 1.6 灰度试验时 schema 不需要同步改。
+        # 业务下限 2.0 是全系统的 single source of truth：
+        #   - schema 这里：bias != neutral 时 RR < 2.0 → 强制 neutral 并清空计划；
+        #   - service.py：``decision_min_rr_ratio`` 默认 2.0（决策闸门 / size 覆盖）；
+        #   - llm_agent._POST_CHECK_DEFAULT_MIN_RR_RATIO=2.0（post-check 复算）。
+        # 三处必须保持同源——任意一处下调都需要同步另外两处，否则会出现
+        # "schema 放过的脏 plan 在 post-check 阶段被强制 neutral"这种 silent
+        # inconsistency（违反 Single-Source-of-Truth 原则，参见 Martin Fowler
+        # 《Refactoring 2nd Ed.》§3.1）。
+        # 取舍依据：胜率 < 50% 时 RR=1.5 即负期望（p × R - (1-p) < 0 在 R=1.5
+        # 下需要 p > 0.4）；抬到 2.0 让 p > 1/3 即可正期望，更能容忍信号系统
+        # 的胜率波动。
         rr = self.risk_reward_ratio
         if rr is None:
             entry_mid = (ez_low + ez_high) / 2
@@ -192,9 +195,9 @@ class TradingSignal(BaseModel):
                 else None
             )
             object.__setattr__(self, "risk_reward_ratio", rr)
-        if rr is None or rr < 1.5:
+        if rr is None or rr < 2.0:
             logger.warning(
-                "TradingSignal RR=%s 不足 1.5，强制降级为 neutral 并清空交易计划", rr
+                "TradingSignal RR=%s 不足 2.0，强制降级为 neutral 并清空交易计划", rr
             )
             object.__setattr__(self, "bias", "neutral")
             object.__setattr__(self, "entry_zone", None)

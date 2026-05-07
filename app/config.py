@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     # LLM temperature（仅在思考模式关闭时生效）
     llm_temperature: float = 0.2
     # LLM 单次调用超时（秒）。思考模式推理较慢，建议放大到 120s 起。
-    llm_timeout: int = 120
+    llm_timeout: int = 300
     # LLM 调用最小间隔（秒）。在该窗口内对同一 symbol 的请求会直接
     # 复用上一次 LLM 返回的 TradingSignal，避免高频付费调用。
     # 默认 900 秒（15 分钟），与"市场中短期波动节奏"基本匹配；
