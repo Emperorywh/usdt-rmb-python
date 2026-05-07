@@ -170,6 +170,17 @@ class TradingSignal(BaseModel):
                 )
 
         # 4) RR 校验：< 1.5 直接降级 neutral，避免拿低 EV 计划下场
+        # ----------------------------------------------------------------
+        # 关于 1.5 vs 2.0 的分层约束：
+        #   - schema 这里保留 1.5 是"最后安全网"——任何路径（LLM 直接构造 /
+        #     缓存重建 / 单元测试桩）只要 RR < 1.5 就一定降为 neutral，
+        #     这是结构性约束，不依赖运行期配置。
+        #   - 业务门槛 2.0 由 service 层 + rules.py 在打分阶段就执行：
+        #     decision_min_rr_ratio 默认 2.0，这意味着实际打到 schema 的信号
+        #     RR 都 ≥ 2.0；schema 的 1.5 不会被真实触发，仅在配置被人手调到
+        #     极激进或代码改坏时兜底。
+        #   - 不把 schema 的硬下限直接抬到 2.0，是为了让 service 层未来下调
+        #     到 1.8 / 1.6 灰度试验时 schema 不需要同步改。
         rr = self.risk_reward_ratio
         if rr is None:
             entry_mid = (ez_low + ez_high) / 2

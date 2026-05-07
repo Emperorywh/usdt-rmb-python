@@ -409,12 +409,14 @@ class RuleEngine:
         plan: Optional[Dict[str, Any]] = None
         # plan_fail_reason 用于在软降级日志里写明"为什么 plan 没构造出来"。
         # 取值含义：
-        #   - "ok"                 : 成功构造出 plan（不会触发软降级）
-        #   - "missing_entry_atr"  : 入场价 / ATR 缺失，根本没去算 plan
-        #   - "missing_levels"     : 该方向上一侧没有可用的支撑或阻力位
-        #   - "level_order"        : 价位排序不满足 sl/ez/tp 的几何约束
-        #   - "rr_below_min"       : 几何上能算出 plan，但 RR < 最低门槛 1.5
-        #   - "invalid_entry"      : entry <= 0
+        #   - "ok"                    : 成功构造出 plan（不会触发软降级）
+        #   - "missing_entry_atr"     : 入场价 / ATR 缺失，根本没去算 plan
+        #   - "missing_levels"        : 该方向上一侧没有可用的支撑或阻力位
+        #   - "level_order"           : 价位排序不满足 sl/ez/tp 的几何约束
+        #   - "rr_below_min"          : 几何上能算出 plan，但 RR < 业务门槛
+        #                               （decision_min_rr_ratio，默认 2.0）
+        #   - "sl_distance_too_close" : SL 距 entry_mid 小于最小距离（P3 守护）
+        #   - "invalid_entry"         : entry <= 0
         plan_fail_reason: str = "ok"
         plan_fail_detail: Dict[str, Any] = {}
         if bias != "neutral":
@@ -427,12 +429,29 @@ class RuleEngine:
                     "res_count": len(res),
                 }
             else:
+                # P3：把 settings 中的业务门槛显式传给 _build_trade_plan，
+                # 让 RR / SL 最小距离阈值随 .env 调参即时生效，不必改代码。
                 plan, plan_fail_reason, plan_fail_detail = _build_trade_plan(
                     bias=bias,
                     entry=entry,
                     supports=sup,
                     resistances=res,
                     atr=atr_val,
+                    min_rr_ratio=float(
+                        getattr(self.settings, "decision_min_rr_ratio", _DEFAULT_MIN_RR_RATIO)
+                    ),
+                    min_sl_atr_mult=float(
+                        getattr(
+                            self.settings, "decision_min_sl_distance_atr_15m",
+                            _DEFAULT_MIN_SL_ATR_MULT,
+                        )
+                    ),
+                    min_sl_pct=float(
+                        getattr(
+                            self.settings, "decision_min_sl_distance_pct",
+                            _DEFAULT_MIN_SL_PCT,
+                        )
+                    ),
                 )
 
         if bias == "long":
@@ -467,7 +486,8 @@ class RuleEngine:
                 "invalid_entry": "入场价非法（entry<=0）",
                 "missing_levels": "该方向缺少可用的支撑/阻力位",
                 "level_order": "支撑/阻力顺序不满足 sl/ez/tp 几何约束",
-                "rr_below_min": "可构造的最优 RR 低于 1.5 阈值",
+                "rr_below_min": "可构造的最优 RR 低于业务门槛（默认 2.0）",
+                "sl_distance_too_close": "SL 距 entry 过近，触发最小距离守护",
             }.get(plan_fail_reason, plan_fail_reason)
             logger.info(
                 "规则引擎 trade plan 落地失败（原因=%s: %s, detail=%s），"
@@ -769,7 +789,7 @@ class RuleEngine:
 
 
 # ----------------------------------------------------------------------
-# 交易计划构造常量（P1 Quant 修复 #1 + #2）
+# 交易计划构造常量（P1 Quant 修复 #1 + #2 + P3 SL 最小距离守护）
 # ----------------------------------------------------------------------
 # 把"魔法数字"集中放在这里，方便回测调参 / 后续接入 settings 灰度。
 #
@@ -777,9 +797,10 @@ class RuleEngine:
 #   止损"防插针"缓冲：拿到最近支撑/阻力后，再向远离价格方向多推一段
 #   buffer = 该倍数 × band_unit。
 #   旧版逻辑：sl = max(valid_sup)（long 时直接贴在支撑价）—— ETH 永续上
-#   插针扫支撑/阻力是常态，这种 SL 是被精准扫损的结构。0.3 × ATR 是
-#   业内常用经验值（既不会让 SL 退太远以至 RR 跌破 1.5，也能挡掉
-#   绝大部分单根上下影插针）。
+#   插针扫支撑/阻力是常态，这种 SL 是被精准扫损的结构。
+#   P1 用 0.3 × ATR 是经验起点，但实盘观察到仍有大量被插针扫损的样本，
+#   P3 把缓冲倍数提高到 0.5（更靠近行业惯例）。代价是 RR 会变小，
+#   配合 RR 业务门槛升级到 2.0 以及 SL 最小距离守护一起使用。
 #
 # _BAND_UNIT_FALLBACK_PCT
 #   ATR 缺失时按"入场价 × 该比例"作为 band_unit 兜底。
@@ -787,8 +808,16 @@ class RuleEngine:
 #   对 3000 价位 ≈ 1.0%–2.7%。0.5% 会让 entry_zone 过窄、SL 离价过近，
 #   频繁触发 schema 里 (ez_high < tp1) 与 RR 校验失败 → 一路降级 neutral。
 #   1.5% 取在 ETH 实测 ATR 占比的中间偏低位，更接近真实波动。
-_SL_BUFFER_ATR_MULT: float = 0.3
+_SL_BUFFER_ATR_MULT: float = 0.5
 _BAND_UNIT_FALLBACK_PCT: float = 0.015
+
+# 默认 RR 业务门槛：当 settings 不可用（直接调用 _build_trade_plan 的
+# 单元测试 / 影子模式）时使用。Service 调用路径会显式传入 settings 中的
+# decision_min_rr_ratio，覆盖该默认值。
+_DEFAULT_MIN_RR_RATIO: float = 2.0
+# 默认 SL 最小距离阈值（× ATR(15m) 与 入场价百分比 取较大者）。
+_DEFAULT_MIN_SL_ATR_MULT: float = 1.5
+_DEFAULT_MIN_SL_PCT: float = 0.005
 
 
 def _build_trade_plan(
@@ -797,15 +826,28 @@ def _build_trade_plan(
     supports: List[float],
     resistances: List[float],
     atr: Optional[float],
+    *,
+    min_rr_ratio: float = _DEFAULT_MIN_RR_RATIO,
+    min_sl_atr_mult: float = _DEFAULT_MIN_SL_ATR_MULT,
+    min_sl_pct: float = _DEFAULT_MIN_SL_PCT,
 ) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
     """
     基于支撑 / 阻力 / ATR 构造一份满足 TradingSignal schema 的粗粒度交易计划
     -------------------------------------------------------------------
+    参数：
+        bias            : long / short（neutral 应在调用方过滤）
+        entry           : 当前入场参考价（一般为最新 close）
+        supports        : 支撑位列表（任意顺序）
+        resistances     : 阻力位列表（任意顺序）
+        atr             : 15m ATR 值；缺失时走 _BAND_UNIT_FALLBACK_PCT 兜底
+        min_rr_ratio    : RR 业务门槛（默认 2.0）。低于此值返回 rr_below_min。
+        min_sl_atr_mult : SL 最小距离 = max(min_sl_atr_mult × atr, min_sl_pct × entry)
+        min_sl_pct      : 同上，绝对百分比下限。
     返回：
         (plan, fail_reason, detail)
             plan         : 构造成功时为字典；失败时为 None
             fail_reason  : "ok" / "invalid_entry" / "missing_levels" /
-                           "level_order" / "rr_below_min"
+                           "level_order" / "rr_below_min" / "sl_distance_too_close"
             detail       : 失败时附带的关键诊断字段（rr/sl/tp1/...），
                            成功时为空 dict
     说明：
@@ -815,10 +857,15 @@ def _build_trade_plan(
 
     P1 Quant 修复：
         #1 band_unit 在 ATR 缺失时从 0.5% 上调到 1.5%（ETH 实测中位）
-        #2 long  SL = max(valid_sup) - 0.3 × ATR（防插针 buffer）
-           short SL = min(valid_res) + 0.3 × ATR（同理）
+        #2 long  SL = max(valid_sup) - 0.5 × ATR（防插针 buffer）
+           short SL = min(valid_res) + 0.5 × ATR（同理）
         TP 不加 buffer：贴价 TP 反而是优势（早一点止盈），加 buffer 会让
-        RR 大量跌破 1.5 直接降 neutral，得不偿失。
+        RR 大量跌破 2.0 直接降 neutral，得不偿失。
+    P3 升级：
+        - SL 最小距离守护：构造完 sl 之后强制把它推到
+          max(min_sl_atr_mult × atr, min_sl_pct × entry) 之外，
+          解决"SL 距 entry < 0.3% → ETH 1m 噪声直接扫损"的问题。
+        - RR 阈值从 1.5 提高到 2.0（业务门槛，service 层显式注入）。
     """
     if entry <= 0:
         return None, "invalid_entry", {"entry": entry}
@@ -827,18 +874,30 @@ def _build_trade_plan(
     ez_low = entry - half_band
     ez_high = entry + half_band
 
-    # P1 Quant 修复 #2：对接价位的 SL 加 0.3 × band_unit 防插针缓冲，
-    # 让"贴在支撑/阻力价"的旧行为升级为"在支撑/阻力价之外再退 0.3 ATR"。
+    # P1 Quant 修复 #2：对接价位的 SL 加 _SL_BUFFER_ATR_MULT × band_unit
+    # 防插针缓冲，让"贴在支撑/阻力价"的旧行为升级为"在支撑/阻力价之外
+    # 再退 0.5 × ATR"。
     sl_buffer = band_unit * _SL_BUFFER_ATR_MULT
+    # P3：SL 最小距离守护（在 |entry_mid - sl| 上施加硬下限）
+    entry_mid_pre = (ez_low + ez_high) / 2
+    sl_min_distance = max(
+        float(min_sl_atr_mult) * band_unit,
+        float(min_sl_pct) * entry,
+    )
 
     if bias == "long":
         valid_sup = [s for s in supports if s < ez_low]
         if valid_sup:
             # 旧：sl = max(valid_sup)（贴价容易插针扫损）
-            # 新：sl = 最近支撑 - 0.3 × ATR buffer，仍保证 sl < ez_low
+            # 新：sl = 最近支撑 - 0.5 × ATR buffer，仍保证 sl < ez_low
             sl = max(valid_sup) - sl_buffer
         else:
             sl = ez_low - max(band_unit * 1.0, entry * 0.005)
+        # P3：SL 最小距离守护
+        # long 方向 sl 必须 ≤ entry_mid - sl_min_distance；不满足则推下去。
+        sl_cap_long = entry_mid_pre - sl_min_distance
+        if sl > sl_cap_long:
+            sl = sl_cap_long
         valid_res = sorted({round(r, 6) for r in resistances if r > ez_high})
         if len(valid_res) >= 2:
             tp1, tp2 = float(valid_res[0]), float(valid_res[1])
@@ -859,10 +918,15 @@ def _build_trade_plan(
     elif bias == "short":
         valid_res = [r for r in resistances if r > ez_high]
         if valid_res:
-            # 旧：sl = min(valid_res)。新：再往上推 0.3 × ATR buffer。
+            # 旧：sl = min(valid_res)。新：再往上推 0.5 × ATR buffer。
             sl = min(valid_res) + sl_buffer
         else:
             sl = ez_high + max(band_unit * 1.0, entry * 0.005)
+        # P3：SL 最小距离守护
+        # short 方向 sl 必须 ≥ entry_mid + sl_min_distance；不满足则推上去。
+        sl_floor_short = entry_mid_pre + sl_min_distance
+        if sl < sl_floor_short:
+            sl = sl_floor_short
         valid_sup = sorted({round(s, 6) for s in supports if s < ez_low}, reverse=True)
         if len(valid_sup) >= 2:
             tp1, tp2 = float(valid_sup[0]), float(valid_sup[1])
@@ -888,10 +952,18 @@ def _build_trade_plan(
         return None, "level_order", {
             "sl": sl, "ez_low": ez_low, "ez_high": ez_high, "risk": risk_per_unit,
         }
+    # P3：再次校验 SL 最小距离（防御性，避免上面分支推 sl 时被 buffer 反向"拉回来"）
+    if risk_per_unit < sl_min_distance - 1e-9:
+        return None, "sl_distance_too_close", {
+            "risk": risk_per_unit,
+            "sl_min_distance": sl_min_distance,
+            "sl": sl, "ez_low": ez_low, "ez_high": ez_high,
+        }
     rr = round(reward_per_unit / risk_per_unit, 4)
-    if rr < 1.5:
+    if rr < float(min_rr_ratio):
         return None, "rr_below_min", {
-            "rr": rr, "sl": round(float(sl), 4),
+            "rr": rr, "min_rr": float(min_rr_ratio),
+            "sl": round(float(sl), 4),
             "tp1": round(float(tp1), 4), "tp2": round(float(tp2), 4),
             "ez_low": round(ez_low, 4), "ez_high": round(ez_high, 4),
         }

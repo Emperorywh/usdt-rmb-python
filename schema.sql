@@ -443,3 +443,51 @@ CREATE TABLE IF NOT EXISTS notification_emails (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_emails_enabled
     ON notification_emails (enabled);
+
+-- ============================================================
+-- P3 升级：信号评估表（signal_evaluation）
+-- ============================================================
+-- 设计要点：
+--   1) 离线评估系统每隔 SIGNAL_EVALUATION_INTERVAL_SECONDS 跑一轮，
+--      对每个 (symbol, window_minutes) 组合写入一行；窗口默认 60/360/1440 三档。
+--   2) 不做"幂等 unique"——历次评估都新增一行，便于看指标随时间漂移。
+--   3) 主用消费场景：LLM prompt 注入 24h（window_minutes=1440）最新一行，
+--      把胜率 / 翻转率 / Sharpe / Brier 等指标喂给 LLM 做自适应放慢决策。
+--   4) 字段语义：
+--        total_signals           : 窗口内 LLM 入库信号总数
+--        triggered_count         : 价格曾走进 entry_zone 的样本数
+--        fill_rate               : triggered_count / total_signals
+--        wins / losses           : 仅"曾入场"样本里的 tp_hit / sl_hit
+--        expired_after_triggered : 曾入场但超时未触发 SL/TP 的笔数
+--        win_rate                : wins / (wins + losses)
+--        avg_pnl_pct             : 曾入场样本的平均 PnL（百分比形式）
+--        total_pnl_pct           : 曾入场样本的累计 PnL
+--        max_favorable_avg       : 曾入场样本的"最大有利波动"平均值
+--        max_adverse_avg         : 曾入场样本的"最大不利波动"平均值
+--        sharpe_estimated        : avg_pnl / std(pnl)（无年化，仅做窗口间比较）
+--        direction_flip_count    : 窗口内相邻信号方向翻转次数
+--        direction_flip_rate     : direction_flip_count / max(total_signals - 1, 1)
+--        brier_score             : mean((conf - actual_outcome)^2)，越低越校准
+CREATE TABLE IF NOT EXISTS signal_evaluation (
+    id                       BIGSERIAL PRIMARY KEY,
+    symbol                   TEXT        NOT NULL,
+    window_minutes           INT         NOT NULL,
+    evaluated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    total_signals            INT         NOT NULL,
+    triggered_count          INT         NOT NULL,
+    fill_rate                NUMERIC(6, 4),
+    wins                     INT,
+    losses                   INT,
+    expired_after_triggered  INT,
+    win_rate                 NUMERIC(6, 4),
+    avg_pnl_pct              NUMERIC(10, 6),
+    total_pnl_pct            NUMERIC(10, 6),
+    max_favorable_avg        NUMERIC(10, 6),
+    max_adverse_avg          NUMERIC(10, 6),
+    sharpe_estimated         NUMERIC(8, 4),
+    direction_flip_count     INT,
+    direction_flip_rate      NUMERIC(6, 4),
+    brier_score              NUMERIC(8, 4)
+);
+CREATE INDEX IF NOT EXISTS idx_signal_evaluation_lookup
+    ON signal_evaluation (symbol, window_minutes, evaluated_at DESC);

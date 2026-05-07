@@ -30,6 +30,25 @@ from app.signal_engine.schemas import TradingSignal
 logger = get_logger(__name__)
 
 
+def _to_float_safe(v: Any) -> Optional[float]:
+    """
+    把任意输入转 float，失败 / NaN / Inf 一律返回 None
+    --------------------------------------------------------------
+    P3 评估段渲染时大量用到（asyncpg 的 Decimal、None、字符串等都可能
+    出现），统一在模块顶部声明避免在多个 classmethod 内部重复实现。
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    import math as _math
+    if not _math.isfinite(f):
+        return None
+    return f
+
+
 # ------------------------------------------------------------------
 # DeepSeek 思考模式 reasoning_content 透传补丁
 # ------------------------------------------------------------------
@@ -140,7 +159,8 @@ SYSTEM_PROMPT = """\
 你是一名资深加密衍生品量化交易分析师。系统会给你一份多周期因子矩阵
 （5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口、多周期关键价位列表，
 以及（P1 升级新增）：market regime（市场状态）、流动性地图、订单簿时序指标、
-散户/精英多空比。
+散户/精英多空比；（P2 升级新增）你最近 N 次判断的成绩单；（P3 升级新增）
+近 24h 系统级评估指标（方向翻转率 / 胜率 / Sharpe / Brier）。
 
 请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为
 完整可执行的交易计划。该信号仅作交易建议，不会被自动下单。
@@ -164,41 +184,81 @@ SYSTEM_PROMPT = """\
   舍弃了哪些低周期信号。
 - timeframe_alignment 必须把 5 个周期的方向都填上，缺一不可。
 
-【可执行交易计划】
+【可执行交易计划】（P3 升级：SL / RR / size 全部抬高门槛）
 你必须输出完整可执行交易计划：
 - entry_zone：**区间，不是单点**，宽度建议 0.2 × ATR(15m) ~ 0.5 × ATR(15m)。
 - stop_loss：必须落在结构关键位（HH/HL swing 点 / 4h 支撑或阻力）的另一侧，
-  且与 entry 中点的距离 ≥ 1 × ATR(15m)。
+  并同时满足以下两条最小距离约束（取较大者）：
+    a) |entry_mid - stop_loss| ≥ **1.5 × ATR(15m)**（旧值 1×ATR，已上调）；
+    b) |entry_mid - stop_loss| / entry_mid ≥ **0.5%**（绝对百分比下限）。
+  动机：ETH 永续 1m 随机噪声常见 0.05–0.15%，0.2–0.3% 的 SL 是高频陷阱。
 - take_profit：至少 2 档，对应附近的对侧关键位 / 流动性池
   （例如：tp1 = 1h 阻力，tp2 = 4h 阻力 / 上一波等量目标）。
-- risk_reward_ratio：必须 ≥ 1.5（按 |tp1 − entry_mid| / |entry_mid − sl| 计算）。
-- position_size_pct：基于 1% 账户风险预算计算
-  （= 0.01 / (|entry_mid - stop_loss| / entry_mid)），
-  最大不超过 0.25。
+- risk_reward_ratio：必须 ≥ **2.0**（旧值 1.5，已上调）。
+  按 |tp1 − entry_mid| / |entry_mid − sl| 计算。
+- position_size_pct：建议值上限 **0.10**（旧 cap 0.25，已下调）。
+  请基于 1% 账户风险预算计算 = 0.01 / (|entry_mid - stop_loss| / entry_mid)，
+  再按 conf 缩放（conf ≤ 0.5 给 0；conf ∈ (0.5, 0.7] 上限 0.05；
+  conf > 0.7 上限 0.10）。
+  注意：服务端会基于历史胜率 + 半凯利对该值再做最终 clamp，
+  你的输出只是"上限建议"，不是最终下单仓位。
 - invalidation_conditions：≥ 2 条**量化**失效条件（必须含具体价位 / 阈值），
   例如："4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
 
 【降级规则】
-- 当 RR < 1.5 时，禁止给出趋势性 long/short 方向；可以走"区间策略"
+- 当 RR < 2.0 时，禁止给出趋势性 long/short 方向；可以走"区间策略"
   （见下方），或在区间策略也不成立时输出 neutral。
 - 多周期方向严重冲突（alignment_score 绝对值 < 0.4 且 dominant_bias=neutral）
   时，**不再强制 neutral**。优先级如下：
-    1) 若 5m / 15m 之间存在 supports[0] < last_close < resistances[0] 的清晰
-       区间（区间宽度 ≥ 0.6 × ATR(15m) 即可视为可交易），允许走"区间策略"：
-         * bias 取"距离更近"的那一侧（贴近 supports → bias=long 做多反弹；
-           贴近 resistances → bias=short 做空回踩）；如果价格几乎在区间正中
-           且没有明显单边动能（CVD slope / 资金流 / 订单簿失衡都不指向同侧），
-           才允许输出 neutral。
-         * entry_zone 必须落在距对应边界 ≤ 0.3 × ATR(15m) 范围内；
-         * stop_loss 必须落在该边界另一侧 0.5 × ATR(15m) buffer 之外；
-         * take_profit[0] 取区间另一侧关键位附近（≥ 0.7 倍区间宽度），
-           take_profit[1] 取区间另一侧 + 一档流动性池节点；
-         * RR 仍必须 ≥ 1.5；做不到就退回 neutral。
-         * **position_size_pct 必须 ≤ 0.05**（强制小仓位）；
-         * reason 必须显式写出"区间策略"四个字 + 区间上下沿的具体价位 +
-           为什么不做趋势单的核心因子证据。
-    2) 若区间不清晰（例如 supports/resistances 缺位、价格刚刚扫过区间一侧）
-       才输出 neutral，并在 reason 中明确说明"区间不可交易：<具体原因>"。
+    1) 必须先按下方【区间策略检查清单】逐项核对 5m **与** 15m 两个周期是否
+       存在可交易区间；任一周期检查通过即允许走"区间策略"，并按区间策略
+       约束输出。
+    2) 若两个周期检查清单都不通过，才输出 neutral，并在 reason 中明确说明
+       "区间不可交易：<5m 失败原因> / <15m 失败原因>"（必须分别给出，
+       不允许笼统写"无区间"）。
+
+【区间策略检查清单（强制结构化校验，禁止跳过任何一项）】
+当满足"alignment_score 绝对值 < 0.4 且 dominant_bias=neutral"或
+"regime ∈ {{ranging, transitional}}"时，你必须在 reason 中**按下表逐行**
+列出 5m 与 15m 两个周期的检查结果，缺一不可（缺数据的字段写"N/A"）：
+
+| 周期 | sup[0] | res[0] | last_close | 闸 A: sup[0]<close<res[0] | 区间宽度 W | 0.6×ATR(15m) | 闸 B: W ≥ 0.6×ATR(15m) | 距离上沿 | 距离下沿 | 闸 C: 哪一侧更近 |
+|------|--------|--------|------------|---------------------------|------------|---------------|------------------------|----------|----------|------------------|
+| 5m   |        |        |            |                           |            |               |                        |          |          |                  |
+| 15m  |        |        |            |                           |            |               |                        |          |          |                  |
+
+判定规则：
+- **闸 A 与 闸 B 同时通过**的周期 = 该周期"区间可交易"，可作为区间策略的
+  边界来源；如果 5m / 15m 都通过，**优先选 15m 作为边界来源**（更稳定），
+  仅当 15m 缺数据时才回退到 5m。
+- 闸 A 不通过的常见原因：res[0] 缺失（resistances=[]）/ sup[0] 缺失 /
+  last_close 已经位于区间外（sweep 已发生）。直接写出哪一项缺。
+- 闸 B 不通过的常见原因：区间太窄。即使 ATR(15m) 缺失，也必须用
+  ATR(5m) × √3 估算 ATR(15m) 后再比较，**禁止以"ATR(15m) 缺失"为由
+  跳过该闸**。
+- **边界来源白名单**：sup[0] / res[0] 必须取自因子矩阵中
+  by_timeframe.<tf>.market_structure.supports / resistances 列表的首元素。
+  **严禁**使用 liquidity_pool_above / liquidity_pool_below 中的
+  round_level / weak 节点作为区间边界（流动性池仅可作为 take_profit[1]
+  的辅助参考，不能用来替代结构关键位）。
+
+如果"5m 通过"或"15m 通过"任一成立，按下列约束输出区间策略：
+  * bias 取"距离更近"的那一侧（贴近 supports → bias=long 做多反弹；
+    贴近 resistances → bias=short 做空回踩）；如果价格几乎在区间正中
+    且没有明显单边动能（CVD slope / 资金流 / 订单簿失衡都不指向同侧），
+    才允许输出 neutral。
+  * **禁止贴边**：entry_zone 必须距对侧边界 ≥ 0.4 × 区间宽度
+    （避免"贴在支撑一侧做多 → 1 根插针就到 SL"的结构性陷阱）。
+  * stop_loss 必须落在该边界另一侧 ≥ 1.5 × ATR(15m) buffer 之外，
+    同时仍满足"|entry_mid - SL| / entry_mid ≥ 0.5%"。
+  * take_profit[0] 取区间另一侧关键位附近（≥ 0.7 倍区间宽度），
+    take_profit[1] 取区间另一侧 + 一档流动性池节点；
+  * RR 仍必须 ≥ 2.0；做不到就退回 neutral，并在 reason 中显式写出
+    "区间策略 RR=<计算值> < 2.0，退回 neutral"，**不要再写"区间不清晰"**——
+    这两种失败原因不同，混淆会让自我反馈机制无法识别真正瓶颈。
+  * **position_size_pct 必须 ≤ 0.05**（强制小仓位）；
+  * reason 必须显式写出"区间策略"四个字 + 选用了哪个周期（5m/15m）的
+    边界 + 区间上下沿的具体价位 + 为什么不做趋势单的核心因子证据。
 - neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct
   全部置 null（schema 强约束）。
 - reason 字段务必引用具体数值（净流入 USD、CVD slope、OI 变动百分比、
@@ -207,25 +267,43 @@ SYSTEM_PROMPT = """\
 - suggestion 字段为面向用户的简体中文建议段落，文末必须注明
   "仅供参考，不构成交易指令"。
 
-【区间策略示例（参考，不要照抄数值）】
-当 4h/1d trend=neutral、1h/15m trend=range、当前价 = 2320，
-supports[15m]=[2320.3, 2319.13, 2313.02]，resistances[15m]=[2327.5, 2332.58]，
-ATR(15m) ≈ 9.6 时：
-- 区间宽度 ≈ 14.5 ≈ 1.5 × ATR(15m)，可交易；
-- 当前价贴近下沿（距离 supports[0] ≈ 0.3，距离 resistances[0] ≈ 7.5），
-  优先 bias=long（做多反弹）；
-- entry_zone ≈ [2318.0, 2321.0]（覆盖 supports 簇）；
-- stop_loss ≈ 2310.5（< 2313.02 - 0.5 × ATR）；
-- take_profit ≈ [2327.5, 2332.5]（区间上沿 + 第二档阻力）；
-- RR ≈ (2327.5 - 2319.5) / (2319.5 - 2310.5) ≈ 0.89 → **不达 1.5，退回 neutral**；
-  否则按上述结构出单，position_size_pct ≤ 0.05。
-此处展示了"先按区间策略尝试、RR 不够再退 neutral"的判断顺序，
-不要因为 alignment_score 低就直接 neutral 而不做这一步尝试。
+【区间策略示例 A：检查清单通过 + RR 不达标 → 退回 neutral（参考写法，不要照抄数值）】
+当 regime=transitional、当前价 = 2330.72、
+5m supports=[2321.8, 2318.88, 2314.3]、5m resistances=[2331.3, 2385.67]、
+15m supports=[2314.3]、15m resistances=[]、
+5m ATR(14)=5.305（→ ATR(15m) 估算 ≈ 5.305 × √3 ≈ 9.19）时，
+reason 中必须先写出检查清单（示意，省略表格框）：
+  - 5m: sup[0]=2321.8, res[0]=2331.3, close=2330.72,
+        闸A 2321.8<2330.72<2331.3 ✅, W=9.5, 0.6×ATR(15m)≈5.51,
+        闸B 9.5≥5.51 ✅, 距上沿 0.58, 距下沿 8.92, 闸C → 贴近上沿
+  - 15m: sup[0]=2314.3, res[0]=N/A, 闸A ❌（resistances 为空）→ 该周期不可用
+  - 边界来源选 5m，bias=short（贴近上沿做回踩）
+然后按区间策略约束算 RR：
+  - 区间宽度 9.5 × 0.4 = 3.8 → EZ 必须距下沿 ≥ 3.8 + sup[0]=2321.8,
+    即 EZ 下沿 ≥ 2325.6；实际取 EZ ≈ [2329.0, 2331.0]，中点 2330.0；
+  - stop_loss ≥ res[0] + 1.5 × ATR(15m) = 2331.3 + 13.79 ≈ 2345.1，
+    同时 |2330 - 2345.1| / 2330 = 0.65% > 0.5% ✅，取 SL = 2345.1；
+  - take_profit[0] 取下沿附近 ≈ 2321.8（≥ 0.7 × 宽度 = 6.65 ✅）；
+  - RR = |2321.8 - 2330| / |2330 - 2345.1| = 8.2 / 15.1 ≈ 0.54。
+  - **RR=0.54 < 2.0 → 退回 neutral**，reason 必须显式写
+    "区间策略 RR=0.54 < 2.0，退回 neutral"（**禁止改写为"区间不清晰"**）。
+此例展示了 P3 升级后的"严格 RR + SL 距离 + EZ 不贴边"三重约束在窄幅震荡里
+多数会推回 neutral，这是预期行为：与其频繁亏损不如不交易。
+
+【区间策略示例 B：检查清单两侧均不通过 → 输出 neutral】
+当 5m/15m 的 supports 或 resistances 都为空、或最近一根 K 已经扫破区间一侧
+（swept_high_recent=true / swept_low_recent=true）时，两个周期闸 A 都失败，
+reason 必须写：
+  "区间不可交易：5m 失败原因=<具体>（如 res 为空 / 价格已突破 res[0]）；
+   15m 失败原因=<具体>"。
+**禁止**只写一句"区间不清晰"——必须把两个周期的失败原因分别列出，
+便于事后通过 fill_rate / 评估器复盘"是结构缺位还是 RR 不足"。
 
 【P1 强约束（必须严格遵守）】
-1) 当 regime=ranging 时禁止给 trending 仓位建议：必须降为 neutral，
-   或在最近 supports/resistances 之间做"区间策略"，并把
-   position_size_pct ≤ 0.05；reason 必须显式提到 "regime=ranging"。
+1) 当 regime ∈ {{ranging, transitional}} 时禁止给 trending 仓位建议：必须降为
+   neutral，或在最近 supports/resistances 之间做"区间策略"，并把
+   position_size_pct ≤ 0.05；reason 必须显式提到 "regime=<值>"。
+   （P3 升级把 transitional 与 ranging 同等对待——切换期同样不该重仓趋势单。）
 2) 当 regime=breakout 或 regime=breakdown 时，stop_loss 必须放在
    "被突破的结构位另一侧"（breakout → SL 放在被刺破的 swing high 下方少量
    buffer；breakdown → SL 放在被刺破的 swing low 上方）。
@@ -238,26 +316,45 @@ ATR(15m) ≈ 9.6 时：
    一档要落在"上方流动性池中第一档 strong/medium 节点"附近 ±0.3% 范围内；
    vacuum_below + 'short' 同理。
 
-【P2 强约束（自我反馈机制 - 必须严格遵守）】
+【P2 强约束（自我反馈机制 - P3 升级版，必须严格遵守）】
 1) 你将看到自己最近 N 次判断的实际成绩单，且会**按"是否曾入场"分两段**：
    - 【判断质量段】：仅统计 triggered_at 非空（价格曾走进 entry_zone）的样本。
      胜率定义为 wins / (wins + losses)，wins = tp1/tp2_hit，losses = sl_hit。
      "曾入场但超时（expired-after-triggered）"不计入胜率分母。
-     **硬约束**：当 (wins + losses) ≥ 3 且胜率 ≤ 40% 时，必须显著降低本次
-     confidence 到 < 0.5，并在 reason 中具体反思失败模式（例如：
-     "近 5 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"）。
-   - 【触发率段】：fill_rate = 曾入场样本 / 总样本，反映 entry_zone 设计是否合理。
-     **软约束**：fill_rate < 30% 时，应在 reason 中反思"入场区间过窄/过远 /
-     方向偏移过早"等，但**不要**因此降低 confidence——价格没回到入场区间
-     与判断方向准不准是两件事，不应混为一谈。
-2) 当 (wins + losses) < 3（即"判断质量段"样本不足，无法形成统计意义）时
-   不应用上述硬约束；但 reason 中要注明 "曾入场样本不足，未触发自我反馈降权"。
+     **硬约束（P3 收紧）**：
+       (a) 当 (wins + losses) ≥ 2 且胜率 ≤ 50% 时，必须显著降低本次
+           confidence 到 < 0.5，并在 reason 中具体反思失败模式（例如：
+           "近 4 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging
+            时强行做趋势"）；
+       (b) 当 (wins + losses) ≥ 1 且胜率 = 0% 时，confidence 上限 0.4。
+   - 【触发率段】：fill_rate = 曾入场样本 / 总样本，反映 entry_zone 设计。
+     **硬约束（P3 升级）**：fill_rate < 30% 时，本次 entry_zone 中点必须距
+     当前价 ≤ 0.3%（不再仅"反思"，必须收紧入场区间），同时在 reason 中
+     说明"上 N 笔 fill_rate < 30%，本次贴近当前价挂单"。
+2) 当 (wins + losses) < 2（"判断质量段"样本不足，无统计意义）时不应用
+   上述硬约束；但 reason 中要注明 "曾入场样本不足，未触发自我反馈降权"。
 3) 对历史成绩的解释必须客观：不要因为 1 次大额胜利就过度自信，
    也不要因为 1 次最大不利波动就强行翻转方向；优先看胜率 / 平均 PnL
    / 最大回撤三者的组合。
 4) 本系统是"信号建议"层，不持仓、不下单。**不要**因为成绩单里出现某条
    方向就认为"还在仓位里"或被它绑架——每一次判断都应基于当前因子矩阵
    独立做出，方向冲突 / 净敞口控制是后续持仓管理层的职责，不在你的范围。
+
+【P3 强约束（系统级评估指标 - 必须严格遵守）】
+你将看到一段近 24h 的系统级评估摘要，包括：方向翻转率、触发率、胜率、
+平均 PnL、估算 Sharpe、Brier score。它代表"系统**整体**最近一天的判断
+质量"，比单条成绩单更宏观。使用规则：
+1) 当 direction_flip_rate > 30% 时，市场近 24h 偏震荡 / 系统在 whipsaw，
+   本次判断必须**明显倾向 neutral 或区间策略**：禁止 trending 单且
+   position_size_pct ≤ 0.05；如果选择 long/short，confidence 上限 0.5。
+2) 当 sharpe_estimated < 0 或 avg_pnl_pct < 0 时，系统近 24h 是**净亏损**
+   状态，本次 confidence 上限 0.5；如果同时 brier_score > 0.30
+   （置信度严重失校），confidence 上限 0.4 且必须在 reason 中明确写出
+   "系统近 24h 处于负期望，本次降权"。
+3) 当评估摘要为"无数据"（评估器尚未跑过 / 该窗口无样本）时，跳过本节
+   约束，但要在 reason 中注明"尚无系统级评估数据，按因子原始结论输出"。
+4) 上述系统级反馈优先级**高于**因子矩阵——即使因子矩阵看起来非常一致，
+   只要 24h 系统状态恶劣，必须降权或转 neutral。
 """
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -276,7 +373,7 @@ JSON Schema:
 """
 
 HUMAN_PROMPT = """\
-{self_feedback_block}合约: {symbol}
+{self_feedback_block}{evaluation_block}合约: {symbol}
 时间: {ts}
 
 规则引擎: bias={rule_bias} score={rule_score} confidence={rule_confidence}
@@ -493,13 +590,23 @@ class LLMAgent:
                      None 或老格式时直接走兜底
         返回：
             建议的 min_interval 秒数；失败 / 关闭时回退到 self.min_interval
-        规则（与 P1 提示词同源）：
+        规则（P3 升级版）：
             volatility_ratio = atr_5m × 12 / atr_1h
                 （把 5m ATR 折算到 1h 尺度后与 1h ATR 比较，> 1 表示 5 分钟波动异常放大）
-            volatility_ratio >= 1.5 或 regime ∈ {breakout, breakdown} → 180s（3 分钟）
-            volatility_ratio >= 1.2 或 |alignment_score| >= 0.75      → 600s（10 分钟）
+            volatility_ratio >= 1.5 或 regime ∈ {breakout, breakdown} → 900s（15 分钟）
+            volatility_ratio >= 1.2 或 |alignment_score| >= 0.5       → 600s（10 分钟）
             其他                                                      → 1800s（30 分钟）
-        上下限通过 settings.llm_min_interval_seconds_min/max 钳制。
+
+            P3 强制下限：当 regime ∈ {ranging, transitional} 时，无论上面命中
+            哪一档都强制 interval = max(interval, 1800)。原因：在窄幅震荡 /
+            状态切换期里 LLM 价值最低（叙事好但预测准确率接近随机），把节流
+            拉满省钱也避免 whipsaw。
+
+            alignment 阈值从 0.75 降到 0.5：原值要求 5/5 周期共振才能加速,
+            实测过严，多数有意义的趋势期都打不到；0.5 对应"5 票里有 3 票
+            同向"，更接近真实可交易场景。
+
+            上下限通过 settings.llm_min_interval_seconds_min/max 钳制。
         """
         # 关闭开关：直接回退到 P0 静态节流
         if not bool(getattr(self.settings, "enable_adaptive_throttle", False)):
@@ -537,10 +644,14 @@ class LLMAgent:
                 interval = 900
             elif (
                 volatility_ratio is not None and volatility_ratio >= 1.2
-            ) or alignment_score >= 0.75:
+            ) or alignment_score >= 0.5:
                 interval = 600
             else:
                 interval = 1800
+
+            # P3：窄幅震荡 / 状态切换期强制拉满节流
+            if regime in ("ranging", "transitional"):
+                interval = max(interval, 1800)
 
             clamped = self._clamp_interval(interval, lo, hi)
             logger.debug(
@@ -778,6 +889,7 @@ class LLMAgent:
         rule_score: float,
         rule_contributions: Dict[str, float],
         recent_settled: Optional[List[Dict[str, Any]]] = None,
+        evaluation_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         把多周期因子矩阵渲染成紧凑中文表格，作为 ChatPromptTemplate 输入
@@ -791,6 +903,11 @@ class LLMAgent:
                 实际下单，把 lifecycle 的 open 行当成"持仓"是概念错位，
                 会导致 LLM 被自己 30 分钟前的旧判断绑架。方向冲突 / 净敞口
                 控制属于后续持仓管理层职责，已从 prompt 中彻底移除。
+            evaluation_summary:
+                P3 升级新增。``signal_evaluation`` 表中近 24h 那一行
+                （window_minutes=1440）。用于渲染"系统级评估"段，把胜率/
+                翻转率/Sharpe/Brier 等宏观指标灌给 LLM 做自适应放慢决策。
+                None 时段落显示"无系统级评估数据"，behavior 与 P2 完全一致。
         返回：
             ChatPromptTemplate.format 所需的全部 key-value 字典。
         说明：
@@ -838,6 +955,17 @@ class LLMAgent:
         else:
             self_feedback_block = ""
 
+        # P3：系统级评估段（注入到 self_feedback_block 之后）
+        # ----------------------------------------------------------
+        # 仅当 enable_signal_evaluation=True 且评估器写过表时才有内容；
+        # 任一条件不满足都退化为"无数据"提示，避免 prompt 中出现噪声。
+        if bool(getattr(self.settings, "enable_signal_evaluation", False)):
+            evaluation_block = self._render_evaluation_block(
+                symbol=symbol, evaluation=evaluation_summary
+            )
+        else:
+            evaluation_block = ""
+
         return {
             "symbol": symbol,
             "ts": ts,
@@ -856,6 +984,7 @@ class LLMAgent:
             "position_ratios_text": position_ratios_text,
             "liquidity_text": liquidity_text,
             "self_feedback_block": self_feedback_block,
+            "evaluation_block": evaluation_block,
         }
 
     @classmethod
@@ -985,6 +1114,99 @@ class LLMAgent:
             lines.append(
                 "提示：fill_rate 偏低（< 30%）通常意味着入场区间过窄或方向偏移过早，"
                 "建议在 reason 中反思入场设计，但不必单方面降低 confidence。"
+            )
+
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _render_evaluation_block(
+        cls,
+        symbol: str,
+        evaluation: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        渲染近 24h 系统级评估摘要（P3 升级新增）
+        ---------------------------------------------------------------
+        参数：
+            symbol     : 合约（仅作标题展示）
+            evaluation : ``signal_evaluation`` 表近 24h 那一行；None 表示
+                         "评估器尚未跑过 / 无样本"。
+        返回：
+            一段紧凑中文文本，结尾带换行；保证 prompt 结构稳定。
+        说明：
+            - 任意字段缺失时显示 "-"，避免把 None / Decimal 直接拼进 prompt。
+            - 与 P3 强约束段（SYSTEM_PROMPT 末尾）配合：LLM 看到
+              direction_flip_rate > 30%、avg_pnl_pct < 0、brier_score > 0.30
+              时会主动降低 confidence。
+        """
+        lines: List[str] = [
+            f"===== 系统级评估（近 24h，{symbol}）====="
+        ]
+        if not evaluation:
+            lines.append(
+                "（暂无系统级评估数据：评估器尚未跑过或 24h 内无 LLM 信号）"
+            )
+            lines.append("")
+            return "\n".join(lines) + "\n"
+
+        def _pct(v: Any, digits: int = 2) -> str:
+            """把 [0, 1] 比例 / [-1, 1] 收益率渲染成百分比字符串"""
+            f = _to_float_safe(v)
+            if f is None:
+                return "-"
+            return f"{f * 100:+.{digits}f}%"
+
+        def _num(v: Any, digits: int = 4) -> str:
+            f = _to_float_safe(v)
+            if f is None:
+                return "-"
+            return f"{f:.{digits}f}"
+
+        total = evaluation.get("total_signals") or 0
+        triggered = evaluation.get("triggered_count") or 0
+        wins = evaluation.get("wins")
+        losses = evaluation.get("losses")
+        decided = (int(wins or 0) + int(losses or 0)) if (wins is not None or losses is not None) else 0
+        flip_rate = _to_float_safe(evaluation.get("direction_flip_rate"))
+        avg_pnl = _to_float_safe(evaluation.get("avg_pnl_pct"))
+        sharpe = _to_float_safe(evaluation.get("sharpe_estimated"))
+        brier = _to_float_safe(evaluation.get("brier_score"))
+
+        lines.append(
+            f"信号总数={total}，触发入场={triggered}，"
+            f"触发率={_pct(evaluation.get('fill_rate'), 1)}，"
+            f"胜率={_pct(evaluation.get('win_rate'), 1)}（{decided} 笔决定性）"
+        )
+        lines.append(
+            f"平均PnL={_pct(avg_pnl, 2)}，"
+            f"累计PnL={_pct(evaluation.get('total_pnl_pct'), 2)}，"
+            f"估算Sharpe={_num(sharpe, 3)}，Brier={_num(brier, 4)}"
+        )
+        lines.append(
+            f"方向翻转={evaluation.get('direction_flip_count')} 次，"
+            f"翻转率={_pct(flip_rate, 1)}"
+        )
+
+        # 自动写出主要预警信号（与 P3 强约束段配合）
+        warnings: List[str] = []
+        if flip_rate is not None and flip_rate > 0.30:
+            warnings.append(
+                f"方向翻转率 {flip_rate * 100:.0f}% 高于 30%，市场近 24h whipsaw"
+            )
+        if avg_pnl is not None and avg_pnl < 0:
+            warnings.append(
+                f"平均PnL {avg_pnl * 100:+.2f}% 为负，系统近 24h 净亏损"
+            )
+        if sharpe is not None and sharpe < 0:
+            warnings.append(f"Sharpe {sharpe:.2f} < 0，风险调整收益为负")
+        if brier is not None and brier > 0.30:
+            warnings.append(
+                f"Brier {brier:.3f} > 0.30，置信度严重失校"
+            )
+        if warnings:
+            lines.append(
+                "P3 预警：" + "；".join(warnings) + "（参见 SYSTEM_PROMPT P3 强约束段）"
             )
 
         lines.append("")
@@ -1421,6 +1643,24 @@ class LLMAgent:
                     adaptive_interval,
                     self.min_interval,
                 )
+                # P3：拉取近 24h 系统级评估摘要（无则 None，prompt 段降级为
+                # "无数据"）。失败吞掉只记 debug：评估系统是"锦上添花"，
+                # 不能因为它把整轮 LLM 调用打挂。
+                evaluation_summary: Optional[Dict[str, Any]] = None
+                if bool(getattr(self.settings, "enable_signal_evaluation", False)):
+                    try:
+                        evaluation_summary = (
+                            await self.repos.fetch_latest_signal_evaluation(
+                                symbol=symbol, window_minutes=1440
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "拉取 signal_evaluation 失败 symbol=%s（不影响主路径）",
+                            symbol,
+                            exc_info=True,
+                        )
+                        evaluation_summary = None
                 prompt_inputs = self._build_prompt_inputs(
                     symbol=symbol,
                     factors=factors,
@@ -1428,6 +1668,7 @@ class LLMAgent:
                     rule_score=rule_score,
                     rule_contributions=rule_contributions,
                     recent_settled=recent_settled,
+                    evaluation_summary=evaluation_summary,
                 )
                 result = await self._chain.ainvoke(prompt_inputs)
             except Exception:

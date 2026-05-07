@@ -40,6 +40,12 @@ async def lifespan(app: FastAPI):
         await container.ic_calibrator.start()
     if container.lifecycle_tracker is not None:
         await container.lifecycle_tracker.start()
+    # P3：启动信号评估后台任务（enable_signal_evaluation=False 时为 None，跳过）。
+    # 与 lifecycle_tracker 同一启动点：评估器读 lifecycle 数据，必须晚于
+    # lifecycle_tracker 启动，但又必须早于 signal_service 跑出第一条信号——
+    # 当前位置完全满足这个偏序约束。
+    if container.signal_evaluator is not None:
+        await container.signal_evaluator.start()
     await container.signal_service.start_periodic(
         symbols=settings.symbols,
         interval_seconds=settings.signal_interval_seconds,

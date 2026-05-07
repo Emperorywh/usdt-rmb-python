@@ -1,4 +1,4 @@
-"""邮件通知发送器（SMTP + HTML 模板）。
+"""邮件通知发送器（基于 Resend HTTP API + HTML 模板）。
 
 设计目标
 ========
@@ -9,32 +9,71 @@
 * 保持发送链路与信号生成主路径解耦：
     * 整个发送过程在 asyncio 后台任务里跑，失败只打日志，不会反向阻塞
       ``SignalService.generate``；
-    * 内部 SMTP IO 是阻塞调用（``smtplib``），通过 ``asyncio.to_thread``
-      丢到默认 executor 上执行，不会拖慢事件循环。
+    * Resend SDK 的 ``Emails.send`` 是同步阻塞 HTTP 调用，通过
+      ``asyncio.to_thread`` 丢到默认 executor 上执行，不会拖慢事件循环。
 
 实现要点
 ========
-* SMTP 客户端用标准库 ``smtplib`` + ``email.message.EmailMessage`` 即可，
-  不引第三方依赖；新浪邮箱默认 ``smtps://smtp.sina.com:465`` (SSL)。
+* 不再依赖 ``smtplib``：直接用 Resend 官方 Python SDK（``resend`` 包）走
+  HTTPS REST，规避国内云主机出口 25/465/587 端口被封禁、STARTTLS 抖动
+  等典型 SMTP 问题，且天然支持模板/退信回执等更高级特性。
+* 模块级 ``resend.api_key`` 在 EmailSender 构造时统一设置一次；后续每个
+  请求复用同一份配置。
 * HTML 模板使用 inline CSS（很多邮件客户端会 strip ``<style>``），
-  并提供纯文本备选（``set_content``）以兼容粗暴的纯文本客户端。
+  并提供纯文本备选（``text`` 字段）以兼容粗暴的纯文本客户端。
 * 价位 / 仓位等数值统一格式化为 4 位小数 / 百分比，避免 Decimal 直拼。
 """
 from __future__ import annotations
 
 import asyncio
-import smtplib
 from datetime import datetime, timezone
-from email.message import EmailMessage
-from email.utils import formataddr
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence
+
+import resend
 
 from app.config import Settings
 from app.logging_config import get_logger
 from app.signal_engine.schemas import TradingSignal
 
 logger = get_logger(__name__)
+
+
+def _format_resend_error(exc: BaseException) -> str:
+    """
+    把 Resend SDK / requests 抛出的异常压成一行可读的错误描述
+    --------------------------------------------------------------
+    参数：
+        exc : 任意异常对象
+    返回：
+        形如 "ResendError(403): The mail.imywh.com domain is not verified"
+        这样的单行字符串；普通异常退化为 "ClassName: str(exc)"。
+    说明：
+        Resend Python SDK 的异常对象通常带有 ``message`` / ``error_type`` /
+        ``code`` / ``status_code`` 等属性，但同一异常类在不同版本里字段名
+        略有差异，这里用 getattr 做兼容性提取，避免出现 "ApiError()" 这种
+        看不出原因的日志。
+    """
+    cls_name = type(exc).__name__
+    parts: list[str] = []
+    status_code = (
+        getattr(exc, "status_code", None)
+        or getattr(exc, "code", None)
+    )
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    error_type = getattr(exc, "error_type", None) or getattr(exc, "name", None)
+    if error_type:
+        parts.append(f"type={error_type}")
+    message = (
+        getattr(exc, "message", None)
+        or getattr(exc, "detail", None)
+        or str(exc)
+    )
+    if message:
+        parts.append(f"msg={message}")
+    suffix = ", ".join(p for p in parts if p)
+    return f"{cls_name}({suffix})" if suffix else cls_name
 
 
 # ----------------------------------------------------------------------
@@ -152,7 +191,7 @@ def render_signal_subject(symbol: str, signal: TradingSignal) -> str:
     bias_label = _BIAS_LABEL.get(bias, bias)
     conf_label = _confidence_label(signal.confidence)
     conf_pct = _fmt_pct(signal.confidence, digits=0)
-    return f"【ETH 量化提醒】{symbol} {bias_label}信号 · 置信度{conf_label}（{conf_pct}）"
+    return f"【ETH 量化提醒】{symbol} {bias_label}信号 · 置信度{conf_label}({conf_pct})"
 
 
 def render_signal_html(
@@ -466,12 +505,13 @@ def render_signal_text(
 # ----------------------------------------------------------------------
 class EmailSender:
     """
-    SMTP 邮件发送器
+    Resend 邮件发送器
     --------------------------------------------------------------
     职责：
-        - 加载 SMTP 配置（host / port / 用户 / 授权码）；
-        - 在事件循环里以非阻塞方式发送 HTML 邮件（``smtplib`` 阻塞 IO
-          通过 ``asyncio.to_thread`` 丢到默认 executor 上跑）；
+        - 加载 Resend 配置（API Key / 发件人地址）；
+        - 在事件循环里以非阻塞方式发送 HTML 邮件
+          （``resend.Emails.send`` 是同步阻塞 HTTP 调用，
+            通过 ``asyncio.to_thread`` 丢到默认 executor 上跑）；
         - 不抛异常：发送失败仅打日志，不影响信号主路径。
     使用：
         sender = EmailSender(settings)
@@ -481,7 +521,24 @@ class EmailSender:
     """
 
     def __init__(self, settings: Settings):
+        """
+        构造邮件发送器并把 Resend API Key 写入 SDK 模块全局变量
+        --------------------------------------------------------------
+        参数：
+            settings : 全局 Settings；本类只读取
+                       ``resend_api_key`` / ``resend_from`` /
+                       ``enable_email_notification`` 三个字段。
+        说明：
+            - Resend SDK 把 ``resend.api_key`` 设计为模块级变量，
+              所有调用都会读它。这里在 EmailSender 实例化时统一赋值，
+              后续 ``Emails.send`` 直接复用，避免每次发送都重新设置；
+            - 若 API Key 留空，仅记录一次 INFO 日志后整个发送链路降级
+              为 no-op（``enabled`` 返回 False）。
+        """
         self.settings = settings
+        api_key = (getattr(settings, "resend_api_key", "") or "").strip()
+        if api_key:
+            resend.api_key = api_key
 
     @property
     def enabled(self) -> bool:
@@ -490,86 +547,65 @@ class EmailSender:
         --------------------------------------------------------------
         判定依据：
             - 主开关 ``enable_email_notification`` 为 True；
-            - SMTP 用户名 / 授权码均已配置。
+            - ``resend_api_key`` 已配置；
+            - ``resend_from`` 已配置（Resend 强制要求 from 字段）。
         三者满足才视为启用，否则整个通知链路降级为 no-op。
         """
         return (
             bool(getattr(self.settings, "enable_email_notification", False))
-            and bool((self.settings.smtp_user or "").strip())
-            and bool((self.settings.smtp_password or "").strip())
+            and bool((getattr(self.settings, "resend_api_key", "") or "").strip())
+            and bool((getattr(self.settings, "resend_from", "") or "").strip())
         )
 
-    def _build_message(
+    def _send_one_blocking(
         self,
         *,
         recipient: str,
         subject: str,
         html_body: str,
         text_body: str,
-    ) -> EmailMessage:
-        """
-        组装一封 multipart/alternative 邮件
-        --------------------------------------------------------------
-        参数：
-            recipient ：单个收件人邮箱
-            subject   ：邮件主题
-            html_body ：HTML 正文
-            text_body ：纯文本备选正文
-        返回：
-            EmailMessage 实例
-        说明：
-            ``set_content(text)`` + ``add_alternative(html, subtype='html')``
-            会自动构造 multipart/alternative，多数邮件客户端会优先渲染 HTML，
-            纯文本仅作降级。
-        """
-        from_addr = (self.settings.smtp_from or self.settings.smtp_user).strip()
-        from_name = (self.settings.smtp_from_name or "").strip()
-
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
-        msg["To"] = recipient
-        msg.set_content(text_body, charset="utf-8")
-        msg.add_alternative(html_body, subtype="html", charset="utf-8")
-        return msg
-
-    def _send_one_blocking(self, msg: EmailMessage, recipient: str) -> None:
+    ) -> Dict[str, Any]:
         """
         同步发送一封邮件（被 to_thread 丢到 executor 跑）
         --------------------------------------------------------------
         参数：
-            msg       : 已组装好的 EmailMessage
-            recipient : 收件邮箱（实际投递地址）
+            recipient : 收件邮箱
+            subject   : 邮件主题
+            html_body : HTML 正文
+            text_body : 纯文本备选正文（多数邮件客户端不会显示，仅作降级）
+        返回：
+            Resend SDK 返回的 dict（含 id 字段，可用于排错 / 退信查询）。
         异常：
-            smtplib / OSError 等任意异常会原样抛出，由调用方记日志。
+            resend.exceptions.* / requests.RequestException 等任意异常会
+            原样抛出，由调用方记日志。
         说明：
-            - SSL 模式（默认 smtp.sina.com:465）走 SMTP_SSL；
-            - 非 SSL 模式默认走 587 + STARTTLS；
-            - 每次都新建连接 + 登录 + 发送 + 关闭，简单可靠；
+            - Resend 的 ``from`` 字段支持两种格式：
+                  "onboarding@resend.dev"
+                  "ETH 量化 <onboarding@resend.dev>"
+              直接把 settings.resend_from 透传即可。
+            - SDK 的同步接口会内部调用 ``requests``，不需要自己再起会话；
               当前发送频率 ≤ 每 15 分钟一次，不需要长连接复用。
         """
-        host = self.settings.smtp_host
-        port = int(self.settings.smtp_port or 0)
-        user = (self.settings.smtp_user or "").strip()
-        password = (self.settings.smtp_password or "").strip()
-        timeout = float(self.settings.smtp_timeout or 20.0)
-
-        if bool(self.settings.smtp_use_ssl):
-            with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout) as smtp:
-                smtp.login(user, password)
-                smtp.send_message(msg, from_addr=user, to_addrs=[recipient])
-        else:
-            with smtplib.SMTP(host=host, port=port, timeout=timeout) as smtp:
-                smtp.ehlo()
-                try:
-                    smtp.starttls()
-                    smtp.ehlo()
-                except smtplib.SMTPException:
-                    logger.warning(
-                        "STARTTLS 失败，将以明文连接继续（不推荐生产）",
-                    )
-                smtp.login(user, password)
-                smtp.send_message(msg, from_addr=user, to_addrs=[recipient])
+        from_addr = (self.settings.resend_from or "").strip()
+        params: resend.Emails.SendParams = {
+            "from": from_addr,
+            "to": [recipient],
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+        }
+        try:
+            return resend.Emails.send(params)
+        except Exception as exc:  # noqa: BLE001
+            err_desc = _format_resend_error(exc)
+            logger.warning(
+                "Resend HTTP API 调用失败：from=%s -> to=%s 错误=%s",
+                from_addr,
+                recipient,
+                err_desc,
+                exc_info=True,
+            )
+            raise RuntimeError(f"Resend API 调用失败：{err_desc}") from exc
 
     async def send_signal_alert(
         self,
@@ -604,7 +640,7 @@ class EmailSender:
 
         if not self.enabled:
             logger.info(
-                "邮件通知未启用（enable_email_notification 或 SMTP 凭据缺失），跳过发送",
+                "邮件通知未启用（enable_email_notification 或 RESEND_API_KEY/RESEND_FROM 缺失），跳过发送",
             )
             result["skipped"] = len(list(recipients))
             return result
@@ -641,65 +677,74 @@ class EmailSender:
             generated_at=generated_at,
         )
 
+        from_addr = (self.settings.resend_from or "").strip()
         for recipient in clean_recipients:
             try:
-                msg = self._build_message(
+                resp = await asyncio.to_thread(
+                    self._send_one_blocking,
                     recipient=recipient,
                     subject=subject,
                     html_body=html_body,
                     text_body=text_body,
                 )
-                await asyncio.to_thread(self._send_one_blocking, msg, recipient)
+                # Resend 同步 SDK 返回的 dict 至少包含 id 字段；这里把它一并打日志
+                # 便于在 Resend 控制台按 id 反查投递状态 / 退信明细。
+                msg_id = (resp or {}).get("id") if isinstance(resp, dict) else None
                 logger.info(
-                    "邮件已发送：%s -> %s（symbol=%s，bias=%s）",
-                    self.settings.smtp_from or self.settings.smtp_user,
+                    "邮件已发送：%s -> %s（symbol=%s，bias=%s，resend_id=%s）",
+                    from_addr,
                     recipient,
                     symbol,
                     signal.bias,
+                    msg_id,
                 )
                 result["sent"] += 1
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "邮件发送失败 -> %s（symbol=%s，bias=%s）",
+                    "邮件发送失败 -> %s（symbol=%s，bias=%s，from=%s）：%s",
                     recipient,
                     symbol,
                     signal.bias,
+                    from_addr,
+                    _format_resend_error(exc),
                     exc_info=True,
                 )
                 result["failed"] += 1
 
         return result
 
-    async def send_test_email(self, recipient: str) -> None:
+    async def send_test_email(self, recipient: str) -> Dict[str, Any]:
         """
-        发送一封测试邮件（管理员校验 SMTP 配置用）
+        发送一封测试邮件（管理员校验 Resend 配置用）
         --------------------------------------------------------------
         参数：
             recipient ：测试收件邮箱
+        返回：
+            Resend SDK 返回的 dict（含 id 字段）。
         异常：
             发送失败时原样抛出，由路由层捕获并返回 500 / 400。
         """
         if not self.enabled:
             raise RuntimeError(
-                "邮件通知未启用（enable_email_notification 或 SMTP 凭据缺失）"
+                "邮件通知未启用（enable_email_notification 或 RESEND_API_KEY/RESEND_FROM 缺失）"
             )
-        subject = "【ETH 量化交易系统】SMTP 配置测试邮件"
+        subject = "【ETH 量化交易系统】Resend 配置测试邮件"
         html_body = (
             "<div style=\"font-family:'PingFang SC','Microsoft YaHei',Arial;color:#0f172a;\">"
-            "<h2 style=\"color:#16a34a;\">SMTP 配置测试成功 ✅</h2>"
-            "<p>如果你看到这封邮件，说明 ETH 量化交易系统的 SMTP 通道已经可以正常发件。</p>"
+            "<h2 style=\"color:#16a34a;\">Resend 配置测试成功 ✅</h2>"
+            "<p>如果你看到这封邮件，说明 ETH 量化交易系统的 Resend 通道已经可以正常发件。</p>"
             f"<p>发送时间：{_now_cn_str()}</p>"
             "<p style=\"color:#94a3b8;font-size:12px;\">本邮件由系统自动发送，无需回复。</p>"
             "</div>"
         )
         text_body = (
-            "ETH 量化交易系统：SMTP 配置测试邮件\n"
+            "ETH 量化交易系统：Resend 配置测试邮件\n"
             f"发送时间：{_now_cn_str()}\n"
         )
-        msg = self._build_message(
+        return await asyncio.to_thread(
+            self._send_one_blocking,
             recipient=recipient,
             subject=subject,
             html_body=html_body,
             text_body=text_body,
         )
-        await asyncio.to_thread(self._send_one_blocking, msg, recipient)

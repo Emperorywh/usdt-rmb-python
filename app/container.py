@@ -22,6 +22,7 @@ from app.factor_engine.ic_calibrator import ICCalibrator
 from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
 from app.notification.email_sender import EmailSender
+from app.signal_engine.evaluator import SignalEvaluator
 from app.signal_engine.lifecycle import LifecycleTracker
 from app.signal_engine.llm_agent import LLMAgent
 from app.signal_engine.rules import RuleEngine
@@ -62,6 +63,8 @@ class AppContainer:
     ic_calibrator: Optional[ICCalibrator] = field(default=None)
     # P2：信号生命周期跟踪任务；enable_lifecycle_tracking=False 时不创建（None）
     lifecycle_tracker: Optional[LifecycleTracker] = field(default=None)
+    # P3：信号评估后台任务；enable_signal_evaluation=False 时不创建（None）
+    signal_evaluator: Optional[SignalEvaluator] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
@@ -181,6 +184,17 @@ class AppContainer:
                 symbols=list(settings.symbols),
             )
 
+        # ---- P3：信号评估后台任务 ----
+        # 仅当总开关打开时创建实例并启动；关闭时维持 None，prompt 注入路径
+        # 拿不到 24h 评估摘要会自然降级为"无系统级评估数据"，行为与 P2 一致。
+        signal_evaluator: Optional[SignalEvaluator] = None
+        if bool(getattr(settings, "enable_signal_evaluation", False)):
+            signal_evaluator = SignalEvaluator(
+                settings=settings,
+                repos=repos,
+                symbols=list(settings.symbols),
+            )
+
         return cls(
             settings=settings,
             db=db,
@@ -197,6 +211,7 @@ class AppContainer:
             kline_aggregator=kline_aggregator,
             ic_calibrator=ic_calibrator,
             lifecycle_tracker=lifecycle_tracker,
+            signal_evaluator=signal_evaluator,
         )
 
     @staticmethod
@@ -261,6 +276,10 @@ class AppContainer:
                 await self.instrument_refresh_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # P3：先停信号评估器；它只读 signals/lifecycle 不写主表，
+        # 关停顺序放在 lifecycle 之前避免最后一轮评估读到半结算状态。
+        if self.signal_evaluator is not None:
+            await self.signal_evaluator.stop()
         # P2：先停 lifecycle / IC 任务，避免它们在 shutdown 期间还在写表
         if self.lifecycle_tracker is not None:
             await self.lifecycle_tracker.stop()

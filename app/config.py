@@ -279,31 +279,92 @@ class Settings(BaseSettings):
     # LLM 自我反馈：注入到 prompt 的"成绩单"条数
     llm_feedback_recent_n: int = 5
 
-    # ===== 邮件通知（SMTP）=====
+    # ===== 邮件通知（Resend HTTP API）=====
     # ----------------------------------------------------------------
     # 当 LLM 输出明确方向（bias=long / short）且本次为真正的 LLM 调用
     # （from_cache=False）时，向 notification_emails 表里所有 enabled=true
-    # 的邮箱发送一封 HTML 格式的提醒。
-    # observe / neutral 不发邮件，避免噪声。
+    # 的邮箱发送一封 HTML 格式的提醒。observe / neutral 不发邮件，避免噪声。
+    #
+    # 实现：调用 Resend 的 HTTPS REST API（resend.Emails.send），不再走
+    # 传统 SMTP 25/465/587 端口，规避了国内云主机出口 SMTP 端口被封禁
+    # 以及 STARTTLS 抖动等问题；阻塞调用通过 asyncio.to_thread 丢到默认
+    # executor 上执行，不会拖慢事件循环。
     #
     # 主开关：ENABLE_EMAIL_NOTIFICATION=false 时整个邮件通知链路降级
-    # （即使 SMTP 配置齐备也不会发送，方便本地开发屏蔽）。
+    # （即使 RESEND_API_KEY 已配置也不会发送，方便本地开发屏蔽）。
     enable_email_notification: bool = False
-    # SMTP 服务器配置（默认走新浪邮箱 smtp.sina.com:465 SSL）
-    smtp_host: str = "smtp.sina.com"
-    smtp_port: int = 465
-    # 是否使用 SSL 直连（True 走 465）；False 走 587 + STARTTLS。
-    smtp_use_ssl: bool = True
-    # SMTP 登录用户名（一般等于发件邮箱）
-    smtp_user: str = ""
-    # SMTP 登录授权码 / 密码（新浪邮箱需要在邮箱后台开启 SMTP 并申请授权码）
-    smtp_password: str = ""
-    # 显示在邮件 From 头里的发件邮箱；留空时回退到 smtp_user
-    smtp_from: str = ""
-    # 显示在邮件 From 头里的发件人名称
-    smtp_from_name: str = "ETH 量化交易系统"
-    # 单封邮件 SMTP 连接 / 发送超时（秒）
-    smtp_timeout: float = 20.0
+    # Resend API Key（在 https://resend.com/api-keys 申请，re_ 开头）。
+    # 留空时整个邮件通知链路降级为 no-op。
+    resend_api_key: str = ""
+    # 发件人地址，可填以下两种格式之一：
+    #   - "noreply@your-domain.com"                           （仅邮箱）
+    #   - "ETH 量化交易系统 <noreply@your-domain.com>"          （带显示名）
+    # 必须使用 Resend 控制台已 DNS 验证过的域名，否则 API 会返回
+    # 403 invalid_from_address。
+    # 注意：``onboarding@resend.dev`` 是 Resend 官方测试地址，
+    #       只能发到账号注册邮箱本人，发给其它收件人会被直接拒绝，
+    #       不适合生产 / 多收件人场景。
+    resend_from: str = "ETH 量化交易系统 <noreply@your-domain.com>"
+    # Resend HTTP 调用超时（秒）。SDK 默认无超时，这里加一道保险
+    # 防止异常情况下后台任务卡死。当前未真正传给 SDK，仅作语义占位
+    # （SDK 暂不暴露 timeout 参数，靠业务层 to_thread + asyncio 的整体
+    # 调度兜底）。保留字段是为将来 SDK 升级后零成本接入。
+    resend_timeout: float = 20.0
+
+    # ===== P3 升级：决策层守门员 + 离线评估系统 =====
+    # ----------------------------------------------------------------
+    # 设计动机：
+    #   实盘观察发现 LLM 在窄幅震荡市里"叙事质量很好但方向预测接近随机"，
+    #   连续 4 条信号在 90 分钟内 long → short → short → long 来回翻转，
+    #   把"信号质量"完全交给 LLM 是反量化的。
+    #   P3 升级把"是否值得让 LLM 出手"以及"出手后是否值得真的下到 25%
+    #   仓位"两件事**前置到服务端硬规则**，LLM 仍然负责方向 + 结构 +
+    #   叙事，但不再决定"出不出"和"押多大"。
+    # 总开关：
+    #   enable_decision_gates=False 时所有 4 道闸门 + size 覆盖全部跳过，
+    #   行为退回 P2（与本轮升级前完全一致），便于灰度回滚。
+    enable_decision_gates: bool = True
+    # 闸 1（ATR 门禁）：15m ATR 占当前价比例（atr_14 / last_close）
+    # 低于该值视为窄幅震荡，跳过 LLM 调用直接输出 neutral。
+    # 0.0025 = 0.25%。ETH 永续 1m 随机噪声大约 0.05–0.15%，
+    # 当 15m ATR 跌到 0.25% 以下意味着"任何 SL 都是高频陷阱"。
+    decision_min_atr_pct_15m: float = 0.0025
+    # 闸 3（方向稳定性）：当前 LLM 输出方向与最近 1 条信号相反时，
+    # 必须满足"价格变动 ≥ 该倍数 × ATR(1h)"才允许翻转，否则降级 neutral。
+    # 0.6 是经验取舍：太大容易错过真实反转；太小起不到去噪效果。
+    decision_direction_flip_min_price_move_atr_1h: float = 0.6
+    # 闸 2（冷静期）：连续 N 次 sl_hit 触发冷静期。
+    decision_cooldown_consecutive_sl_threshold: int = 2
+    # 冷静期时长（分钟）。期间所有方向输出强制降为 neutral。
+    decision_cooldown_minutes: int = 60
+    # size 覆盖：服务端最终 clamp 上限（覆盖 schema 里 0.25 的硬上限）。
+    # 即便 LLM 给到 0.25、conf=0.9，最大也只能下 0.10。
+    decision_max_position_size_pct: float = 0.10
+    # size 覆盖：凯利激进度（0.5 = 半凯利，业界常用保守值）。
+    decision_kelly_aggressiveness: float = 0.5
+    # 决策层最低 RR 业务门槛（schema 里仍保留 1.5 作为最后安全网）。
+    # 2.0 取舍依据：胜率 < 50% 时 RR=1.5 即负期望（p × R - (1-p) < 0
+    # 在 R=1.5 下需要 p > 0.4），抬到 2.0 让 p > 1/3 即可正期望。
+    decision_min_rr_ratio: float = 2.0
+    # SL 最小距离（× ATR(15m)）。1.5 × ATR(15m) 足以避开多数插针扫损。
+    decision_min_sl_distance_atr_15m: float = 1.5
+    # SL 最小距离绝对下限（占入场价比例）。0.5% 是 ETH 永续的经验下限。
+    decision_min_sl_distance_pct: float = 0.005
+    # 闸 4（规则 vs LLM 冲突保护）：回溯近 N 条已结算信号判定胜率。
+    decision_rule_llm_conflict_window: int = 5
+    # 闸 4：胜率阈值。LLM 与规则引擎反向且历史胜率低于此值时降级 neutral。
+    decision_rule_llm_conflict_winrate_threshold: float = 0.4
+    # 离线评估系统总开关：False 时不启动 SignalEvaluator 后台任务，
+    # prompt 中评估段也降级为"无数据"。
+    enable_signal_evaluation: bool = True
+    # 评估任务运行节奏（秒）。5 分钟一轮足够：indicator 是分钟级聚合，
+    # 不需要每 30 秒重算。
+    signal_evaluation_interval_seconds: int = 300
+    # 评估窗口（分钟列表）。1h / 6h / 24h 三档：1h 反映短期波段，
+    # 6h 反映半日态势，24h 反映系统级稳定性（喂回 LLM prompt 用 24h）。
+    signal_evaluation_windows_minutes: Annotated[List[int], NoDecode] = Field(
+        default_factory=lambda: [60, 360, 1440]
+    )
 
     # API
     api_host: str = "0.0.0.0"
@@ -327,6 +388,24 @@ class Settings(BaseSettings):
             v: 原始值，可能是字符串、列表或 None
         返回：
             int 列表
+        """
+        if isinstance(v, str):
+            return [int(item.strip()) for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("signal_evaluation_windows_minutes", mode="before")
+    @classmethod
+    def _split_eval_windows_csv(cls, v):
+        """
+        允许从环境变量传入逗号分隔的整数串（如 "60,360,1440"）
+        ----------------------------------------------------------
+        参数：
+            v: 原始值，可能是字符串、列表或 None
+        返回：
+            int 列表
+        说明：
+            与 liquidation_windows_minutes 共用同一套语义，但单独写一个 validator
+            是为了避免"两个字段共用同一 validator 时 Pydantic 的兼容性问题"。
         """
         if isinstance(v, str):
             return [int(item.strip()) for item in v.split(",") if item.strip()]

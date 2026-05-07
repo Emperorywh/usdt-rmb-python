@@ -1929,6 +1929,225 @@ class Repositories:
             )
         return _parse_delete_count(result)
 
+    # ------------------------------------------------------------------
+    # P3：信号评估表（signal_evaluation）+ 决策层闸门所需的查询
+    # ------------------------------------------------------------------
+    # 设计要点：
+    #   - signal_evaluation 表每窗口一行，写入由后台 SignalEvaluator 任务驱动；
+    #     读取由 LLMAgent 的 prompt 注入路径与 API 排查路径共用。
+    #   - 不在 SQL 层做"最近 N 行去重"——多保留一些历史能直接看指标随时间漂移。
+    #   - "决策层闸门" 共需 2 个新查询：
+    #       * fetch_signals_for_evaluation：评估器批量拉数据用
+    #       * fetch_recent_signals_for_conflict_check：service 层 _decision_rule_conflict_gate 用
+    async def insert_signal_evaluation(
+        self,
+        symbol: str,
+        window_minutes: int,
+        metrics: Dict[str, Any],
+    ) -> Optional[int]:
+        """
+        写入一行信号评估指标
+        --------------------------------------------------------------
+        参数：
+            symbol         : 合约代码
+            window_minutes : 评估窗口（分钟）
+            metrics        : 评估指标字典，键名见下方 SQL 列名映射；缺失键
+                             一律按 NULL 写入（NUMERIC 列允许 NULL）。
+        返回：
+            新行的 id；写入失败 / 异常时返回 None（不影响主路径）。
+        说明：
+            评估器每 N 分钟跑一次，写入失败也不应该把后台任务打死，
+            异常吞掉只记 warning，与 lifecycle 任务的容错策略一致。
+        """
+        try:
+            async with self.db.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO signal_evaluation (
+                        symbol, window_minutes, evaluated_at,
+                        total_signals, triggered_count, fill_rate,
+                        wins, losses, expired_after_triggered, win_rate,
+                        avg_pnl_pct, total_pnl_pct,
+                        max_favorable_avg, max_adverse_avg,
+                        sharpe_estimated,
+                        direction_flip_count, direction_flip_rate,
+                        brier_score
+                    ) VALUES (
+                        $1, $2, NOW(),
+                        $3, $4, $5,
+                        $6, $7, $8, $9,
+                        $10, $11,
+                        $12, $13,
+                        $14,
+                        $15, $16,
+                        $17
+                    )
+                    RETURNING id
+                    """,
+                    symbol,
+                    int(window_minutes),
+                    int(metrics.get("total_signals") or 0),
+                    int(metrics.get("triggered_count") or 0),
+                    _to_dec(metrics.get("fill_rate")),
+                    metrics.get("wins"),
+                    metrics.get("losses"),
+                    metrics.get("expired_after_triggered"),
+                    _to_dec(metrics.get("win_rate")),
+                    _to_dec(metrics.get("avg_pnl_pct")),
+                    _to_dec(metrics.get("total_pnl_pct")),
+                    _to_dec(metrics.get("max_favorable_avg")),
+                    _to_dec(metrics.get("max_adverse_avg")),
+                    _to_dec(metrics.get("sharpe_estimated")),
+                    metrics.get("direction_flip_count"),
+                    _to_dec(metrics.get("direction_flip_rate")),
+                    _to_dec(metrics.get("brier_score")),
+                )
+            return int(row["id"]) if row else None
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "写入 signal_evaluation 失败 symbol=%s window=%d（不影响主路径）",
+                symbol,
+                window_minutes,
+                exc_info=True,
+            )
+            return None
+
+    async def fetch_latest_signal_evaluation(
+        self,
+        symbol: str,
+        window_minutes: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        读取指定 (symbol, window_minutes) 最近一行评估指标
+        --------------------------------------------------------------
+        参数：
+            symbol         : 合约代码
+            window_minutes : 窗口（分钟）。默认 LLM prompt 注入用 1440（24h）。
+        返回：
+            最近一行 dict；表内无数据则返回 None。
+        说明：
+            走 idx_signal_evaluation_lookup (symbol, window_minutes,
+            evaluated_at DESC) 索引，单点查询毫秒级。
+        """
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, symbol, window_minutes, evaluated_at,
+                       total_signals, triggered_count, fill_rate,
+                       wins, losses, expired_after_triggered, win_rate,
+                       avg_pnl_pct, total_pnl_pct,
+                       max_favorable_avg, max_adverse_avg,
+                       sharpe_estimated,
+                       direction_flip_count, direction_flip_rate,
+                       brier_score
+                FROM signal_evaluation
+                WHERE symbol = $1 AND window_minutes = $2
+                ORDER BY evaluated_at DESC
+                LIMIT 1
+                """,
+                symbol,
+                int(window_minutes),
+            )
+        return dict(row) if row else None
+
+    async def fetch_signals_for_evaluation(
+        self,
+        symbol: str,
+        since: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        拉取评估窗口内 signals + signal_lifecycle 的合并视图
+        --------------------------------------------------------------
+        参数：
+            symbol : 合约代码
+            since  : 起始 UTC 时间（含），按 signals.ts 过滤
+        返回：
+            按 signals.ts 升序的 dict 列表，每条字段含：
+                signal_id / ts / bias / confidence /
+                lifecycle_status / triggered_at / triggered_price /
+                exit_price / pnl_pct / max_favorable_pct / max_adverse_pct
+            若该 signal 没有对应 lifecycle 行（开关刚打开等情况），
+            lifecycle_status 等字段为 None，但仍会被纳入 total_signals 计数。
+        说明：
+            - 仅评估"真实 LLM 调用"的信号（source 不含 'cache'），避免缓存命中
+              的同一判断被重复计入翻转率/胜率统计。
+            - LEFT JOIN lifecycle 而非 INNER JOIN：保留没有 lifecycle 的 signal，
+              便于"评估器开启 lifecycle 跟踪之前的旧信号也能算 total_signals"。
+        """
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    s.id           AS signal_id,
+                    s.ts,
+                    s.bias,
+                    s.confidence,
+                    s.source,
+                    sl.status                AS lifecycle_status,
+                    sl.triggered_at,
+                    sl.triggered_price,
+                    sl.exit_price,
+                    sl.pnl_pct,
+                    sl.max_favorable_pct,
+                    sl.max_adverse_pct
+                FROM signals s
+                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
+                WHERE s.symbol = $1
+                  AND s.ts >= $2
+                  AND s.source NOT LIKE '%cache%'
+                ORDER BY s.ts ASC
+                """,
+                symbol,
+                since,
+            )
+        return [dict(r) for r in rows]
+
+    async def fetch_recent_signals_for_conflict_check(
+        self,
+        symbol: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        读取近 N 条已结算信号（含规则引擎打分），供"规则 vs LLM 冲突保护"闸门使用
+        --------------------------------------------------------------
+        参数：
+            symbol : 合约代码
+            limit  : 回溯条数
+        返回：
+            按 signals.ts 倒序的 dict 列表，每条字段：
+                signal_id / ts / bias(LLM) / rule_score / lifecycle_status / pnl_pct
+            rule_score 从 signals.factors->>'rule_score' 抽取（写入路径在
+            SignalService.generate 已规范化为顶层 key）。
+        说明：
+            - 仅返回 lifecycle 已结算（status ∈ {sl_hit, tp1_hit, tp2_hit,
+              expired, invalidated}）的样本：未结算样本对"胜率"是无效的。
+            - source NOT LIKE '%cache%'：与 fetch_signals_for_evaluation 一致，
+              避免缓存重复计入。
+        """
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    s.id           AS signal_id,
+                    s.ts,
+                    s.bias,
+                    (s.factors->>'rule_score')::float8  AS rule_score,
+                    sl.status                AS lifecycle_status,
+                    sl.pnl_pct
+                FROM signals s
+                JOIN signal_lifecycle sl ON sl.signal_id = s.id
+                WHERE s.symbol = $1
+                  AND s.source NOT LIKE '%cache%'
+                  AND sl.status IN ('sl_hit', 'tp1_hit', 'tp2_hit',
+                                    'expired', 'invalidated')
+                ORDER BY s.ts DESC
+                LIMIT $2
+                """,
+                symbol,
+                int(limit),
+            )
+        return [dict(r) for r in rows]
+
 
 def _parse_delete_count(status: str) -> int:
     """

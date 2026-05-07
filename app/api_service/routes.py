@@ -740,20 +740,30 @@ async def send_test_notification_email(
         email : 测试收件邮箱
     错误：
         400 - 邮箱格式非法
-        503 - 邮件通知未启用 / SMTP 凭据缺失
-        500 - SMTP 实际发送失败
+        503 - 邮件通知未启用 / Resend 凭据缺失
+        500 - Resend HTTP API 实际发送失败
     """
     email = _validate_email_str(payload.email)
     sender = container.email_sender
     if sender is None or not sender.enabled:
         raise HTTPException(
             status_code=503,
-            detail="邮件通知未启用或 SMTP 凭据未配置（检查 ENABLE_EMAIL_NOTIFICATION / SMTP_USER / SMTP_PASSWORD）",
+            detail="邮件通知未启用或 Resend 凭据未配置（检查 ENABLE_EMAIL_NOTIFICATION / RESEND_API_KEY / RESEND_FROM）",
         )
     try:
-        await sender.send_test_email(email)
+        resp = await sender.send_test_email(email)
     except Exception as exc:  # noqa: BLE001
+        # _send_one_blocking 已经把 Resend 原始异常压成 RuntimeError 并带上
+        # status / type / msg；直接把 str(exc) 透回前端，方便排查
+        # "from 不是已验证域名 / API Key 无效 / 收件人不在沙盒白名单内" 这类问题。
         raise HTTPException(
-            status_code=500, detail=f"测试邮件发送失败：{exc}"
+            status_code=500,
+            detail=(
+                f"测试邮件发送失败：{exc}。"
+                f"常见原因：1) RESEND_FROM 的域名未在 Resend 控制台 DNS 验证；"
+                f"2) RESEND_API_KEY 无效或权限不足；"
+                f"3) 仍在使用 onboarding@resend.dev 测试地址，但收件人不是 Resend 账号本人。"
+            ),
         ) from exc
-    return {"ok": True, "to": email}
+    msg_id = (resp or {}).get("id") if isinstance(resp, dict) else None
+    return {"ok": True, "to": email, "resend_id": msg_id}
