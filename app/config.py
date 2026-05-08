@@ -323,7 +323,7 @@ class Settings(BaseSettings):
     # 总开关：
     #   enable_decision_gates=False 时所有 4 道闸门 + size 覆盖全部跳过，
     #   行为退回 P2（与本轮升级前完全一致），便于灰度回滚。
-    enable_decision_gates: bool = True
+    enable_decision_gates: bool = False
     # 闸 1（ATR 门禁）：15m ATR 占当前价比例（atr_14 / last_close）
     # 低于该值视为窄幅震荡，跳过 LLM 调用直接输出 neutral。
     # 0.0025 = 0.25%。ETH 永续 1m 随机噪声大约 0.05–0.15%，
@@ -354,6 +354,32 @@ class Settings(BaseSettings):
     decision_rule_llm_conflict_window: int = 5
     # 闸 4：胜率阈值。LLM 与规则引擎反向且历史胜率低于此值时降级 neutral。
     decision_rule_llm_conflict_winrate_threshold: float = 0.4
+
+    # ----------------------------------------------------------------
+    # P3 决策层 · LLM 缓存"价位过期"保护（与节流窗口正交）
+    # ----------------------------------------------------------------
+    # 背景：
+    #   `LLM_MIN_INTERVAL_SECONDS` 把 LLM 真实调用节奏锁到了 30 分钟一次，
+    #   缓存命中时 service 直接复用 30 分钟前的 entry_zone / SL / TP。
+    #   但只要市场在这 30 分钟内有趋势性单边移动，缓存里的 entry_zone
+    #   就会"价格回不去"，让接口透出的入场建议变成"看着是 long、但价已经
+    #   跑出了 entry_zone 上沿"的过期计划。
+    # 保护机制（在 `_load_recent_judgment` 命中缓存后做一次"价格漂移检查"）：
+    #   - 仅对 bias ∈ {long, short} 的缓存 signal 检查；
+    #   - 若 |当前 last_close(15m) − cached entry_mid| ≥ 阈值 × ATR(15m)，
+    #     视为缓存已经"价位过期"，返回 None 强制本轮真打一次 LLM；
+    #   - 默认阈值 1.5 × ATR(15m)：在 ETH 上约对应 ~1.5%–2% 的单边位移，
+    #     对应"明显趋势启动"，足以让旧 entry_zone 失效。
+    # 节流冷却：
+    #   `decision_cache_stale_min_age_seconds`（默认 300s）保证同一缓存
+    #   命中后 5 分钟内**不**做漂移检查——避免 LLM 刚返回就因为 1m 抖动被
+    #   高频反复重调，绑死 30 分钟节奏的成本预算下限。
+    #   设为 0 可关闭冷却（漂移立即重调），但在高波动期可能突破成本预算。
+    # 总开关：
+    #   `decision_cache_stale_drift_atr_15m <= 0` 时整个保护关闭，
+    #   行为退回纯节流缓存（与 P3 其它升级前完全一致）。
+    decision_cache_stale_drift_atr_15m: float = 1.5
+    decision_cache_stale_min_age_seconds: int = 300
     # 离线评估系统总开关：False 时不启动 SignalEvaluator 后台任务，
     # prompt 中评估段也降级为"无数据"。
     enable_signal_evaluation: bool = True

@@ -11,8 +11,11 @@ P3 升级（决策层守门员 + 服务端 size 覆盖）：
 * 在 LLM 调用**前**插入 2 道闸门：
     闸 1（ATR 过低）—— ``_decision_atr_gate``
     闸 2（连续止损冷静期）—— ``_decision_cooldown_gate``
-  任一触发都跳过 LLM 调用，直接构造一条 ``bias=neutral`` 的"被门禁的"
-  TradingSignal 落库，``source="rules+llm(gated:<reason>)"``。
+  任一触发都跳过 LLM 调用，构造一条 ``bias=neutral`` 的"被门禁的"
+  TradingSignal **仅用于本轮接口/日志展示，不写入 signals 表**。
+  策略说明（与用户口径对齐）：signals 表只保留"真正经过 LLM 推理"
+  的判断，前置闸门触发 = LLM 未参与 = 不入库；这同时也避免了循环
+  期内 30 秒一条 gated-neutral 把表灌满 / 把 LLM 节流窗口的语义弄乱。
 * 在 LLM 调用**后**插入 2 道闸门：
     闸 3（方向反转 + 价格微动）—— ``_decision_direction_stability_gate``
     闸 4（规则 vs LLM 长期反向且历史胜率 < 40%）—— ``_decision_rule_conflict_gate``
@@ -91,9 +94,12 @@ class SignalService:
         # ====================================================================
         # P3 升级：LLM 前置闸门（闸 1 ATR + 闸 2 连续止损冷静期）
         # --------------------------------------------------------------------
-        # 任一闸门触发都直接构造一条 gated-neutral signal 入库，跳过 LLM 调用。
+        # 任一闸门触发都跳过 LLM 调用，仅在本轮接口响应 / 日志中产出一条
+        # gated-neutral 占位信号，**不写入 signals 表**。
         # 这是"省钱 + 防 whipsaw"的第一道保险——窄幅震荡 / 连续止损时 LLM
-        # 价值最低，绕过它直接 neutral 是更经济的选择。
+        # 价值最低，跳过它直接 neutral 是更经济的选择。
+        # 入库策略（与用户口径对齐）：signals 表只保留"真正经过 LLM 推理"
+        # 的判断；前置闸门触发 = LLM 未参与 = 不入库。
         # ====================================================================
         gated_pre_llm_reason: Optional[str] = None
         if gates_enabled:
@@ -106,6 +112,15 @@ class SignalService:
                     gated_pre_llm_reason = cooldown_reason
 
         if gated_pre_llm_reason is not None:
+            # ----------------------------------------------------------------
+            # 前置闸门触发：仅做"接口响应 + 日志审计"，不入库
+            # ----------------------------------------------------------------
+            # 业务语义：signals 表是"经过 LLM 推理的判断流水"，因此本路径下
+            #   - 不调用 LLM（llm_result=None）
+            #   - 不写 signals（should_persist=False）
+            #   - 不写 lifecycle、不发邮件（下面两段逻辑都以 should_persist 为门）
+            # 这避免了之前每 30 秒一条 gated-neutral 把表灌满的脏数据问题
+            # （详见 392/393/394 三条样本：35 秒一条 atr_too_low）。
             final = self._make_gated_neutral_signal(
                 rule_signal=rule_signal,
                 gate_reason=gated_pre_llm_reason,
@@ -113,9 +128,10 @@ class SignalService:
             reasoning_content = None
             source = f"rules+llm(gated:{gated_pre_llm_reason})"
             llm_result = None
-            should_persist = True
+            should_persist = False
             logger.info(
-                "P3 决策闸门：symbol=%s 触发前置闸门 reason=%s，跳过 LLM 调用直接 neutral",
+                "P3 决策闸门：symbol=%s 触发前置闸门 reason=%s，跳过 LLM 调用 + 跳过入库"
+                "（策略：signals 表仅保留经 LLM 推理的判断）",
                 symbol, gated_pre_llm_reason,
             )
         else:

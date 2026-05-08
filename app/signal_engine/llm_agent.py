@@ -954,6 +954,7 @@ class LLMAgent:
         self,
         symbol: str,
         min_interval: Optional[int] = None,
+        factors: Optional[Dict[str, Any]] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         若指定 symbol 在节流窗口内已有 LLM 判断（落在 signals 表里），
@@ -962,6 +963,10 @@ class LLMAgent:
         参数：
             symbol:       合约代码
             min_interval: P1 自适应节流窗口（秒）。None 时回退到 self.min_interval。
+            factors:      当前最新因子矩阵（可选）。仅用于"缓存价格漂移检查"——
+                          缓存命中且 bias ∈ {long, short} 时，对比缓存的 entry_mid
+                          和当前 last_close(15m) 的偏差是否 ≥ 阈值 × ATR(15m)。
+                          None 时跳过漂移检查（行为退回纯节流缓存）。
         步骤：
             1) ``effective_interval <= 0``：节流关闭，直接返回 None（每次都真调）。
             2) 查 signals 表里该 symbol 最近一条记录的 ts；
@@ -972,6 +977,12 @@ class LLMAgent:
                  LLMAnalysisResult，并把 ``from_cache`` 置 True 返回。
                  service 层据此跳过本次入库，避免重复行。
                - ``>= effective_interval``：节流过期，返回 None。
+            4) **B 增量**：第 3 步命中缓存后，再做一道"价格漂移检查"——
+               若当前价距缓存 entry_mid 漂移 ≥ 阈值 × ATR(15m)，视为缓存
+               价位过期，返回 None 让上层强制真打一次 LLM。这能避免在
+               1800s 节流窗口内透出"价格已经回不去"的过期入场建议。
+               配套节流冷却 (decision_cache_stale_min_age_seconds，默认 300s)
+               保证刚返回的缓存不会被 1m 抖动反复触发重调，守住成本预算下限。
         异常处理：
             DB 查询失败时（如连接被 reset），不应阻塞 LLM 调用；记一行
             warning 后返回 None，让上层退化为"直接打 LLM"——成本上界仍是
@@ -1042,6 +1053,34 @@ class LLMAgent:
             )
             return None
 
+        # ----------------------------------------------------------------
+        # B 增量：缓存"价位过期"漂移检查
+        # ----------------------------------------------------------------
+        # 详细背景见本方法 docstring。这里只做一次轻量计算：
+        #   - 仅当传入了 factors（service 调用路径）才检查；
+        #   - 仅当缓存的 bias ∈ {long, short} 且 entry_zone 完整时检查；
+        #   - 仅当缓存年龄 ≥ decision_cache_stale_min_age_seconds 时检查
+        #     （刚返回的缓存不会被 1m 抖动立刻打挂）；
+        #   - 计算结果由 _is_cache_stale_by_price 给出布尔 + 调试 detail。
+        # 触发漂移则返回 None，外层会真正调用一次 LLM、写一条新 signal，
+        # 隐式刷新节流窗口，下一轮起再以新的 ts 为准。
+        if factors is not None and elapsed >= float(
+            getattr(self.settings, "decision_cache_stale_min_age_seconds", 300)
+        ):
+            stale, stale_detail = self._is_cache_stale_by_price(
+                cached_signal=cached_signal,
+                factors=factors,
+            )
+            if stale:
+                logger.info(
+                    "LLM 缓存价格漂移触发强制刷新 %s（已过 %.0fs，detail=%s）；"
+                    "本轮将真打一次 LLM 重建判断",
+                    symbol,
+                    elapsed,
+                    stale_detail,
+                )
+                return None
+
         remaining = effective_interval - elapsed
         logger.info(
             "LLM 数据库节流命中 %s（已过 %.0fs，下次调用还需 %.0fs，min_interval=%ds）",
@@ -1055,6 +1094,107 @@ class LLMAgent:
             reasoning_content=row.get("reasoning_content"),
             from_cache=True,
         )
+
+    def _is_cache_stale_by_price(
+        self,
+        cached_signal: TradingSignal,
+        factors: Optional[Dict[str, Any]],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        判断"缓存信号是否因为价格漂移而过期"
+        --------------------------------------------------------------
+        参数：
+            cached_signal : 从 signals 表重建出的 TradingSignal
+                            （已通过 schema 强约束，bias=long/short 时 entry_zone 必有）
+            factors       : FactorAggregator.compute 输出的最新因子矩阵
+        返回：
+            (stale, detail)
+            - stale  : True 表示需要强制重调 LLM；False 表示缓存仍可用
+            - detail : 调试用字典，键含 current_price / cached_entry_mid /
+                       drift / threshold；触发时打日志好排查。
+                       未触发时也填了关键中间值，便于 debug 级别复现。
+        判定规则（任一不满足即视为"无法判定 → 不触发漂移"，保留缓存）：
+            1) decision_cache_stale_drift_atr_15m 阈值 > 0；
+            2) factors 是 dict 且能拿到 by_timeframe.15m.market_structure；
+            3) cached_signal.bias ∈ {long, short} 且 entry_zone 是 (low, high) 元组；
+            4) ATR(15m) 与 last_close(15m) 都非空且 > 0。
+        触发条件：
+            |last_close(15m) - cached_entry_mid| >= threshold × ATR(15m)
+        设计取舍：
+            - 阈值用 ATR(15m) 而不是绝对百分比：让阈值随波动率自适应，
+              低波动期不会误触发，高波动期及时刷新。
+            - 仅看 last_close(15m) 而不取 1m close：1m 噪声大，与本机制
+              "防止透出过期入场建议"的目标不一致——15m close 已经过滤掉
+              短期插针，刚好对应"行情已经走了一根 15m K 线"的级别。
+        """
+        # 默认调试详情结构，保证返回的 detail 一定有这些键
+        detail: Dict[str, Any] = {
+            "threshold_atr_mult": None,
+            "atr_15m": None,
+            "current_price": None,
+            "cached_entry_mid": None,
+            "drift": None,
+            "drift_threshold": None,
+            "skip_reason": None,
+        }
+        threshold_mult = self._safe_float(
+            getattr(self.settings, "decision_cache_stale_drift_atr_15m", None)
+        )
+        detail["threshold_atr_mult"] = threshold_mult
+        if threshold_mult is None or threshold_mult <= 0:
+            detail["skip_reason"] = "threshold_disabled"
+            return False, detail
+
+        if not isinstance(factors, dict):
+            detail["skip_reason"] = "factors_not_dict"
+            return False, detail
+
+        bias = getattr(cached_signal, "bias", None)
+        if bias not in ("long", "short"):
+            detail["skip_reason"] = f"bias_not_directional({bias})"
+            return False, detail
+
+        ez = getattr(cached_signal, "entry_zone", None)
+        if not isinstance(ez, (list, tuple)) or len(ez) != 2:
+            detail["skip_reason"] = "entry_zone_missing"
+            return False, detail
+        ez_low = self._safe_float(ez[0])
+        ez_high = self._safe_float(ez[1])
+        if ez_low is None or ez_high is None:
+            detail["skip_reason"] = "entry_zone_invalid"
+            return False, detail
+        cached_entry_mid = (ez_low + ez_high) / 2.0
+        detail["cached_entry_mid"] = cached_entry_mid
+
+        by_tf = factors.get("by_timeframe") or {}
+        ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
+        atr_15m = self._safe_float(ms_15m.get("atr_14"))
+        current_price = self._safe_float(ms_15m.get("last_close"))
+        detail["atr_15m"] = atr_15m
+        detail["current_price"] = current_price
+        if atr_15m is None or atr_15m <= 0 or current_price is None:
+            detail["skip_reason"] = "missing_atr_or_price_15m"
+            return False, detail
+
+        drift = abs(current_price - cached_entry_mid)
+        drift_threshold = float(threshold_mult) * float(atr_15m)
+        detail["drift"] = drift
+        detail["drift_threshold"] = drift_threshold
+
+        if drift >= drift_threshold:
+            return True, detail
+        return False, detail
+
+    @staticmethod
+    def _safe_float(v: Any) -> Optional[float]:
+        """
+        把任意输入转 float，失败 / NaN / Inf 一律返回 None
+        --------------------------------------------------------------
+        与模块顶部 ``_to_float_safe`` 同语义；这里加一个类静态版本
+        是为了让 _is_cache_stale_by_price 这种实例方法可以
+        直接 self._safe_float(...) 调用，避免在多处重复 import。
+        """
+        return _to_float_safe(v)
 
     # ------------------------------------------------------------------
     # Prompt 构造（多周期因子矩阵 → 紧凑中文表格）
@@ -2099,8 +2239,12 @@ class LLMAgent:
         adaptive_interval = self.compute_min_interval(factors)
 
         # 快速路径：先在锁外查一次 DB，避免抢锁。
+        # B 增量：把 factors 透传进去，让 _load_recent_judgment 命中缓存后
+        # 再做一次"价格漂移检查"——若当前价距缓存 entry_mid 偏离 ≥
+        # decision_cache_stale_drift_atr_15m × ATR(15m)，视为缓存过期，
+        # 强制本轮真打一次 LLM。详见 _load_recent_judgment / _is_cache_stale_by_price。
         cached = await self._load_recent_judgment(
-            symbol, min_interval=adaptive_interval
+            symbol, min_interval=adaptive_interval, factors=factors
         )
         if cached is not None:
             return cached
@@ -2109,7 +2253,7 @@ class LLMAgent:
         # 防止同一 symbol 在节流刚过期的瞬间被并发调用打多次接口。
         async with self._get_lock(symbol):
             cached = await self._load_recent_judgment(
-                symbol, min_interval=adaptive_interval
+                symbol, min_interval=adaptive_interval, factors=factors
             )
             if cached is not None:
                 return cached

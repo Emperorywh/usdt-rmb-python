@@ -44,7 +44,7 @@ def _settings(**overrides: Any) -> Any:
     传入 overrides 可覆盖任意单项，便于"开关 / 阈值"边界测试。
     """
     s = MagicMock()
-    s.enable_decision_gates = True
+    s.enable_decision_gates = False
     s.decision_min_atr_pct_15m = 0.0025
     s.decision_direction_flip_min_price_move_atr_1h = 0.6
     s.decision_cooldown_consecutive_sl_threshold = 2
