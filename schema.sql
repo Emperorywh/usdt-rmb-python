@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS signals (
     risk               TEXT,
     suggestion         TEXT,
     factors            JSONB,
-    source             TEXT        NOT NULL DEFAULT 'rules+llm',
+    source             TEXT        NOT NULL DEFAULT 'llm',
     reasoning_content  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signals_symbol_ts ON signals (symbol, ts DESC);
@@ -335,91 +335,13 @@ CREATE INDEX IF NOT EXISTS idx_position_ratios_symbol_type_ts
     ON position_ratios (symbol, ratio_type, ts DESC);
 
 -- ============================================================
--- P2 升级：因子权重表（IC 自适应） + 信号生命周期表（自我反馈）
+-- LLM-First 重构（plan 第 1.7 节）：以下 3 张表已整体下线
+--   - factor_weights      （RuleEngine + ICCalibrator 已删除）
+--   - signal_lifecycle    （LifecycleTracker 已删除）
+--   - signal_evaluation   （SignalEvaluator 已删除）
+-- 老库可以通过 migrations/2026_05_drop_legacy_tables.sql 一键 DROP，
+-- 新库直接走本 schema 不会建出这些表。
 -- ============================================================
--- 设计取舍（详见 P2 升级说明文档）：
---   1) 因子权重表 factor_weights 替代代码里硬编码的"按 regime 切换"权重，
---      支持 IC 自动校准任务后台覆盖；同一 (regime, timeframe) 下所有
---      factor_name 的 weight 总和归一为 1.0。
---   2) 信号生命周期表 signal_lifecycle 跟踪每条 signals 行从 pending →
---      triggered → sl_hit / tp1_hit / tp2_hit / expired 的状态机，
---      给 LLM "自我反馈"提供数据基础：每次 analyze() 时回查最近 5 条已结算
---      记录注入到 prompt，让模型看到自己上一轮判断的真实 PnL。
---   3) 两张表都使用 IF NOT EXISTS，旧库/新库幂等；signal_lifecycle 通过 FK
---      ON DELETE CASCADE 与 signals 同生共死，避免 retention 任务删 signals
---      后留下孤儿 lifecycle 行。
-
--- 12) 因子权重表（替代规则引擎里的硬编码权重）
---   说明：
---     - 同一 (regime, timeframe) 下所有 factor_name 的 weight 总和应 = 1.0
---       （由 IC 校准任务在 UPSERT 时归一），规则引擎读到后直接累加；
---       归一不依赖 DB 约束，避免高频 UPSERT 时 DEFERRABLE 检查的开销。
---     - factor_group 与 factor_name 都是冗余但便于人类阅读 / 归因 API 使用：
---       factor_group ∈ {capital_flow, orderbook, derivatives, market_structure, liquidity}
---     - ic_30d / ic_90d / sample_count 是观测窗口指标，仅用于审计与归因展示。
---     - regime='overall' / timeframe='overall' 作为兜底维度：当具体
---       (regime, timeframe) 没有该 factor 时，规则引擎用它作为后备权重。
-CREATE TABLE IF NOT EXISTS factor_weights (
-    id              BIGSERIAL PRIMARY KEY,
-    regime          TEXT        NOT NULL,
-    timeframe       TEXT        NOT NULL,
-    factor_group    TEXT        NOT NULL,
-    factor_name     TEXT        NOT NULL,
-    weight          NUMERIC(10, 6) NOT NULL,
-    ic_30d          NUMERIC(10, 6),
-    ic_90d          NUMERIC(10, 6),
-    sample_count    INTEGER,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT factor_weights_unique
-        UNIQUE (regime, timeframe, factor_group, factor_name)
-);
-CREATE INDEX IF NOT EXISTS idx_factor_weights_regime_tf
-    ON factor_weights (regime, timeframe);
-
--- 13) 信号生命周期跟踪表（pending → triggered → sl_hit / tp_hit / expired）
---   设计要点：
---     - 主键直接复用 signals.id：1:1 关系，删除 signals 时级联删除 lifecycle，
---       不需要在 signals 表加任何反向引用列。
---     - status 用 CHECK 列举枚举值，避免拼写漂移；增加新状态时只需要改这里。
---     - take_profit 用 JSONB 而非 NUMERIC[]：与 signals.take_profit 列对齐，
---       方便整段拷贝；此外历史 signals 行的 take_profit 可能为空数组 / null，
---       JSONB 更宽容。
---     - max_favorable_pct / max_adverse_pct 用 NUMERIC(10,6)：百分比形式，
---       例如 0.012345 表示 +1.2345%，统计聚合不需要再除一遍。
---     - expires_at 列单独建偏序索引：lifecycle 任务每 30 秒扫"未结算且即将
---       过期"的行，加 WHERE 过滤的偏序索引可以把扫描成本降到 O(快到期数量)。
-CREATE TABLE IF NOT EXISTS signal_lifecycle (
-    signal_id           BIGINT      PRIMARY KEY
-                        REFERENCES signals(id) ON DELETE CASCADE,
-    symbol              TEXT        NOT NULL,
-    bias                TEXT        NOT NULL CHECK (bias IN ('long', 'short', 'neutral')),
-    entry_zone_low      NUMERIC(24, 10),
-    entry_zone_high     NUMERIC(24, 10),
-    stop_loss           NUMERIC(24, 10),
-    take_profit         JSONB,
-    status              TEXT        NOT NULL CHECK (status IN (
-        'pending', 'triggered', 'sl_hit', 'tp1_hit', 'tp2_hit',
-        'expired', 'invalidated'
-    )),
-    triggered_at        TIMESTAMPTZ,
-    triggered_price     NUMERIC(24, 10),
-    exit_at             TIMESTAMPTZ,
-    exit_price          NUMERIC(24, 10),
-    pnl_pct             NUMERIC(12, 6),
-    max_favorable_pct   NUMERIC(12, 6),
-    max_adverse_pct     NUMERIC(12, 6),
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at          TIMESTAMPTZ NOT NULL,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_signal_lifecycle_symbol_status
-    ON signal_lifecycle (symbol, status);
-CREATE INDEX IF NOT EXISTS idx_signal_lifecycle_symbol_updated
-    ON signal_lifecycle (symbol, updated_at DESC);
--- 偏序索引：只覆盖未结算行，配合 lifecycle 任务"扫到期 + 触发"双查询路径
-CREATE INDEX IF NOT EXISTS idx_signal_lifecycle_open_expires
-    ON signal_lifecycle (expires_at)
-    WHERE status IN ('pending', 'triggered');
 
 -- ============================================================
 -- 邮件通知收件人表（notification_emails）
@@ -444,50 +366,3 @@ CREATE TABLE IF NOT EXISTS notification_emails (
 CREATE INDEX IF NOT EXISTS idx_notification_emails_enabled
     ON notification_emails (enabled);
 
--- ============================================================
--- P3 升级：信号评估表（signal_evaluation）
--- ============================================================
--- 设计要点：
---   1) 离线评估系统每隔 SIGNAL_EVALUATION_INTERVAL_SECONDS 跑一轮，
---      对每个 (symbol, window_minutes) 组合写入一行；窗口默认 60/360/1440 三档。
---   2) 不做"幂等 unique"——历次评估都新增一行，便于看指标随时间漂移。
---   3) 主用消费场景：LLM prompt 注入 24h（window_minutes=1440）最新一行，
---      把胜率 / 翻转率 / Sharpe / Brier 等指标喂给 LLM 做自适应放慢决策。
---   4) 字段语义：
---        total_signals           : 窗口内 LLM 入库信号总数
---        triggered_count         : 价格曾走进 entry_zone 的样本数
---        fill_rate               : triggered_count / total_signals
---        wins / losses           : 仅"曾入场"样本里的 tp_hit / sl_hit
---        expired_after_triggered : 曾入场但超时未触发 SL/TP 的笔数
---        win_rate                : wins / (wins + losses)
---        avg_pnl_pct             : 曾入场样本的平均 PnL（百分比形式）
---        total_pnl_pct           : 曾入场样本的累计 PnL
---        max_favorable_avg       : 曾入场样本的"最大有利波动"平均值
---        max_adverse_avg         : 曾入场样本的"最大不利波动"平均值
---        sharpe_estimated        : avg_pnl / std(pnl)（无年化，仅做窗口间比较）
---        direction_flip_count    : 窗口内相邻信号方向翻转次数
---        direction_flip_rate     : direction_flip_count / max(total_signals - 1, 1)
---        brier_score             : mean((conf - actual_outcome)^2)，越低越校准
-CREATE TABLE IF NOT EXISTS signal_evaluation (
-    id                       BIGSERIAL PRIMARY KEY,
-    symbol                   TEXT        NOT NULL,
-    window_minutes           INT         NOT NULL,
-    evaluated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    total_signals            INT         NOT NULL,
-    triggered_count          INT         NOT NULL,
-    fill_rate                NUMERIC(6, 4),
-    wins                     INT,
-    losses                   INT,
-    expired_after_triggered  INT,
-    win_rate                 NUMERIC(6, 4),
-    avg_pnl_pct              NUMERIC(10, 6),
-    total_pnl_pct            NUMERIC(10, 6),
-    max_favorable_avg        NUMERIC(10, 6),
-    max_adverse_avg          NUMERIC(10, 6),
-    sharpe_estimated         NUMERIC(8, 4),
-    direction_flip_count     INT,
-    direction_flip_rate      NUMERIC(6, 4),
-    brier_score              NUMERIC(8, 4)
-);
-CREATE INDEX IF NOT EXISTS idx_signal_evaluation_lookup
-    ON signal_evaluation (symbol, window_minutes, evaluated_at DESC);

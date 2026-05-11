@@ -123,15 +123,13 @@ class IngestionRunner:
         # REST 不再无脑 60s 轮询，改成 stale-watchdog：仅当 WS 长时间没有
         # 推送对应频道时才发一次 REST 兜底，降低对外网请求频率。
         self._tasks.append(asyncio.create_task(self._run_rest_watchdog(), name="rest-watchdog"))
-        # P1：持仓比 REST 轮询任务（与主行情链路完全解耦）
-        # 关闭开关 / 没配置 settings 字段时不启动，跳过即可保留 P0 行为。
-        if bool(getattr(self.settings, "enable_position_ratios", False)):
-            self._tasks.append(
-                asyncio.create_task(
-                    self._run_position_ratios_poller(),
-                    name="position-ratios-poller",
-                )
+        # 持仓比 REST 轮询任务（LLM-First 架构下永远启动）
+        self._tasks.append(
+            asyncio.create_task(
+                self._run_position_ratios_poller(),
+                name="position-ratios-poller",
             )
+        )
         # 数据保留清理任务：retention_run_interval_seconds <= 0 时彻底关闭。
         # 不启动该任务时高频表会无限增长，仅在外部已有清理脚本时才允许关闭。
         if int(getattr(self.settings, "retention_run_interval_seconds", 0) or 0) > 0:
@@ -213,12 +211,9 @@ class IngestionRunner:
                         bids=event["bids"],
                         asks=event["asks"],
                     )
-                # P1 路径：独立的 orderbook_metrics 时序指标（默认 10s 节流）
-                # 任一计算 / 落库失败都只记 warn，不影响 P0 主路径。
-                if (
-                    bool(getattr(self.settings, "enable_orderbook_timeseries", False))
-                    and self._should_write_orderbook_metric(event["symbol"])
-                ):
+                # 独立的 orderbook_metrics 时序指标（10s 节流，永远开启）
+                # 任一计算 / 落库失败都只记 warn，不影响主路径。
+                if self._should_write_orderbook_metric(event["symbol"]):
                     try:
                         metric = compute_orderbook_metric_row(
                             snapshot=event,

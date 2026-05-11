@@ -198,18 +198,16 @@ def render_signal_html(
     *,
     symbol: str,
     signal: TradingSignal,
-    rule_score: Optional[float] = None,
     factors: Optional[Dict[str, Any]] = None,
     signal_id: Optional[int] = None,
     generated_at: Optional[datetime] = None,
 ) -> str:
     """
-    把交易信号渲染成 HTML 邮件正文
+    把交易信号渲染成 HTML 邮件正文（LLM-First 架构）
     --------------------------------------------------------------
     参数：
         symbol       : 合约代码
         signal       : 完整 TradingSignal（含交易计划）
-        rule_score   : 规则引擎打分，可空
         factors      : 因子聚合 dict（用于摘要 regime / current_price）
         signal_id    : signals.id（可空，用于在邮件页脚展示）
         generated_at : 信号生成时间（默认 = now UTC）
@@ -288,9 +286,6 @@ def render_signal_html(
     risk_html = escape(signal.risk or "").replace("\n", "<br>")
     suggestion_html = escape(signal.suggestion or "").replace("\n", "<br>")
 
-    rule_score_str = (
-        f"{float(rule_score):+.4f}" if rule_score is not None else "-"
-    )
     regime_str = str(regime) if regime else "-"
     current_price_str = _fmt_price(current_price)
     rr_str = _fmt_price(signal.risk_reward_ratio, digits=2)
@@ -367,10 +362,6 @@ def render_signal_html(
                 <td style="padding:6px 10px;border:1px solid #e2e8f0;color:#475569;">建议仓位</td>
                 <td style="padding:6px 10px;border:1px solid #e2e8f0;font-weight:600;color:#0f172a;">{pos_str}</td>
               </tr>
-              <tr>
-                <td style="padding:6px 10px;border:1px solid #e2e8f0;color:#475569;">规则引擎打分</td>
-                <td style="padding:6px 10px;border:1px solid #e2e8f0;font-weight:600;color:#0f172a;">{rule_score_str}</td>
-              </tr>
             </table>
           </td>
         </tr>
@@ -426,7 +417,7 @@ def render_signal_html(
         <!-- Footer -->
         <tr>
           <td style="background:#f8fafc;padding:14px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.6;">
-            信号 ID：{escape(signal_id_str)} &nbsp;|&nbsp; 来源：DeepSeek + 规则引擎多周期共振<br>
+            信号 ID：{escape(signal_id_str)} &nbsp;|&nbsp; 来源：DeepSeek（LLM-First · 多周期共振）<br>
             本邮件由系统自动发送，仅供参考，不构成交易指令。请结合自身风险承受能力独立决策。
           </td>
         </tr>
@@ -441,7 +432,6 @@ def render_signal_text(
     *,
     symbol: str,
     signal: TradingSignal,
-    rule_score: Optional[float] = None,
     signal_id: Optional[int] = None,
     generated_at: Optional[datetime] = None,
 ) -> str:
@@ -459,9 +449,6 @@ def render_signal_text(
     pos_str = _fmt_pct(signal.position_size_pct, digits=2)
     entry_low = signal.entry_zone[0] if signal.entry_zone else None
     entry_high = signal.entry_zone[1] if signal.entry_zone else None
-    rule_score_str = (
-        f"{float(rule_score):+.4f}" if rule_score is not None else "-"
-    )
 
     tp_lines = "\n".join(
         f"  - 止盈{i}：{_fmt_price(tp)}"
@@ -479,7 +466,6 @@ def render_signal_text(
         f"== 核心判断 ==\n"
         f"方向：{bias_label}\n"
         f"置信度：{conf_pct}（{conf_label}）\n"
-        f"规则引擎打分：{rule_score_str}\n"
         f"\n"
         f"== 交易计划 ==\n"
         f"入场区间：{_fmt_price(entry_low)} ~ {_fmt_price(entry_high)}\n"
@@ -613,7 +599,6 @@ class EmailSender:
         recipients: Sequence[str],
         symbol: str,
         signal: TradingSignal,
-        rule_score: Optional[float] = None,
         factors: Optional[Dict[str, Any]] = None,
         signal_id: Optional[int] = None,
         generated_at: Optional[datetime] = None,
@@ -625,7 +610,6 @@ class EmailSender:
             recipients   ：收件人邮箱列表（已过滤 enabled=TRUE）
             symbol       ：合约代码
             signal       ：完整 TradingSignal
-            rule_score   ：规则引擎打分，可空
             factors      ：因子聚合 dict（用于摘要 regime / current_price）
             signal_id    ：signals.id（可空）
             generated_at ：信号生成时间，默认 now UTC
@@ -664,7 +648,6 @@ class EmailSender:
         html_body = render_signal_html(
             symbol=symbol,
             signal=signal,
-            rule_score=rule_score,
             factors=factors,
             signal_id=signal_id,
             generated_at=generated_at,
@@ -672,7 +655,6 @@ class EmailSender:
         text_body = render_signal_text(
             symbol=symbol,
             signal=signal,
-            rule_score=rule_score,
             signal_id=signal_id,
             generated_at=generated_at,
         )

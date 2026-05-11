@@ -1,18 +1,26 @@
-"""HTTP routes（P0/P1/P2 共用）。
+"""HTTP routes（LLM-First 架构）。
 
-P2 新增接口：
-* GET  /signals/{signal_id}/attribution   信号因子贡献度归因
-* GET  /factors/weights/current           当前生效的权重表（按 regime 过滤）
-* GET  /signals/lifecycle/stats           近 N 天信号胜率 / 平均 RR / 各 regime 命中率
-* POST /admin/calibrate-ic                手动触发一次 IC 校准（带 token）
+LLM-First 重构后，本路由表只保留三大类接口：
+
+1. ``/health`` / ``/healthz``                 ：基础健康度
+2. ``/factors`` / ``/signal*`` / ``/analysis*``：行情因子与 LLM 信号读写
+3. ``/emails*``                                ：邮件通知收件人 CRUD（运营）
+
+已删除（与 plan 第 1.5 / 1.6 节对齐）：
+- ``GET  /signals/{signal_id}/attribution``：规则引擎归因
+- ``GET  /factors/weights/current``         ：因子权重表
+- ``GET  /signals/lifecycle/stats``         ：信号生命周期统计
+- ``POST /admin/calibrate-ic``              ：手动触发 IC 校准
+
+这些接口依赖的 ``factor_weights`` / ``signal_lifecycle`` / IC 校准器在
+LLM-First 架构下整体退场，相关 DB 表也已 DROP。
 """
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api_service.analysis_view import serialize_signal_full
@@ -51,14 +59,7 @@ def _validate_email_str(email: str) -> str:
 
 
 class NotificationEmailCreate(BaseModel):
-    """
-    新增邮件收件人入参
-    --------------------------------------------------------------
-    字段：
-        email   : 收件邮箱（必填，UNIQUE）
-        name    : 备注名（可空）
-        enabled : 是否启用（默认 True）
-    """
+    """新增邮件收件人入参"""
 
     email: str = Field(..., description="收件邮箱")
     name: Optional[str] = Field(default=None, max_length=128, description="备注名")
@@ -66,12 +67,7 @@ class NotificationEmailCreate(BaseModel):
 
 
 class NotificationEmailUpdate(BaseModel):
-    """
-    更新邮件收件人入参
-    --------------------------------------------------------------
-    所有字段都是可空的（PATCH 语义）；显式置空 name 请传空字符串以外的标记，
-    本接口暂不支持把 name 重置回 NULL。
-    """
+    """更新邮件收件人入参（PATCH 语义）"""
 
     email: Optional[str] = Field(default=None, description="收件邮箱")
     name: Optional[str] = Field(default=None, max_length=128, description="备注名")
@@ -79,9 +75,7 @@ class NotificationEmailUpdate(BaseModel):
 
 
 class TestEmailRequest(BaseModel):
-    """
-    /emails/test 入参：发送一封测试邮件到指定地址
-    """
+    """/emails/test 入参：发送一封测试邮件到指定地址"""
 
     email: str = Field(..., description="测试邮箱地址")
 
@@ -104,15 +98,7 @@ async def healthz(container: AppContainer = Depends(get_container)) -> Dict[str,
     返回字段：
         - status:  'ok' / 'degraded'，是否所有 WS 频道都在新鲜窗口内
         - ws:      {symbol: {kind: {age_seconds, last_event_at}}}
-                   每个 (symbol, kind) 的 WS 推送年龄；kind ∈
-                   {trade, orderbook, ticker, funding_rate, open_interest}
-        - rest:    {op_name: {state, consecutive_failures,
-                              cooldown_remaining, last_error,
-                              last_success_at, success_count, failure_count}}
-                   每个 REST endpoint 的熔断状态
-    用途：
-        - 运维监控 / 仪表盘判断"WS 是否在推" / "REST 是否被熔断"
-        - 信号引擎可读取本接口在数据陈旧时主动降级
+        - rest:    {op_name: {state, consecutive_failures, ...}}
     """
     ws_snapshot = (
         container.ingestion_runner.ws_health_snapshot()
@@ -121,8 +107,6 @@ async def healthz(container: AppContainer = Depends(get_container)) -> Dict[str,
     )
     rest_snapshot = container.okx_rest.health_snapshot()
 
-    # status 判定：只要有任意 (symbol, funding_rate/open_interest) 通道
-    # 在 staleness 阈值之上即视为 degraded；trade/orderbook 静默 60s 也算异常。
     degraded = False
     for symbol_view in ws_snapshot.values():
         for kind, info in symbol_view.items():
@@ -210,9 +194,8 @@ async def refresh_signal(
         "symbol": sym,
         "source": result["source"],
         "signal": result["signal"],
-        "rule_signal": result["rule_signal"],
-        "rule_score": result["rule_score"],
-        # 注意：persisted=False 时 reasoning_content 不会进入 DB（纯规则引擎路径）
+        # LLM-First 架构下不再返回 rule_signal / rule_score：
+        # 决策路径已经只剩 LLM 一条线。
         "persisted": result["persisted"],
         "reasoning_available": result["reasoning_content"] is not None,
     }
@@ -223,17 +206,6 @@ async def refresh_signal(
 
 # ======================================================================
 # 前端综合分析视图（最近一次 / 历史列表 / 单条详情）
-# ----------------------------------------------------------------------
-# 设计目标：
-#   1) 一次拿齐前端"分析卡片 / 详情页"需要的所有字段，避免串行多次调用
-#      /signal + /signals/{id}/attribution + lifecycle stats。
-#   2) 把所有 Decimal / datetime / 枚举字段都做成对前端友好的形态：
-#      - Decimal → float、datetime → ISO8601；
-#      - bias / source / lifecycle_status 都补一份中文 label + Tag color；
-#      - take_profit 自动算好"距入场点的收益百分比"，前端直接渲染；
-#      - rule_contributions 已经按贡献度绝对值排好序并截断 top N。
-#   3) 默认带 factors_snapshot（可关），不带 reasoning_content 全文（可显式打开），
-#      避免默认响应被一两万字思维链撑爆。
 # ======================================================================
 @router.get("/analysis/latest", tags=["analysis"])
 async def get_latest_analysis(
@@ -246,16 +218,13 @@ async def get_latest_analysis(
         default=False,
         description="是否携带 LLM 思维链全文（reasoning_content，可能很长）",
     ),
-    top_contributions: int = Query(
-        default=10, ge=1, le=50, description="规则引擎归因 top N 因子",
-    ),
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
     """
     返回最新一次综合分析（前端友好视图）
     -------------------------------------------------------------------
-    包含：信号判断 / 结构化交易计划 / 多周期共振 / regime / 流动性地图 /
-    规则引擎归因 / 信号生命周期实战表现 等。
+    包含：LLM 判断 / 结构化交易计划 / 多周期共振 / regime / 流动性地图 /
+    失效条件 / 信号元数据。
     """
     sym = _resolve_symbol(symbol, container)
     row = await container.repos.fetch_latest_signal_full(sym)
@@ -270,7 +239,6 @@ async def get_latest_analysis(
         row,
         include_factors_snapshot=bool(include_factors),
         include_reasoning=bool(include_reasoning),
-        rule_contributions_top_n=int(top_contributions),
     )
 
 
@@ -290,17 +258,10 @@ async def get_analysis_history(
         default=False,
         description="列表场景默认不返回 factors 快照，节省带宽；详情页再单独取",
     ),
-    top_contributions: int = Query(default=5, ge=1, le=50),
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
     """
     返回最近 N 条综合分析（按时间倒序，前端时间线 / 历史列表用）
-    -------------------------------------------------------------------
-    返回：
-        {
-            "symbol": ..., "count": N,
-            "items": [<同 /analysis/latest 的视图>, ...]
-        }
     """
     if bias is not None and bias not in ("long", "short", "neutral"):
         raise HTTPException(
@@ -318,7 +279,6 @@ async def get_analysis_history(
             r,
             include_factors_snapshot=bool(include_factors),
             include_reasoning=False,
-            rule_contributions_top_n=int(top_contributions),
         )
         for r in rows
     ]
@@ -335,13 +295,13 @@ async def get_analysis_by_id(
     signal_id: int,
     include_factors: bool = Query(default=True),
     include_reasoning: bool = Query(default=False),
-    top_contributions: int = Query(default=20, ge=1, le=100),
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
     """
     按 signals.id 读取单条综合分析详情
     -------------------------------------------------------------------
-    与 /analysis/latest 字段一致；详情页通常打开 include_reasoning=true 看思维链全文。
+    与 /analysis/latest 字段一致；详情页通常打开 include_reasoning=true
+    看思维链全文。
     """
     row = await container.repos.fetch_signal_full_by_id(signal_id)
     if not row:
@@ -350,229 +310,7 @@ async def get_analysis_by_id(
         row,
         include_factors_snapshot=bool(include_factors),
         include_reasoning=bool(include_reasoning),
-        rule_contributions_top_n=int(top_contributions),
     )
-
-
-# ======================================================================
-# P2：归因 / 权重 / 生命周期统计
-# ======================================================================
-@router.get("/signals/{signal_id}/attribution", tags=["signal", "p2"])
-async def get_signal_attribution(
-    signal_id: int,
-    container: AppContainer = Depends(get_container),
-) -> Dict[str, Any]:
-    """
-    返回某条信号的因子贡献度分解（基于规则引擎 contributions + LLM reasoning_content 摘要）
-    -------------------------------------------------------------------
-    返回字段：
-        signal_id        : 入参
-        symbol / ts / bias / confidence / source
-        rule_score       : 规则引擎打分
-        rule_contributions : 原子因子粒度的贡献度（来自 signals.factors.rule_contributions）
-        regime           : 当时的 market regime（来自 signals.factors.factors.regime）
-        weights_snapshot : 该 regime 下当前生效的权重（用于"当时打分用了哪些权重"溯源）
-        reasoning_excerpt: LLM 思维链前 800 字符（仅审计用，全文走 /signal?include_reasoning）
-    说明：
-        signals.factors 是 JSONB，里面的 rule_contributions 由 service 层在
-        持久化时写入；P2 升级后 contributions 已经是"tf:group.factor_name"粒度。
-    """
-    async with container.db.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, ts, symbol, bias, confidence, factors, source,
-                   reasoning_content
-            FROM signals
-            WHERE id = $1
-            """,
-            signal_id,
-        )
-    if row is None:
-        raise HTTPException(status_code=404, detail="signal_id not found")
-
-    factors_blob = row["factors"] or {}
-    inner_factors = (
-        factors_blob.get("factors")
-        if isinstance(factors_blob, dict) and "factors" in factors_blob
-        else factors_blob
-    )
-    rule_contribs = (
-        factors_blob.get("rule_contributions")
-        if isinstance(factors_blob, dict)
-        else None
-    )
-    rule_score = (
-        factors_blob.get("rule_score")
-        if isinstance(factors_blob, dict)
-        else None
-    )
-    regime = (
-        inner_factors.get("regime")
-        if isinstance(inner_factors, dict)
-        else None
-    ) or "overall"
-
-    # 当前权重表快照（按 regime 取，附带 overall 兜底）
-    weights_snapshot: List[Dict[str, Any]] = []
-    try:
-        weights_rows = await container.repos.fetch_factor_weights_by_regime(regime)
-        weights_snapshot = [
-            {
-                "timeframe": r["timeframe"],
-                "factor_group": r["factor_group"],
-                "factor_name": r["factor_name"],
-                "weight": float(r["weight"]),
-                "ic_30d": float(r["ic_30d"]) if r["ic_30d"] is not None else None,
-                "ic_90d": float(r["ic_90d"]) if r["ic_90d"] is not None else None,
-                "sample_count": r["sample_count"],
-            }
-            for r in weights_rows
-        ]
-    except Exception:
-        weights_snapshot = []
-
-    reasoning = row.get("reasoning_content") or ""
-    excerpt = reasoning[:800] if isinstance(reasoning, str) else ""
-
-    return {
-        "signal_id": row["id"],
-        "ts": row["ts"].isoformat(),
-        "symbol": row["symbol"],
-        "bias": row["bias"],
-        "confidence": float(row["confidence"]),
-        "source": row["source"],
-        "regime": regime,
-        "rule_score": rule_score,
-        "rule_contributions": rule_contribs or {},
-        "weights_snapshot": weights_snapshot,
-        "reasoning_excerpt": excerpt,
-        "reasoning_total_chars": len(reasoning) if isinstance(reasoning, str) else 0,
-    }
-
-
-@router.get("/factors/weights/current", tags=["factors", "p2"])
-async def get_current_factor_weights(
-    regime: Optional[str] = Query(
-        default=None,
-        description="按 regime 过滤；不传则返回全表",
-    ),
-    container: AppContainer = Depends(get_container),
-) -> Dict[str, Any]:
-    """
-    返回当前生效的因子权重（按 regime 维度过滤；不传 regime 则返回全表）
-    -------------------------------------------------------------------
-    用途：
-        前端展示 "当前 regime=trending_up 下，net_flow_usd 在 5m 上权重 0.18"
-        这种归因细节；同时给运维 / 量化研究员一个"快速查看 IC 校准结果"的入口。
-    """
-    if regime:
-        rows = await container.repos.fetch_factor_weights_by_regime(regime)
-    else:
-        rows = await container.repos.fetch_all_factor_weights()
-    return {
-        "count": len(rows),
-        "regime_filter": regime,
-        "shadow_mode": bool(
-            getattr(container.settings, "ic_calibrator_shadow_mode", True)
-        ),
-        "weights": [
-            {
-                "regime": r["regime"],
-                "timeframe": r["timeframe"],
-                "factor_group": r["factor_group"],
-                "factor_name": r["factor_name"],
-                "weight": float(r["weight"]),
-                "ic_30d": float(r["ic_30d"]) if r["ic_30d"] is not None else None,
-                "ic_90d": float(r["ic_90d"]) if r["ic_90d"] is not None else None,
-                "sample_count": r["sample_count"],
-                "updated_at": (
-                    r["updated_at"].isoformat()
-                    if r.get("updated_at") is not None
-                    else None
-                ),
-            }
-            for r in rows
-        ],
-    }
-
-
-@router.get("/signals/lifecycle/stats", tags=["signal", "p2"])
-async def get_lifecycle_stats(
-    symbol: Optional[str] = Query(default=None),
-    days: int = Query(default=7, ge=1, le=180),
-    container: AppContainer = Depends(get_container),
-) -> Dict[str, Any]:
-    """
-    近 N 天信号胜率 / 平均 RR / 平均 PnL / 各 regime 下的命中率
-    -------------------------------------------------------------------
-    参数：
-        symbol: 合约代码；缺省取 settings.symbols[0]
-        days  : 统计窗口（天），上限 180 天，避免误传巨大窗口拖垮 DB
-    返回：
-        {
-          "symbol": ...,
-          "since": ...,
-          "total": ..,
-          "win_rate": float,
-          "avg_pnl_pct": float,
-          "avg_rr": float,
-          "by_regime": {regime: {...}}
-        }
-    """
-    sym = _resolve_symbol(symbol, container)
-    since = datetime.now(timezone.utc) - timedelta(days=int(days))
-    stats = await container.repos.fetch_lifecycle_stats(symbol=sym, since=since)
-    return {
-        "symbol": sym,
-        "since": since.isoformat(),
-        "days": days,
-        **stats,
-    }
-
-
-@router.post("/admin/calibrate-ic", tags=["admin", "p2"])
-async def admin_calibrate_ic(
-    container: AppContainer = Depends(get_container),
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
-) -> Dict[str, Any]:
-    """
-    手动立刻触发一次 IC 校准（不等待下一个周期）
-    -------------------------------------------------------------------
-    Header：
-        X-Admin-Token : 必须等于 settings.ic_calibrator_admin_token；
-                         token 留空时本接口直接 403（避免误暴露重计算入口）。
-    返回：
-        校准报告摘要（与 logs/ic_calibration_*.json 对齐）。
-    说明：
-        - 任务内部带 asyncio.Lock，与 cron 周期任务串行，不会并发跑两轮；
-        - container.ic_calibrator 为 None 时（开关关闭）返回 503。
-    """
-    expected = (container.settings.ic_calibrator_admin_token or "").strip()
-    if not expected:
-        raise HTTPException(
-            status_code=403,
-            detail="admin calibrate disabled: ic_calibrator_admin_token is empty",
-        )
-    if (x_admin_token or "").strip() != expected:
-        raise HTTPException(status_code=401, detail="invalid admin token")
-
-    if container.ic_calibrator is None:
-        raise HTTPException(
-            status_code=503, detail="IC calibrator is disabled at startup"
-        )
-    report = await container.ic_calibrator.run_once(triggered_by="admin")
-    return {
-        "ran_at": report.ran_at.isoformat(),
-        "finished_at": report.finished_at.isoformat(),
-        "skipped": report.skipped,
-        "skipped_reason": report.skipped_reason,
-        "total_signals_30d": report.total_signals_30d,
-        "total_signals_90d": report.total_signals_90d,
-        "total_records_30d": report.total_records_30d,
-        "groups_updated": report.groups_updated,
-        "groups_skipped_low_sample": report.groups_skipped_low_sample,
-        "weights_written": report.weights_written,
-    }
 
 
 # ======================================================================
@@ -581,17 +319,10 @@ async def admin_calibrate_ic(
 # 设计原则：
 #   - 路径 /emails 而非 /admin/emails，方便前端配置页直接调用；
 #   - 所有写操作都做"邮箱格式预校验 + 唯一约束错误友好转换"；
-#   - 输出统一走 _serialize_notification_email_row，前端拿到的字段固定。
+#   - 输出统一走 _serialize_notification_email_row。
 # ======================================================================
 def _serialize_notification_email_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    把 notification_emails 表行序列化为前端友好的 dict
-    --------------------------------------------------------------
-    参数：
-        row : repos 返回的 dict（包含 datetime / bool 等原始字段）
-    返回：
-        统一格式的 dict（datetime 统一 ISO8601 字符串）
-    """
+    """把 notification_emails 表行序列化为前端友好的 dict"""
     created_at = row.get("created_at")
     updated_at = row.get("updated_at")
     return {
@@ -609,14 +340,7 @@ async def list_notification_emails(
     only_enabled: bool = Query(default=False, description="仅返回启用的收件人"),
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    列出所有邮件通知收件人
-    --------------------------------------------------------------
-    参数：
-        only_enabled : True 时仅返回 enabled=TRUE 的行；默认 False 看全部
-    返回：
-        {"count": N, "items": [...]}
-    """
+    """列出所有邮件通知收件人"""
     rows = await container.repos.list_notification_emails(only_enabled=only_enabled)
     items = [_serialize_notification_email_row(r) for r in rows]
     return {"count": len(items), "items": items}
@@ -627,19 +351,7 @@ async def create_notification_email(
     payload: NotificationEmailCreate,
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    新增一条邮件通知收件人
-    --------------------------------------------------------------
-    入参（JSON Body）：
-        email   : 收件邮箱（必填）
-        name    : 备注名（可空）
-        enabled : 是否启用（默认 True）
-    返回：
-        新建行的完整 dict
-    错误：
-        400 - 邮箱格式非法
-        409 - 邮箱已存在
-    """
+    """新增一条邮件通知收件人。错误：400 格式 / 409 唯一冲突。"""
     email = _validate_email_str(payload.email)
     try:
         row = await container.repos.insert_notification_email(
@@ -648,7 +360,6 @@ async def create_notification_email(
             enabled=bool(payload.enabled),
         )
     except Exception as exc:  # noqa: BLE001
-        # asyncpg 的 UniqueViolationError 路径
         msg = str(exc)
         if "notification_emails_unique" in msg or "duplicate key" in msg.lower():
             raise HTTPException(
@@ -663,12 +374,7 @@ async def get_notification_email(
     email_id: int,
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    按 id 查询单条邮件通知收件人详情
-    --------------------------------------------------------------
-    错误：
-        404 - id 不存在
-    """
+    """按 id 查询单条邮件通知收件人详情"""
     row = await container.repos.fetch_notification_email_by_id(email_id)
     if not row:
         raise HTTPException(status_code=404, detail="未找到对应邮箱")
@@ -681,14 +387,7 @@ async def update_notification_email(
     payload: NotificationEmailUpdate,
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    更新一条邮件通知收件人（PATCH 语义：未提供的字段保持不变）
-    --------------------------------------------------------------
-    错误：
-        400 - 邮箱格式非法
-        404 - id 不存在
-        409 - 修改后的邮箱与他人冲突
-    """
+    """更新一条邮件通知收件人（PATCH 语义：未提供的字段保持不变）"""
     new_email: Optional[str] = None
     if payload.email is not None:
         new_email = _validate_email_str(payload.email)
@@ -716,12 +415,7 @@ async def delete_notification_email(
     email_id: int,
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    删除一条邮件通知收件人
-    --------------------------------------------------------------
-    错误：
-        404 - id 不存在
-    """
+    """删除一条邮件通知收件人"""
     ok = await container.repos.delete_notification_email(email_id)
     if not ok:
         raise HTTPException(status_code=404, detail="未找到对应邮箱")
@@ -733,16 +427,7 @@ async def send_test_notification_email(
     payload: TestEmailRequest,
     container: AppContainer = Depends(get_container),
 ) -> Dict[str, Any]:
-    """
-    发送一封测试邮件（用于校验 SMTP 配置是否正确）
-    --------------------------------------------------------------
-    入参：
-        email : 测试收件邮箱
-    错误：
-        400 - 邮箱格式非法
-        503 - 邮件通知未启用 / Resend 凭据缺失
-        500 - Resend HTTP API 实际发送失败
-    """
+    """发送一封测试邮件（用于校验 Resend 配置是否正确）"""
     email = _validate_email_str(payload.email)
     sender = container.email_sender
     if sender is None or not sender.enabled:
@@ -753,9 +438,6 @@ async def send_test_notification_email(
     try:
         resp = await sender.send_test_email(email)
     except Exception as exc:  # noqa: BLE001
-        # _send_one_blocking 已经把 Resend 原始异常压成 RuntimeError 并带上
-        # status / type / msg；直接把 str(exc) 透回前端，方便排查
-        # "from 不是已验证域名 / API Key 无效 / 收件人不在沙盒白名单内" 这类问题。
         raise HTTPException(
             status_code=500,
             detail=(

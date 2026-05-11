@@ -49,24 +49,14 @@ from typing import Any, Dict, List, Optional
 
 from app.config import Settings
 from app.data_storage.repositories import Repositories
-from app.factor_engine.capital_flow import (
-    compute_capital_flow,
-    compute_capital_flow_from_klines,
-)
+from app.factor_engine.capital_flow import compute_capital_flow_from_klines
 from app.factor_engine.derivatives import (
-    compute_derivatives_factors,
     compute_derivatives_per_timeframe,
     compute_position_ratio_factors,
 )
 from app.factor_engine.liquidity import build_liquidity_map
-from app.factor_engine.market_structure import (
-    compute_market_structure,
-    compute_market_structure_from_klines,
-)
-from app.factor_engine.orderbook import (
-    compute_orderbook_factors,
-    compute_orderbook_factors_timeseries,
-)
+from app.factor_engine.market_structure import compute_market_structure_from_klines
+from app.factor_engine.orderbook import compute_orderbook_factors_timeseries
 from app.factor_engine.regime import detect_regime
 from app.logging_config import get_logger
 
@@ -100,14 +90,18 @@ def _ob_static_view(ob_factors: Dict[str, Any]) -> Dict[str, Any]:
 
 class FactorAggregator:
     """
-    因子聚合器
+    因子聚合器（LLM-First 架构下永远走多周期路径）
     -----------------------------------------------------------------
     职责：
-        - 当 settings.enable_mtf_factors=True：按 MTF_TIMEFRAMES 拉取多周期
-          K 线表 + funding/OI + 最新订单簿 + 最近 1h 爆仓，组合成多周期
-          因子矩阵 + mtf_alignment 共振 + liquidations 滚动窗口。
-        - 当 settings.enable_mtf_factors=False：回退到老聚合器路径
-          （30 分钟单一窗口 + trades 重采样），保证灰度回滚一键生效。
+        按 MTF_TIMEFRAMES 拉取多周期 K 线表 + funding/OI + 最新订单簿
+        + 最近 1h 爆仓，组合成多周期因子矩阵 + mtf_alignment 共振
+        + liquidations 滚动窗口 + regime + 流动性地图 + 持仓比。
+
+    LLM-First 重构：
+        删除 ``_compute_legacy`` 回滚通道与 ``enable_mtf_factors`` /
+        ``enable_orderbook_timeseries`` / ``enable_position_ratios`` /
+        ``enable_regime`` 4 个灰度 flag。MTF / 订单簿时序 / 持仓比 /
+        regime 全部永远开启。
     """
 
     def __init__(self, repos: Repositories, settings: Settings):
@@ -128,52 +122,13 @@ class FactorAggregator:
         参数：
             symbol: 合约代码，例如 'ETH-USDT-SWAP'
         返回：
-            多周期模式：见模块顶部的 by_timeframe / mtf_alignment / liquidations 结构
-            老模式：单层 dict（capital_flow / orderbook / derivatives / market_structure）
+            模块顶部说明的 by_timeframe / mtf_alignment / liquidations /
+            regime / liquidity / position_ratios 完整结构。
         """
-        if not self.settings.enable_mtf_factors:
-            return await self._compute_legacy(symbol)
         return await self._compute_mtf(symbol)
 
     # ------------------------------------------------------------------
-    # 老聚合（回滚通道）
-    # ------------------------------------------------------------------
-    async def _compute_legacy(self, symbol: str) -> Dict[str, Any]:
-        """
-        老版聚合：30 分钟窗口的单层因子 dict
-        -------------------------------------------------------------
-        参数：
-            symbol: 合约代码
-        返回：
-            单层 dict，与 P0 升级前的 schema 完全一致。
-        """
-        window = self.settings.factor_window_seconds
-        since = datetime.now(timezone.utc) - timedelta(seconds=window)
-
-        trades = await self.repos.fetch_recent_trades(symbol, since=since, limit=20000)
-        orderbook = await self.repos.fetch_latest_orderbook(symbol)
-        funding = await self.repos.fetch_latest_funding(symbol)
-        oi_history = await self.repos.fetch_recent_oi(symbol, since=since, limit=2000)
-
-        capital = compute_capital_flow(trades)
-        ob = compute_orderbook_factors(
-            orderbook, wall_multiplier=self.settings.liquidity_wall_multiplier
-        )
-        deriv = compute_derivatives_factors(funding, oi_history)
-        struct = compute_market_structure(trades)
-
-        return {
-            "symbol": symbol,
-            "window_seconds": window,
-            "computed_at": datetime.now(timezone.utc).isoformat(),
-            "capital_flow": capital,
-            "orderbook": ob,
-            "derivatives": deriv,
-            "market_structure": struct,
-        }
-
-    # ------------------------------------------------------------------
-    # 多周期聚合（P0 主路径）
+    # 多周期聚合（唯一路径）
     # ------------------------------------------------------------------
     async def _compute_mtf(self, symbol: str) -> Dict[str, Any]:
         """
@@ -198,39 +153,36 @@ class FactorAggregator:
         liq_since = now - timedelta(seconds=2 * 3600)
         liquidations = await self.repos.fetch_liquidations_since(symbol, liq_since)
 
-        # ---- P1：订单簿时序 / 持仓比 / 7 天 funding 历史 ----
-        # 三块都只在对应开关打开时拉，关闭时退化到 P0 行为。
+        # ---- 订单簿时序 / 持仓比 / 7 天 funding 历史（永远开启）----
         recent_orderbook_metrics: List[Dict[str, Any]] = []
-        if bool(getattr(self.settings, "enable_orderbook_timeseries", False)):
-            ob_metric_window = int(
-                getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
+        ob_metric_window = int(
+            getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
+        )
+        try:
+            recent_orderbook_metrics = await self.repos.fetch_orderbook_metrics_since(
+                symbol=symbol,
+                since=now - timedelta(seconds=ob_metric_window),
             )
-            try:
-                recent_orderbook_metrics = await self.repos.fetch_orderbook_metrics_since(
-                    symbol=symbol,
-                    since=now - timedelta(seconds=ob_metric_window),
-                )
-            except Exception:
-                logger.warning(
-                    "拉取 orderbook_metrics 失败，退化为单快照模式 symbol=%s",
-                    symbol,
-                    exc_info=True,
-                )
-                recent_orderbook_metrics = []
+        except Exception:
+            logger.warning(
+                "拉取 orderbook_metrics 失败，退化为单快照模式 symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+            recent_orderbook_metrics = []
 
         latest_position_ratios: Dict[str, Dict[str, Any]] = {}
-        if bool(getattr(self.settings, "enable_position_ratios", False)):
-            try:
-                latest_position_ratios = await self.repos.fetch_latest_position_ratios(
-                    symbol
-                )
-            except Exception:
-                logger.warning(
-                    "拉取 position_ratios 失败，散户/精英多空比将为 None symbol=%s",
-                    symbol,
-                    exc_info=True,
-                )
-                latest_position_ratios = {}
+        try:
+            latest_position_ratios = await self.repos.fetch_latest_position_ratios(
+                symbol
+            )
+        except Exception:
+            logger.warning(
+                "拉取 position_ratios 失败，散户/精英多空比将为 None symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+            latest_position_ratios = {}
 
         funding_history: List[Dict[str, Any]] = []
         try:
@@ -247,24 +199,18 @@ class FactorAggregator:
                 exc_info=True,
             )
 
-        # 订单簿因子：P1 走时序版，回退到 P0 单快照
-        if bool(getattr(self.settings, "enable_orderbook_timeseries", False)):
-            ob_factors = compute_orderbook_factors_timeseries(
-                latest_snapshot=orderbook,
-                recent_metrics=recent_orderbook_metrics,
-                wall_multiplier=self.settings.liquidity_wall_multiplier,
-                now=now,
-                window_seconds=int(
-                    getattr(self.settings, "orderbook_metrics_window_seconds", 900)
-                ),
-                baseline_seconds=int(
-                    getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
-                ),
-            )
-        else:
-            ob_factors = compute_orderbook_factors(
-                orderbook, wall_multiplier=self.settings.liquidity_wall_multiplier
-            )
+        ob_factors = compute_orderbook_factors_timeseries(
+            latest_snapshot=orderbook,
+            recent_metrics=recent_orderbook_metrics,
+            wall_multiplier=self.settings.liquidity_wall_multiplier,
+            now=now,
+            window_seconds=int(
+                getattr(self.settings, "orderbook_metrics_window_seconds", 900)
+            ),
+            baseline_seconds=int(
+                getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
+            ),
+        )
 
         lookback = int(self.settings.mtf_lookback_bars)
 
@@ -309,26 +255,25 @@ class FactorAggregator:
             liquidations=liquidations, now=now,
         )
 
-        # P1：regime 检测（默认开启；关闭时挂 None）
+        # regime 检测（永远开启；失败时挂 None）
         regime: Optional[str] = None
-        if bool(getattr(self.settings, "enable_regime", False)):
-            try:
-                regime = detect_regime(
-                    by_timeframe=by_timeframe,
-                    bb_width_history_4h=self._collect_bb_width_history(by_timeframe, "4h"),
-                    bb_width_history_15m=self._collect_bb_width_history(by_timeframe, "15m"),
-                    adx_trending_threshold=float(
-                        getattr(self.settings, "regime_adx_trending_threshold", 25.0)
-                    ),
-                    adx_ranging_threshold=float(
-                        getattr(self.settings, "regime_adx_ranging_threshold", 18.0)
-                    ),
-                )
-            except Exception:
-                logger.warning(
-                    "regime 检测失败，回退到 None symbol=%s", symbol, exc_info=True
-                )
-                regime = None
+        try:
+            regime = detect_regime(
+                by_timeframe=by_timeframe,
+                bb_width_history_4h=self._collect_bb_width_history(by_timeframe, "4h"),
+                bb_width_history_15m=self._collect_bb_width_history(by_timeframe, "15m"),
+                adx_trending_threshold=float(
+                    getattr(self.settings, "regime_adx_trending_threshold", 25.0)
+                ),
+                adx_ranging_threshold=float(
+                    getattr(self.settings, "regime_adx_ranging_threshold", 18.0)
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "regime 检测失败，回退到 None symbol=%s", symbol, exc_info=True
+            )
+            regime = None
 
         # P1：流动性地图
         try:

@@ -3,6 +3,10 @@
 从 :class:`Settings` 构建并装配所有长生命周期组件。容器在 FastAPI 的
 lifespan 中实例化一次并挂载到 ``app.state``；路由通过
 :mod:`app.api_service.deps` 拉取依赖。
+
+LLM-First 重构后这里**只**装配数据采集 / 因子聚合 / LLM Agent / 邮件
+通知 4 类组件，不再创建 RuleEngine / ICCalibrator / LifecycleTracker /
+SignalEvaluator —— 这些模块都被整体删除（plan 第 1.1 / 1.5 节）。
 """
 from __future__ import annotations
 
@@ -18,14 +22,10 @@ from app.data_ingestion.runner import IngestionRunner
 from app.data_storage.database import Database
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
-from app.factor_engine.ic_calibrator import ICCalibrator
 from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
 from app.notification.email_sender import EmailSender
-from app.signal_engine.evaluator import SignalEvaluator
-from app.signal_engine.lifecycle import LifecycleTracker
 from app.signal_engine.llm_agent import LLMAgent
-from app.signal_engine.rules import RuleEngine
 from app.signal_engine.service import SignalService
 
 logger = get_logger(__name__)
@@ -50,21 +50,14 @@ class AppContainer:
     okx_rest: OKXRestClient
     onchain: Optional[MockOnchainProvider]
     factor_aggregator: FactorAggregator
-    rule_engine: RuleEngine
     llm_agent: LLMAgent
     email_sender: EmailSender
     signal_service: SignalService
     ingestion_runner: Optional[IngestionRunner] = field(default=None)
     # 启动后台周期刷新合约面值的任务句柄；shutdown 时一并取消，避免泄漏
     instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
-    # P0：多周期 K 线增量聚合器；enable_mtf_factors=False 时不创建（None）
+    # 多周期 K 线增量聚合器（LLM-First 架构下永远启用）
     kline_aggregator: Optional[KlineAggregator] = field(default=None)
-    # P2：IC 校准任务；enable_factor_weights_table=False 时不创建（None）
-    ic_calibrator: Optional[ICCalibrator] = field(default=None)
-    # P2：信号生命周期跟踪任务；enable_lifecycle_tracking=False 时不创建（None）
-    lifecycle_tracker: Optional[LifecycleTracker] = field(default=None)
-    # P3：信号评估后台任务；enable_signal_evaluation=False 时不创建（None）
-    signal_evaluator: Optional[SignalEvaluator] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
@@ -101,7 +94,6 @@ class AppContainer:
         # OKX 经常每次 ConnectTimeout，导致冷启动多花 ≈120s。
         # 现在改成：先用 default_contract_value 占位让服务立刻起来，
         # 同时启动一个后台任务异步拉真值并写回 OKXWebSocketClient。
-        # ctVal 默认 0.1（ETH-USDT-SWAP）即便取不到真值也不会偏离太多。
         contract_values: Dict[str, float] = {
             sym: settings.default_contract_value for sym in settings.symbols
         }
@@ -135,65 +127,28 @@ class AppContainer:
             rest_client=okx_rest,
         )
 
-        # ---- Factor + signal ----
+        # ---- Factor + signal（LLM-First 决策核心）----
         factor_aggregator = FactorAggregator(repos=repos, settings=settings)
-        # P2：rule_engine 现在持有 repos 用来查 factor_weights 表（带 5min 缓存）
-        rule_engine = RuleEngine(settings=settings, repos=repos)
         llm_agent = LLMAgent(settings=settings, repos=repos)
         # 邮件通知发送器：当 LLM 给出明确方向时（long/short）异步给 notification_emails
         # 表里所有 enabled=TRUE 的邮箱推送一封 HTML 提醒邮件。
-        # observe / 缓存命中不发；未配置 SMTP 凭据时整体降级为 no-op。
+        # observe / 缓存命中不发；未配置 Resend 凭据时整体降级为 no-op。
         email_sender = EmailSender(settings=settings)
         signal_service = SignalService(
             repos=repos,
             factor_aggregator=factor_aggregator,
-            rule_engine=rule_engine,
             llm_agent=llm_agent,
             email_sender=email_sender,
         )
 
-        # ---- P0：多周期 K 线增量聚合器 ----
-        # 仅当开关打开时创建实例并启动；关闭时维持 None，跳过所有 K 线写入，
-        # FactorAggregator 自己会回退到老的 30 分钟单一窗口路径。
-        kline_aggregator: Optional[KlineAggregator] = None
-        if bool(getattr(settings, "enable_mtf_factors", False)):
-            kline_aggregator = KlineAggregator(
-                repos=repos,
-                settings=settings,
-                exchange="okx",
-            )
-
-        # ---- P2：IC 校准 + 生命周期跟踪 ----
-        # 两个独立开关：任意一个关闭都不会破坏 P0/P1 行为，方便灰度上线。
-        ic_calibrator: Optional[ICCalibrator] = None
-        if bool(getattr(settings, "enable_factor_weights_table", False)):
-            # 默认对配置里的第一个 symbol 跑校准。
-            # 多 symbol 部署时可以扩展为 list[ICCalibrator]，本期保持单实例。
-            primary_symbol = (
-                settings.symbols[0] if settings.symbols else "ETH-USDT-SWAP"
-            )
-            ic_calibrator = ICCalibrator(
-                settings=settings, repos=repos, symbol=primary_symbol
-            )
-
-        lifecycle_tracker: Optional[LifecycleTracker] = None
-        if bool(getattr(settings, "enable_lifecycle_tracking", False)):
-            lifecycle_tracker = LifecycleTracker(
-                settings=settings,
-                repos=repos,
-                symbols=list(settings.symbols),
-            )
-
-        # ---- P3：信号评估后台任务 ----
-        # 仅当总开关打开时创建实例并启动；关闭时维持 None，prompt 注入路径
-        # 拿不到 24h 评估摘要会自然降级为"无系统级评估数据"，行为与 P2 一致。
-        signal_evaluator: Optional[SignalEvaluator] = None
-        if bool(getattr(settings, "enable_signal_evaluation", False)):
-            signal_evaluator = SignalEvaluator(
-                settings=settings,
-                repos=repos,
-                symbols=list(settings.symbols),
-            )
+        # ---- 多周期 K 线增量聚合器 ----
+        # LLM-First 架构下 MTF 因子永远开启（NarrativeRenderer 7 段叙事
+        # 全部依赖 by_timeframe）；不再有 enable_mtf_factors 灰度路径。
+        kline_aggregator = KlineAggregator(
+            repos=repos,
+            settings=settings,
+            exchange="okx",
+        )
 
         return cls(
             settings=settings,
@@ -202,16 +157,12 @@ class AppContainer:
             okx_rest=okx_rest,
             onchain=onchain,
             factor_aggregator=factor_aggregator,
-            rule_engine=rule_engine,
             llm_agent=llm_agent,
             email_sender=email_sender,
             signal_service=signal_service,
             ingestion_runner=runner,
             instrument_refresh_task=instrument_refresh_task,
             kline_aggregator=kline_aggregator,
-            ic_calibrator=ic_calibrator,
-            lifecycle_tracker=lifecycle_tracker,
-            signal_evaluator=signal_evaluator,
         )
 
     @staticmethod
@@ -276,16 +227,7 @@ class AppContainer:
                 await self.instrument_refresh_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        # P3：先停信号评估器；它只读 signals/lifecycle 不写主表，
-        # 关停顺序放在 lifecycle 之前避免最后一轮评估读到半结算状态。
-        if self.signal_evaluator is not None:
-            await self.signal_evaluator.stop()
-        # P2：先停 lifecycle / IC 任务，避免它们在 shutdown 期间还在写表
-        if self.lifecycle_tracker is not None:
-            await self.lifecycle_tracker.stop()
-        if self.ic_calibrator is not None:
-            await self.ic_calibrator.stop()
-        # P0：先停 K 线聚合器再停采集，保证关闭时不会再有"读 trades / 写 klines"
+        # 先停 K 线聚合器再停采集，保证关闭时不会再有"读 trades / 写 klines"
         # 的协程在飞，避免与连接池关闭竞态。
         if self.kline_aggregator is not None:
             await self.kline_aggregator.stop()

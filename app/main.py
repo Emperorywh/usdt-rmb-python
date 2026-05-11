@@ -30,22 +30,11 @@ async def lifespan(app: FastAPI):
 
     if container.ingestion_runner is not None:
         await container.ingestion_runner.start()
-    # P0：启动多周期 K 线增量聚合器（仅在 enable_mtf_factors=True 时创建实例）
-    # 1m / 5m 每秒一次；15m / 1h 每 10 秒一次；4h / 1d 每分钟一次。
+    # 启动多周期 K 线增量聚合器：1m/5m 每秒一次，15m/1h 每 10 秒，4h/1d 每分钟。
     if container.kline_aggregator is not None:
         await container.kline_aggregator.start(symbols=list(settings.symbols))
-    # P2：启动 IC 校准 + 信号生命周期跟踪后台任务
-    # （任一开关关闭则容器里对应字段为 None，这里跳过启动；既不查表也不写表）。
-    if container.ic_calibrator is not None:
-        await container.ic_calibrator.start()
-    if container.lifecycle_tracker is not None:
-        await container.lifecycle_tracker.start()
-    # P3：启动信号评估后台任务（enable_signal_evaluation=False 时为 None，跳过）。
-    # 与 lifecycle_tracker 同一启动点：评估器读 lifecycle 数据，必须晚于
-    # lifecycle_tracker 启动，但又必须早于 signal_service 跑出第一条信号——
-    # 当前位置完全满足这个偏序约束。
-    if container.signal_evaluator is not None:
-        await container.signal_evaluator.start()
+    # LLM-First 架构下不再启动 IC 校准 / 生命周期跟踪 / 信号评估后台任务——
+    # 这三个模块整体删除（plan 第 1.1 / 1.5 节）。
     await container.signal_service.start_periodic(
         symbols=settings.symbols,
         interval_seconds=settings.signal_interval_seconds,

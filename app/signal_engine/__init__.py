@@ -1,1 +1,1 @@
-"""Signal engine: rule-based + LangChain LLM trading signal generator."""
+"""Signal engine: LLM-Native trading signal generator (LangChain + DeepSeek)."""

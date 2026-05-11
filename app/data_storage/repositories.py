@@ -913,50 +913,35 @@ class Repositories:
         self, symbol: str
     ) -> Optional[Dict[str, Any]]:
         """
-        读取指定 symbol 最近一条信号的"全字段视图"（含 P0 结构化交易计划 + lifecycle）
+        读取指定 symbol 最近一条信号的"全字段视图"（结构化交易计划）
         ---------------------------------------------------------------
         参数：
             symbol: 合约代码
         返回：
-            dict（不存在则返回 None），字段包含：
-                - signals 表全部列（id / ts / bias / confidence / reason / risk /
-                  suggestion / factors / source / reasoning_content /
-                  entry_zone / stop_loss / take_profit / risk_reward_ratio /
-                  position_size_pct / timeframe_alignment / invalidation_conditions）
-                - 通过 LEFT JOIN signal_lifecycle 拼上的实战结果列：
-                  lifecycle_status / triggered_at / triggered_price /
-                  exit_at / exit_price / pnl_pct / max_favorable_pct /
-                  max_adverse_pct / lifecycle_expires_at / lifecycle_updated_at
+            dict（不存在则返回 None），字段为 signals 表全部列：
+                id / ts / bias / confidence / reason / risk / suggestion /
+                factors / source / reasoning_content / entry_zone /
+                stop_loss / take_profit / risk_reward_ratio /
+                position_size_pct / timeframe_alignment /
+                invalidation_conditions
         说明：
-            - 专供前端"分析卡片 / 详情页"使用，一次拿齐所有可视化字段，
-              避免前端串行多次调用 /signal + /signals/{id}/attribution + lifecycle stats。
-            - LEFT JOIN：未启用 lifecycle_tracking 或 lifecycle 行尚未生成时，
-              JOIN 出来的列会全为 NULL，前端按 None 处理即可。
+            - 专供前端"分析卡片 / 详情页"使用，一次拿齐所有可视化字段。
+            - LLM-First 重构后 signal_lifecycle 表已被整体删除；前端如需
+              "信号实战结果"列请走业务侧自己跟踪。
         """
         async with self.db.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    s.id, s.ts, s.symbol, s.bias, s.confidence,
-                    s.reason, s.risk, s.suggestion,
-                    s.factors, s.source, s.reasoning_content,
-                    s.entry_zone, s.stop_loss, s.take_profit,
-                    s.risk_reward_ratio, s.position_size_pct,
-                    s.timeframe_alignment, s.invalidation_conditions,
-                    sl.status        AS lifecycle_status,
-                    sl.triggered_at  AS lifecycle_triggered_at,
-                    sl.triggered_price,
-                    sl.exit_at       AS lifecycle_exit_at,
-                    sl.exit_price,
-                    sl.pnl_pct,
-                    sl.max_favorable_pct,
-                    sl.max_adverse_pct,
-                    sl.expires_at    AS lifecycle_expires_at,
-                    sl.updated_at    AS lifecycle_updated_at
-                FROM signals s
-                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
-                WHERE s.symbol = $1
-                ORDER BY s.ts DESC
+                    id, ts, symbol, bias, confidence,
+                    reason, risk, suggestion,
+                    factors, source, reasoning_content,
+                    entry_zone, stop_loss, take_profit,
+                    risk_reward_ratio, position_size_pct,
+                    timeframe_alignment, invalidation_conditions
+                FROM signals
+                WHERE symbol = $1
+                ORDER BY ts DESC
                 LIMIT 1
                 """,
                 symbol,
@@ -972,59 +957,41 @@ class Repositories:
         only_persisted: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        读取指定 symbol 最近 N 条信号的"全字段视图"（含 lifecycle）
+        读取指定 symbol 最近 N 条信号的"全字段视图"
         ---------------------------------------------------------------
         参数：
             symbol         : 合约代码
             limit          : 返回条数上限（防御性 1~200）
             bias           : 可选过滤，'long' / 'short' / 'neutral'
             source_like    : 可选 ILIKE 模式（如 '%llm%' 只看 LLM 路径）
-            only_persisted : 默认 True；仅返回真正落库的信号（即排除掉
-                             根本没插入 signals 表的纯规则缓存路径——但因为
-                             那种信号本来就没入库，这里 "True" 是 No-op，
-                             保留参数语义便于将来扩展过滤策略）。
+            only_persisted : 默认 True，No-op 占位，保留参数语义。
         返回：
             按 ts 倒序的 dict 列表，字段同 fetch_latest_signal_full。
-        说明：
-            - 专供前端"历史列表 / 时间线"使用；体积比 LIMIT N 个独立查询小得多。
-            - factors 列虽是 JSONB，但每条体积可控（< 50KB）；建议 limit ≤ 50。
         """
         safe_limit = max(1, min(int(limit), 200))
-        clauses = ["s.symbol = $1"]
+        clauses = ["symbol = $1"]
         params: List[Any] = [symbol]
         if bias in ("long", "short", "neutral"):
             params.append(bias)
-            clauses.append(f"s.bias = ${len(params)}")
+            clauses.append(f"bias = ${len(params)}")
         if source_like:
             params.append(source_like)
-            clauses.append(f"s.source ILIKE ${len(params)}")
+            clauses.append(f"source ILIKE ${len(params)}")
         params.append(safe_limit)
         where_sql = " AND ".join(clauses)
         sql = f"""
             SELECT
-                s.id, s.ts, s.symbol, s.bias, s.confidence,
-                s.reason, s.risk, s.suggestion,
-                s.factors, s.source, s.reasoning_content,
-                s.entry_zone, s.stop_loss, s.take_profit,
-                s.risk_reward_ratio, s.position_size_pct,
-                s.timeframe_alignment, s.invalidation_conditions,
-                sl.status        AS lifecycle_status,
-                sl.triggered_at  AS lifecycle_triggered_at,
-                sl.triggered_price,
-                sl.exit_at       AS lifecycle_exit_at,
-                sl.exit_price,
-                sl.pnl_pct,
-                sl.max_favorable_pct,
-                sl.max_adverse_pct,
-                sl.expires_at    AS lifecycle_expires_at,
-                sl.updated_at    AS lifecycle_updated_at
-            FROM signals s
-            LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
+                id, ts, symbol, bias, confidence,
+                reason, risk, suggestion,
+                factors, source, reasoning_content,
+                entry_zone, stop_loss, take_profit,
+                risk_reward_ratio, position_size_pct,
+                timeframe_alignment, invalidation_conditions
+            FROM signals
             WHERE {where_sql}
-            ORDER BY s.ts DESC
+            ORDER BY ts DESC
             LIMIT ${len(params)}
         """
-        # only_persisted 当前为 No-op 占位，避免未使用变量告警
         _ = only_persisted
         async with self.db.acquire() as conn:
             rows = await conn.fetch(sql, *params)
@@ -1034,7 +1001,7 @@ class Repositories:
         self, signal_id: int
     ) -> Optional[Dict[str, Any]]:
         """
-        按 id 读取单条信号的"全字段视图"（含 lifecycle）
+        按 id 读取单条信号的"全字段视图"
         ---------------------------------------------------------------
         参数：
             signal_id: signals.id
@@ -1045,25 +1012,14 @@ class Repositories:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    s.id, s.ts, s.symbol, s.bias, s.confidence,
-                    s.reason, s.risk, s.suggestion,
-                    s.factors, s.source, s.reasoning_content,
-                    s.entry_zone, s.stop_loss, s.take_profit,
-                    s.risk_reward_ratio, s.position_size_pct,
-                    s.timeframe_alignment, s.invalidation_conditions,
-                    sl.status        AS lifecycle_status,
-                    sl.triggered_at  AS lifecycle_triggered_at,
-                    sl.triggered_price,
-                    sl.exit_at       AS lifecycle_exit_at,
-                    sl.exit_price,
-                    sl.pnl_pct,
-                    sl.max_favorable_pct,
-                    sl.max_adverse_pct,
-                    sl.expires_at    AS lifecycle_expires_at,
-                    sl.updated_at    AS lifecycle_updated_at
-                FROM signals s
-                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
-                WHERE s.id = $1
+                    id, ts, symbol, bias, confidence,
+                    reason, risk, suggestion,
+                    factors, source, reasoning_content,
+                    entry_zone, stop_loss, take_profit,
+                    risk_reward_ratio, position_size_pct,
+                    timeframe_alignment, invalidation_conditions
+                FROM signals
+                WHERE id = $1
                 """,
                 signal_id,
             )
@@ -1163,612 +1119,12 @@ class Repositories:
         return _parse_delete_count(result)
 
     # ------------------------------------------------------------------
-    # P2：因子权重表（factor_weights）
+    # LLM-First 重构（plan 第 1.1 节）整体删除以下模块对应的方法：
+    #   - factor_weights / IC 校准（RuleEngine + ICCalibrator 已删）
+    #   - signal_lifecycle（LifecycleTracker 已删）
+    #   - signal_evaluation（SignalEvaluator 已删）
+    # 仅保留 notification_emails（运营功能）+ signals 自身的清理方法。
     # ------------------------------------------------------------------
-    # 设计要点：
-    #   - 同一 (regime, timeframe) 下所有 factor_name 的 weight 总和 = 1.0
-    #     由 IC 校准任务在 UPSERT 之前归一好；这里只负责"原子地批量写入"，
-    #     不在 SQL 层校验总和（PG 没有便宜的"组内求和约束"，引入触发器
-    #     反而会拖慢热路径）。
-    #   - 读侧使用 (regime, timeframe) 的索引一次取出整组权重，
-    #     交给 RuleEngine 按 (factor_group, factor_name) 拼回内存字典。
-    async def upsert_factor_weights(self, rows: Sequence[Dict[str, Any]]) -> int:
-        """
-        批量 UPSERT 因子权重
-        --------------------------------------------------------------
-        参数：
-            rows: 每条字段需含
-                regime / timeframe / factor_group / factor_name / weight
-                可选：ic_30d / ic_90d / sample_count
-        返回：
-            尝试入库的行数（实际 UPSERT 数）。
-        说明：
-            UNIQUE(regime, timeframe, factor_group, factor_name) +
-            ON CONFLICT DO UPDATE：每次校准任务直接覆盖 weight + IC 指标
-            + 样本数 + updated_at；没有跑校准的组合保留旧值（基线种子）。
-        """
-        if not rows:
-            return 0
-        records = [
-            (
-                r["regime"],
-                r["timeframe"],
-                r["factor_group"],
-                r["factor_name"],
-                _to_dec(r["weight"]),
-                _to_dec(r.get("ic_30d")),
-                _to_dec(r.get("ic_90d")),
-                int(r["sample_count"]) if r.get("sample_count") is not None else None,
-                r.get("updated_at") or _utcnow(),
-            )
-            for r in rows
-        ]
-
-        async def _do() -> None:
-            async with self.db.acquire() as conn:
-                await conn.executemany(
-                    """
-                    INSERT INTO factor_weights
-                        (regime, timeframe, factor_group, factor_name,
-                         weight, ic_30d, ic_90d, sample_count, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (regime, timeframe, factor_group, factor_name)
-                    DO UPDATE SET
-                        weight       = EXCLUDED.weight,
-                        ic_30d       = EXCLUDED.ic_30d,
-                        ic_90d       = EXCLUDED.ic_90d,
-                        sample_count = EXCLUDED.sample_count,
-                        updated_at   = EXCLUDED.updated_at
-                    """,
-                    records,
-                )
-
-        await self.db.run_with_retry(_do, op_name="upsert_factor_weights")
-        return len(records)
-
-    async def fetch_all_factor_weights(self) -> List[Dict[str, Any]]:
-        """
-        一次性读出整张 factor_weights 表
-        --------------------------------------------------------------
-        说明：
-            - RuleEngine 启动 / 周期刷新缓存时调用一次即可；表规模上限
-              为 (regime 数 × timeframe 数 × factor 数)，量级 < 数百行，
-              全表扫描成本远低于按 (regime, timeframe) 多次查询的累计开销。
-        返回：
-            含 regime / timeframe / factor_group / factor_name / weight /
-            ic_30d / ic_90d / sample_count / updated_at 的 dict 列表。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT regime, timeframe, factor_group, factor_name,
-                       weight, ic_30d, ic_90d, sample_count, updated_at
-                FROM factor_weights
-                """,
-            )
-        return [dict(r) for r in rows]
-
-    async def fetch_factor_weights_by_regime(
-        self, regime: str
-    ) -> List[Dict[str, Any]]:
-        """
-        按 regime 读取权重（含 overall 兜底），归因 API 用
-        --------------------------------------------------------------
-        参数：
-            regime: 'trending_up' / 'trending_down' / 'ranging' / 'breakout'
-                    / 'breakdown' / 'transitional' / 'overall'
-        返回：
-            dict 列表（仅匹配 regime 的行；'overall' 留给上层合并）。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT regime, timeframe, factor_group, factor_name,
-                       weight, ic_30d, ic_90d, sample_count, updated_at
-                FROM factor_weights
-                WHERE regime = $1
-                ORDER BY timeframe, factor_group, factor_name
-                """,
-                regime,
-            )
-        return [dict(r) for r in rows]
-
-    # ------------------------------------------------------------------
-    # P2：信号生命周期表（signal_lifecycle）
-    # ------------------------------------------------------------------
-    async def insert_signal_lifecycle(
-        self,
-        signal_id: int,
-        symbol: str,
-        bias: str,
-        entry_zone: Optional[List[float]],
-        stop_loss: Optional[float],
-        take_profit: Optional[List[float]],
-        expires_at: datetime,
-    ) -> None:
-        """
-        信号入库后立刻挂一条 pending 的 lifecycle 行
-        --------------------------------------------------------------
-        参数：
-            signal_id   ：刚 INSERT 进 signals 表的自增 id（FK 主键）
-            symbol      ：合约代码
-            bias        ：long / short / neutral；neutral 时可直接置 expired
-            entry_zone  ：[low, high]（可空，长度 2）
-            stop_loss   ：止损价（可空）
-            take_profit ：止盈位列表（可空，原样写入 JSONB）
-            expires_at  ：超时强制结算的 UTC 时间（一般 = 信号 ts + 24h）
-        说明：
-            - neutral 信号也会落 lifecycle，但 status 直接置 expired，
-              方便统一统计"近 N 条已结算判断"。
-            - long/short 缺关键价位的旧 / 异常信号在 lifecycle 任务首轮扫到时
-              会被置 expired，不强行回填。
-        """
-        ez_low: Optional[Decimal] = None
-        ez_high: Optional[Decimal] = None
-        if entry_zone and len(entry_zone) == 2:
-            try:
-                ez_low = _to_dec(min(float(entry_zone[0]), float(entry_zone[1])))
-                ez_high = _to_dec(max(float(entry_zone[0]), float(entry_zone[1])))
-            except (TypeError, ValueError):
-                ez_low = ez_high = None
-
-        initial_status = "expired" if bias == "neutral" else "pending"
-
-        async def _do() -> None:
-            async with self.db.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO signal_lifecycle
-                        (signal_id, symbol, bias,
-                         entry_zone_low, entry_zone_high, stop_loss, take_profit,
-                         status, expires_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, NOW())
-                    ON CONFLICT (signal_id) DO NOTHING
-                    """,
-                    signal_id,
-                    symbol,
-                    bias,
-                    ez_low,
-                    ez_high,
-                    _to_dec(stop_loss),
-                    take_profit,
-                    initial_status,
-                    expires_at,
-                )
-
-        await self.db.run_with_retry(_do, op_name="insert_signal_lifecycle")
-
-    async def fetch_open_signal_lifecycles(
-        self, symbol: Optional[str] = None, limit: int = 500
-    ) -> List[Dict[str, Any]]:
-        """
-        拉取所有 status ∈ {pending, triggered} 的生命周期行
-        --------------------------------------------------------------
-        参数：
-            symbol: 可选过滤；None 时拉全表（多 symbol 部署时配合任务调度用）
-            limit:  防御性上限
-        返回：
-            dict 列表，含 signal_id / symbol / bias / entry_zone_* / stop_loss /
-            take_profit / status / triggered_at / triggered_price /
-            max_favorable_pct / max_adverse_pct / expires_at / created_at。
-        说明：
-            走偏序索引 idx_signal_lifecycle_open_expires，扫描成本 O(未结算行数)。
-        """
-        async with self.db.acquire() as conn:
-            if symbol is None:
-                rows = await conn.fetch(
-                    """
-                    SELECT signal_id, symbol, bias,
-                           entry_zone_low, entry_zone_high, stop_loss, take_profit,
-                           status, triggered_at, triggered_price,
-                           max_favorable_pct, max_adverse_pct,
-                           expires_at, created_at
-                    FROM signal_lifecycle
-                    WHERE status IN ('pending', 'triggered')
-                    ORDER BY expires_at ASC
-                    LIMIT $1
-                    """,
-                    limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT signal_id, symbol, bias,
-                           entry_zone_low, entry_zone_high, stop_loss, take_profit,
-                           status, triggered_at, triggered_price,
-                           max_favorable_pct, max_adverse_pct,
-                           expires_at, created_at
-                    FROM signal_lifecycle
-                    WHERE status IN ('pending', 'triggered') AND symbol = $1
-                    ORDER BY expires_at ASC
-                    LIMIT $2
-                    """,
-                    symbol,
-                    limit,
-                )
-        return [dict(r) for r in rows]
-
-    async def update_signal_lifecycle(
-        self,
-        signal_id: int,
-        *,
-        status: Optional[str] = None,
-        triggered_at: Optional[datetime] = None,
-        triggered_price: Optional[float] = None,
-        exit_at: Optional[datetime] = None,
-        exit_price: Optional[float] = None,
-        pnl_pct: Optional[float] = None,
-        max_favorable_pct: Optional[float] = None,
-        max_adverse_pct: Optional[float] = None,
-    ) -> None:
-        """
-        增量更新一条 lifecycle 行
-        --------------------------------------------------------------
-        说明：
-            - 只动传入的字段（None 表示不更新），最终 updated_at 必更新；
-            - 用 COALESCE($n, 当前列) 让 SQL 一段就能跑完，避免 N 个 UPDATE。
-        """
-        async def _do() -> None:
-            async with self.db.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE signal_lifecycle SET
-                        status            = COALESCE($2, status),
-                        triggered_at      = COALESCE($3, triggered_at),
-                        triggered_price   = COALESCE($4, triggered_price),
-                        exit_at           = COALESCE($5, exit_at),
-                        exit_price        = COALESCE($6, exit_price),
-                        pnl_pct           = COALESCE($7, pnl_pct),
-                        max_favorable_pct = COALESCE($8, max_favorable_pct),
-                        max_adverse_pct   = COALESCE($9, max_adverse_pct),
-                        updated_at        = NOW()
-                    WHERE signal_id = $1
-                    """,
-                    signal_id,
-                    status,
-                    triggered_at,
-                    _to_dec(triggered_price),
-                    exit_at,
-                    _to_dec(exit_price),
-                    _to_dec(pnl_pct),
-                    _to_dec(max_favorable_pct),
-                    _to_dec(max_adverse_pct),
-                )
-
-        await self.db.run_with_retry(_do, op_name="update_signal_lifecycle")
-
-    async def invalidate_pending_lifecycles_for_symbol(
-        self, symbol: str
-    ) -> int:
-        """
-        把同 symbol 下所有 status='pending' 的 lifecycle 行批量 supersede 为 invalidated
-        --------------------------------------------------------------
-        参数：
-            symbol : 合约代码
-        返回：
-            实际被改动的行数（用于日志 / 监控）。
-        语义：
-            - 在 service 写入新一条 pending lifecycle **之前**调用：
-              用"新建议"作废"旧建议"，避免旧的、价格已经走开的 entry_zone 仍
-              堆在表里，等到 24h（旧）/ 90 分钟（新）后批量 expired，污染
-              "近 N 次成绩单"的胜率统计。
-            - 仅作用于 status='pending'（从未入场的）；triggered 行不动，
-              那些是已经入过场、还在跟踪 SL/TP 的真实判断成绩，不能擅自作废。
-            - exit_at 设为 NOW()、exit_price 留空（pending 阶段没有触发价
-              可参考），pnl_pct / 极值字段不写——只是"被新信号取代"，
-              不参与盈亏统计。
-            - 走偏序索引 idx_signal_lifecycle_open_expires，即使表里堆了
-              成千上万的历史行也只扫"未结算"那一小段，成本可控。
-        """
-
-        async def _do() -> int:
-            async with self.db.acquire() as conn:
-                tag = await conn.execute(
-                    """
-                    UPDATE signal_lifecycle
-                       SET status     = 'invalidated',
-                           exit_at    = NOW(),
-                           updated_at = NOW()
-                     WHERE symbol = $1
-                       AND status = 'pending'
-                    """,
-                    symbol,
-                )
-            try:
-                # asyncpg 的 execute 返回类似 'UPDATE 3' 的字符串
-                return int(tag.split()[-1]) if tag else 0
-            except (ValueError, IndexError):
-                return 0
-
-        return await self.db.run_with_retry(
-            _do, op_name="invalidate_pending_lifecycles_for_symbol"
-        )
-
-    async def fetch_recent_settled_lifecycles(
-        self,
-        symbol: str,
-        limit: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """
-        读取指定 symbol 最近 N 条已结算的 lifecycle 行（含 signals 表的元数据）
-        --------------------------------------------------------------
-        参数：
-            symbol : 合约代码
-            limit  : 最近 N 条（默认 5，给 LLM 自我反馈用）
-        返回：
-            dict 列表，按 updated_at 倒序。每条额外带 ts / regime（来自 signals.factors）
-            / confidence / reason，便于 prompt 构造紧凑表格。
-        说明：
-            - 已结算 = status ∈ {sl_hit, tp1_hit, tp2_hit, expired, invalidated}。
-            - 与 signals JOIN 一次拿齐，避免 LLM 路径多打一轮 RTT。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    sl.signal_id, sl.symbol, sl.bias, sl.status,
-                    sl.entry_zone_low, sl.entry_zone_high,
-                    sl.stop_loss, sl.take_profit,
-                    sl.triggered_at, sl.triggered_price,
-                    sl.exit_at, sl.exit_price, sl.pnl_pct,
-                    sl.max_favorable_pct, sl.max_adverse_pct,
-                    sl.created_at, sl.updated_at, sl.expires_at,
-                    s.ts AS signal_ts,
-                    s.confidence,
-                    s.reason,
-                    s.factors
-                FROM signal_lifecycle sl
-                JOIN signals s ON s.id = sl.signal_id
-                WHERE sl.symbol = $1
-                  AND sl.status IN ('sl_hit', 'tp1_hit', 'tp2_hit',
-                                    'expired', 'invalidated')
-                ORDER BY sl.updated_at DESC
-                LIMIT $2
-                """,
-                symbol,
-                limit,
-            )
-        return [dict(r) for r in rows]
-
-    async def fetch_open_signal_lifecycle_for_symbol(
-        self, symbol: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        读取指定 symbol 最近一条 status ∈ {pending, triggered} 的 lifecycle
-        --------------------------------------------------------------
-        说明：
-            LLM 自我反馈的 SYSTEM_PROMPT 约束需要它："如果上一条信号还在
-            triggered，新判断方向不能与其相反"。
-        """
-        async with self.db.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT signal_id, symbol, bias, status,
-                       entry_zone_low, entry_zone_high,
-                       stop_loss, take_profit,
-                       triggered_at, triggered_price,
-                       max_favorable_pct, max_adverse_pct,
-                       created_at, expires_at
-                FROM signal_lifecycle
-                WHERE symbol = $1
-                  AND status IN ('pending', 'triggered')
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                symbol,
-            )
-        return dict(row) if row else None
-
-    async def fetch_lifecycle_stats(
-        self,
-        symbol: str,
-        since: datetime,
-    ) -> Dict[str, Any]:
-        """
-        近 N 天信号胜率 / 平均 RR / 平均 PnL / 各 regime 命中率（API 用）
-        --------------------------------------------------------------
-        参数：
-            symbol : 合约代码
-            since  : 起始 UTC 时间（含），按 lifecycle.created_at 过滤
-        返回：
-            {
-              "total": ..,
-              "win": ..,
-              "loss": ..,
-              "expired": ..,
-              "win_rate": float,
-              "avg_pnl_pct": float,
-              "avg_rr": float,
-              "by_regime": {regime: {...}, ...}
-            }
-        说明：
-            - win = tp1_hit / tp2_hit；loss = sl_hit；expired/invalidated 单算。
-            - regime 来自 signals.factors->>'regime'；新格式直接挂在根；
-              老格式 / 字段缺失时归到 'unknown'。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT sl.status, sl.pnl_pct,
-                       COALESCE(s.factors->'factors'->>'regime',
-                                s.factors->>'regime',
-                                'unknown') AS regime,
-                       s.risk_reward_ratio
-                FROM signal_lifecycle sl
-                JOIN signals s ON s.id = sl.signal_id
-                WHERE sl.symbol = $1
-                  AND sl.created_at >= $2
-                  AND sl.status IN ('sl_hit', 'tp1_hit', 'tp2_hit',
-                                    'expired', 'invalidated')
-                """,
-                symbol,
-                since,
-            )
-
-        total = len(rows)
-        win = sum(1 for r in rows if r["status"] in ("tp1_hit", "tp2_hit"))
-        loss = sum(1 for r in rows if r["status"] == "sl_hit")
-        expired_cnt = sum(1 for r in rows if r["status"] == "expired")
-        pnl_values = [float(r["pnl_pct"]) for r in rows if r["pnl_pct"] is not None]
-        rr_values = [
-            float(r["risk_reward_ratio"])
-            for r in rows
-            if r["risk_reward_ratio"] is not None
-        ]
-        win_rate = (win / total) if total else 0.0
-        avg_pnl = (sum(pnl_values) / len(pnl_values)) if pnl_values else 0.0
-        avg_rr = (sum(rr_values) / len(rr_values)) if rr_values else 0.0
-
-        by_regime: Dict[str, Dict[str, Any]] = {}
-        for r in rows:
-            reg = r["regime"] or "unknown"
-            bucket = by_regime.setdefault(
-                reg, {"total": 0, "win": 0, "loss": 0, "expired": 0, "pnl_sum": 0.0}
-            )
-            bucket["total"] += 1
-            if r["status"] in ("tp1_hit", "tp2_hit"):
-                bucket["win"] += 1
-            elif r["status"] == "sl_hit":
-                bucket["loss"] += 1
-            elif r["status"] == "expired":
-                bucket["expired"] += 1
-            if r["pnl_pct"] is not None:
-                bucket["pnl_sum"] += float(r["pnl_pct"])
-
-        for bucket in by_regime.values():
-            bucket["win_rate"] = (
-                bucket["win"] / bucket["total"] if bucket["total"] else 0.0
-            )
-            bucket["avg_pnl_pct"] = (
-                bucket["pnl_sum"] / bucket["total"] if bucket["total"] else 0.0
-            )
-
-        return {
-            "total": total,
-            "win": win,
-            "loss": loss,
-            "expired": expired_cnt,
-            "win_rate": win_rate,
-            "avg_pnl_pct": avg_pnl,
-            "avg_rr": avg_rr,
-            "by_regime": by_regime,
-        }
-
-    # ------------------------------------------------------------------
-    # P2：mark price + 历史信号查询（IC 校准 / lifecycle 用）
-    # ------------------------------------------------------------------
-    async def fetch_latest_kline_close_within(
-        self,
-        timeframe: str,
-        symbol: str,
-        max_age_seconds: float,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        读取指定周期最新一根 K 线的 close + ts，并校验"年龄 ≤ max_age_seconds"
-        --------------------------------------------------------------
-        参数：
-            timeframe       : '1m' / '5m' / ... 白名单内
-            symbol          : 合约代码
-            max_age_seconds : 最大允许的"距 now 的秒数"；超过则视为陈旧
-        返回：
-            {ts, close} 或 None（K 线缺失 / 陈旧）
-        说明：
-            生命周期任务专用——K 线断流时（max_age_seconds 一般取 60s），
-            本方法返回 None，调用方据此跳过本轮判断，避免误结算。
-        """
-        latest = await self.fetch_latest_kline(timeframe=timeframe, symbol=symbol)
-        if not latest:
-            return None
-        ts = latest.get("ts")
-        if ts is None:
-            return None
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - ts).total_seconds()
-        if age > max_age_seconds:
-            return None
-        return {"ts": ts, "close": latest.get("close")}
-
-    async def fetch_kline_close_at(
-        self,
-        timeframe: str,
-        symbol: str,
-        target_ts: datetime,
-    ) -> Optional[float]:
-        """
-        取在 target_ts 之后最早一根 K 线的 close
-        --------------------------------------------------------------
-        参数：
-            timeframe : '1m' / '5m' / '1h' / '4h'
-            symbol    : 合约代码
-            target_ts : 目标时间（IC 校准里 = signal.ts + Δh）
-        返回：
-            最近未来 K 线的 close（float）；找不到时返回 None。
-        说明：
-            - "之后最早"而非"之前最近"是为了 IC 计算的因果性：
-              forward_return = (px_future - px_now) / px_now，px_future
-              必须严格在 px_now 之后；早于 target_ts 的 close 会引入未来函数。
-            - 走 idx_klines_<tf>_symbol_ts (symbol, ts DESC) 索引，
-              ts >= target_ts 用 ASC 第一条命中，单次查询 < 5ms。
-        """
-        table = self._kline_table(timeframe)
-        async with self.db.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT close
-                FROM {table}
-                WHERE symbol = $1 AND ts >= $2
-                ORDER BY ts ASC
-                LIMIT 1
-                """,
-                symbol,
-                target_ts,
-            )
-        if not row or row["close"] is None:
-            return None
-        return float(row["close"])
-
-    async def fetch_signals_with_factors_since(
-        self,
-        symbol: str,
-        since: datetime,
-        source_like: str = "%llm%",
-        limit: int = 5000,
-    ) -> List[Dict[str, Any]]:
-        """
-        IC 校准任务用：拉取最近一段时间内 source 含 'llm' 的 signals 行
-        --------------------------------------------------------------
-        参数：
-            symbol      : 合约代码
-            since       : 起始 UTC 时间（含），通常 = now - 90d
-            source_like : ILIKE 模式，默认 '%llm%' 匹配 'rules+llm' / 'rules+llm(cache)'
-            limit       : 防御性上限；30s 一条 × 30 天 ≈ 86400，不会触顶
-        返回：
-            dict 列表，含 id / ts / bias / confidence / factors（JSONB 反序列化为 dict）
-            / source。
-        说明：
-            - factors 列体积大，IC 任务只跑一次/天，单次扫描 < 1s 可接受。
-            - 之所以用 ILIKE 而不是 = 'rules+llm'：是为了兼容历史 / 未来的 source
-              变体（例如 'rules+llm(cache)'、'rules+llm(shadow)' 等）。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, ts, bias, confidence, source, factors
-                FROM signals
-                WHERE symbol = $1
-                  AND ts >= $2
-                  AND source ILIKE $3
-                ORDER BY ts ASC
-                LIMIT $4
-                """,
-                symbol,
-                since,
-                source_like,
-                limit,
-            )
-        return [dict(r) for r in rows]
-
     # ------------------------------------------------------------------
     # notification_emails（邮件通知收件人）
     # ------------------------------------------------------------------
@@ -1928,225 +1284,6 @@ class Repositories:
                 cutoff,
             )
         return _parse_delete_count(result)
-
-    # ------------------------------------------------------------------
-    # P3：信号评估表（signal_evaluation）+ 决策层闸门所需的查询
-    # ------------------------------------------------------------------
-    # 设计要点：
-    #   - signal_evaluation 表每窗口一行，写入由后台 SignalEvaluator 任务驱动；
-    #     读取由 LLMAgent 的 prompt 注入路径与 API 排查路径共用。
-    #   - 不在 SQL 层做"最近 N 行去重"——多保留一些历史能直接看指标随时间漂移。
-    #   - "决策层闸门" 共需 2 个新查询：
-    #       * fetch_signals_for_evaluation：评估器批量拉数据用
-    #       * fetch_recent_signals_for_conflict_check：service 层 _decision_rule_conflict_gate 用
-    async def insert_signal_evaluation(
-        self,
-        symbol: str,
-        window_minutes: int,
-        metrics: Dict[str, Any],
-    ) -> Optional[int]:
-        """
-        写入一行信号评估指标
-        --------------------------------------------------------------
-        参数：
-            symbol         : 合约代码
-            window_minutes : 评估窗口（分钟）
-            metrics        : 评估指标字典，键名见下方 SQL 列名映射；缺失键
-                             一律按 NULL 写入（NUMERIC 列允许 NULL）。
-        返回：
-            新行的 id；写入失败 / 异常时返回 None（不影响主路径）。
-        说明：
-            评估器每 N 分钟跑一次，写入失败也不应该把后台任务打死，
-            异常吞掉只记 warning，与 lifecycle 任务的容错策略一致。
-        """
-        try:
-            async with self.db.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO signal_evaluation (
-                        symbol, window_minutes, evaluated_at,
-                        total_signals, triggered_count, fill_rate,
-                        wins, losses, expired_after_triggered, win_rate,
-                        avg_pnl_pct, total_pnl_pct,
-                        max_favorable_avg, max_adverse_avg,
-                        sharpe_estimated,
-                        direction_flip_count, direction_flip_rate,
-                        brier_score
-                    ) VALUES (
-                        $1, $2, NOW(),
-                        $3, $4, $5,
-                        $6, $7, $8, $9,
-                        $10, $11,
-                        $12, $13,
-                        $14,
-                        $15, $16,
-                        $17
-                    )
-                    RETURNING id
-                    """,
-                    symbol,
-                    int(window_minutes),
-                    int(metrics.get("total_signals") or 0),
-                    int(metrics.get("triggered_count") or 0),
-                    _to_dec(metrics.get("fill_rate")),
-                    metrics.get("wins"),
-                    metrics.get("losses"),
-                    metrics.get("expired_after_triggered"),
-                    _to_dec(metrics.get("win_rate")),
-                    _to_dec(metrics.get("avg_pnl_pct")),
-                    _to_dec(metrics.get("total_pnl_pct")),
-                    _to_dec(metrics.get("max_favorable_avg")),
-                    _to_dec(metrics.get("max_adverse_avg")),
-                    _to_dec(metrics.get("sharpe_estimated")),
-                    metrics.get("direction_flip_count"),
-                    _to_dec(metrics.get("direction_flip_rate")),
-                    _to_dec(metrics.get("brier_score")),
-                )
-            return int(row["id"]) if row else None
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "写入 signal_evaluation 失败 symbol=%s window=%d（不影响主路径）",
-                symbol,
-                window_minutes,
-                exc_info=True,
-            )
-            return None
-
-    async def fetch_latest_signal_evaluation(
-        self,
-        symbol: str,
-        window_minutes: int,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        读取指定 (symbol, window_minutes) 最近一行评估指标
-        --------------------------------------------------------------
-        参数：
-            symbol         : 合约代码
-            window_minutes : 窗口（分钟）。默认 LLM prompt 注入用 1440（24h）。
-        返回：
-            最近一行 dict；表内无数据则返回 None。
-        说明：
-            走 idx_signal_evaluation_lookup (symbol, window_minutes,
-            evaluated_at DESC) 索引，单点查询毫秒级。
-        """
-        async with self.db.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, symbol, window_minutes, evaluated_at,
-                       total_signals, triggered_count, fill_rate,
-                       wins, losses, expired_after_triggered, win_rate,
-                       avg_pnl_pct, total_pnl_pct,
-                       max_favorable_avg, max_adverse_avg,
-                       sharpe_estimated,
-                       direction_flip_count, direction_flip_rate,
-                       brier_score
-                FROM signal_evaluation
-                WHERE symbol = $1 AND window_minutes = $2
-                ORDER BY evaluated_at DESC
-                LIMIT 1
-                """,
-                symbol,
-                int(window_minutes),
-            )
-        return dict(row) if row else None
-
-    async def fetch_signals_for_evaluation(
-        self,
-        symbol: str,
-        since: datetime,
-    ) -> List[Dict[str, Any]]:
-        """
-        拉取评估窗口内 signals + signal_lifecycle 的合并视图
-        --------------------------------------------------------------
-        参数：
-            symbol : 合约代码
-            since  : 起始 UTC 时间（含），按 signals.ts 过滤
-        返回：
-            按 signals.ts 升序的 dict 列表，每条字段含：
-                signal_id / ts / bias / confidence /
-                lifecycle_status / triggered_at / triggered_price /
-                exit_price / pnl_pct / max_favorable_pct / max_adverse_pct
-            若该 signal 没有对应 lifecycle 行（开关刚打开等情况），
-            lifecycle_status 等字段为 None，但仍会被纳入 total_signals 计数。
-        说明：
-            - 仅评估"真实 LLM 调用"的信号（source 不含 'cache'），避免缓存命中
-              的同一判断被重复计入翻转率/胜率统计。
-            - LEFT JOIN lifecycle 而非 INNER JOIN：保留没有 lifecycle 的 signal，
-              便于"评估器开启 lifecycle 跟踪之前的旧信号也能算 total_signals"。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    s.id           AS signal_id,
-                    s.ts,
-                    s.bias,
-                    s.confidence,
-                    s.source,
-                    sl.status                AS lifecycle_status,
-                    sl.triggered_at,
-                    sl.triggered_price,
-                    sl.exit_price,
-                    sl.pnl_pct,
-                    sl.max_favorable_pct,
-                    sl.max_adverse_pct
-                FROM signals s
-                LEFT JOIN signal_lifecycle sl ON sl.signal_id = s.id
-                WHERE s.symbol = $1
-                  AND s.ts >= $2
-                  AND s.source NOT LIKE '%cache%'
-                ORDER BY s.ts ASC
-                """,
-                symbol,
-                since,
-            )
-        return [dict(r) for r in rows]
-
-    async def fetch_recent_signals_for_conflict_check(
-        self,
-        symbol: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        读取近 N 条已结算信号（含规则引擎打分），供"规则 vs LLM 冲突保护"闸门使用
-        --------------------------------------------------------------
-        参数：
-            symbol : 合约代码
-            limit  : 回溯条数
-        返回：
-            按 signals.ts 倒序的 dict 列表，每条字段：
-                signal_id / ts / bias(LLM) / rule_score / lifecycle_status / pnl_pct
-            rule_score 从 signals.factors->>'rule_score' 抽取（写入路径在
-            SignalService.generate 已规范化为顶层 key）。
-        说明：
-            - 仅返回 lifecycle 已结算（status ∈ {sl_hit, tp1_hit, tp2_hit,
-              expired, invalidated}）的样本：未结算样本对"胜率"是无效的。
-            - source NOT LIKE '%cache%'：与 fetch_signals_for_evaluation 一致，
-              避免缓存重复计入。
-        """
-        async with self.db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    s.id           AS signal_id,
-                    s.ts,
-                    s.bias,
-                    (s.factors->>'rule_score')::float8  AS rule_score,
-                    sl.status                AS lifecycle_status,
-                    sl.pnl_pct
-                FROM signals s
-                JOIN signal_lifecycle sl ON sl.signal_id = s.id
-                WHERE s.symbol = $1
-                  AND s.source NOT LIKE '%cache%'
-                  AND sl.status IN ('sl_hit', 'tp1_hit', 'tp2_hit',
-                                    'expired', 'invalidated')
-                ORDER BY s.ts DESC
-                LIMIT $2
-                """,
-                symbol,
-                int(limit),
-            )
-        return [dict(r) for r in rows]
 
 
 def _parse_delete_count(status: str) -> int:

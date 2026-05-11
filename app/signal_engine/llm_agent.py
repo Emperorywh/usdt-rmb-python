@@ -1,20 +1,32 @@
-"""基于 DeepSeek（OpenAI 兼容协议）的 LangChain 分析 Agent。
+"""LLM-First 决策核心：基于 DeepSeek（OpenAI 兼容协议）的 LangChain Agent。
 
-用 ``langchain-openai`` 的 ``ChatOpenAI``，并把 ``base_url`` 指到 DeepSeek。
-通过 ``with_structured_output(...)``（function-calling）把输出约束到
-:class:`TradingSignal`，保证返回严格 JSON，否则直接抛错。
+设计目标
+========
+本系统是 **LLM-Native** 而非"LLM 外壳 + 量化内核"。``LLMAgent`` 负责：
 
-输出语言：reason / risk / suggestion 三个字段统一使用简体中文，
-bias 字段保持 long/short/neutral 英文枚举（与 ``signals.bias`` 的
-CHECK 约束保持一致）。
+1. 把因子矩阵交给 :class:`~app.signal_engine.narrative_renderer.NarrativeRenderer`
+   渲染成 7 段 desk trader 叙事 + 当前价；
+2. 拼成紧凑 prompt（system + 1 条 few-shot + human）调用 DeepSeek；
+3. 校验 LLM 输出的"数学自洽性"（schema 强约束 + 轻量 post-check）；
+4. 通过基于 PostgreSQL ``signals`` 表 ts 的节流缓存控制成本。
+
+** 不做 ** 的事情：
+- 不渲染任何 ASCII 表格 / 数值堆砌段；
+- 不注入"历史成绩单 / 系统级评估摘要 / 规则引擎打分"作为参考；
+- 不做 RR / SL 业务下限校验（schema 已保证数学自洽，业务下限由 LLM 自决）；
+- 不做"价格漂移强制刷新"补丁；节流由 ``compute_min_interval`` 一处控制。
+
+输出语言：reason / risk / suggestion 简体中文 desk 语气，bias 保持
+long / short / neutral 英文枚举（与 ``signals.bias`` CHECK 约束对齐）。
 
 思考模式下额外返回 ``reasoning_content``（思维链原文），由外层 service
-负责落库做审计；它不参与下游决策、也不会进入提示词上下文。
+负责落库做审计；不会进入下一轮 prompt。
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -28,6 +40,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from app.config import Settings
 from app.data_storage.repositories import Repositories
 from app.logging_config import get_logger
+from app.signal_engine.narrative_renderer import NarrativeRenderer
 from app.signal_engine.schemas import TradingSignal
 
 logger = get_logger(__name__)
@@ -47,9 +60,6 @@ _SYMBOL_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
 def _to_float_safe(v: Any) -> Optional[float]:
     """
     把任意输入转 float，失败 / NaN / Inf 一律返回 None
-    --------------------------------------------------------------
-    P3 评估段渲染时大量用到（asyncpg 的 Decimal、None、字符串等都可能
-    出现），统一在模块顶部声明避免在多个 classmethod 内部重复实现。
     """
     if v is None:
         return None
@@ -57,8 +67,7 @@ def _to_float_safe(v: Any) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    import math as _math
-    if not _math.isfinite(f):
+    if not math.isfinite(f):
         return None
     return f
 
@@ -71,25 +80,9 @@ def _to_float_safe(v: Any) -> Optional[float]:
 #   OpenAI 标准字段（content / function_call / tool_calls / audio），
 #   对 DeepSeek 在 assistant 消息上额外返回的 ``reasoning_content``
 #   字段（即"思维链原文"）会**直接丢弃**。
-#   表现就是：开启思考模式后，调用方从 AIMessage.additional_kwargs 与
-#   AIMessage.response_metadata 里都拿不到 reasoning_content，最终
-#   signals.reasoning_content 列永远为 NULL。
-#
 # 修复方案：
-#   子类化 ChatOpenAI，重写 ``_create_chat_result``：
-#   1) 让父类先按原逻辑构建 ChatResult；
-#   2) 再从原始响应字典里把每个 choice 的 ``message.reasoning_content``
-#      取出来，塞进对应 AIMessage.additional_kwargs["reasoning_content"]。
-#   这样 ``LLMAgent._extract_reasoning`` 现有的查找路径就能命中，
-#   service 层也无需改动入库逻辑。
-#
-# 设计取舍：
-#   - 不去 monkey-patch langchain 内部函数：影响面不可控、阻碍未来升级。
-#   - 不绕开 langchain 直接裸调 openai SDK：会让 prompt / 解析 /
-#     重试 / 日志全部要重写，得不偿失。
-#   - 不在 chain 上挂一层 RunnableLambda 后处理：拿不到原始 dict，
-#     只能拿到已经被 langchain 转换后丢失了 reasoning_content 的 AIMessage。
-#   重写 _create_chat_result 是改动面最小、最稳妥的做法。
+#   子类化 ChatOpenAI，重写 ``_create_chat_result`` 把 reasoning_content
+#   塞回 AIMessage.additional_kwargs，让 _extract_reasoning 能命中。
 def _build_deepseek_chat_openai_class():
     """
     构造一个支持 DeepSeek ``reasoning_content`` 透传的 ChatOpenAI 子类
@@ -110,22 +103,15 @@ def _build_deepseek_chat_openai_class():
         """
 
         def _create_chat_result(self, response, generation_info=None):
-            # 先让父类完成标准转换；它会把 response 序列化成 dict 再走
-            # _convert_dict_to_message。我们这里需要的也是同一份 dict，
-            # 因此再独立 dump 一次以拿到原始 reasoning_content。
             chat_result = super()._create_chat_result(response, generation_info)
-
             response_dict = (
                 response if isinstance(response, dict) else response.model_dump()
             )
             choices = response_dict.get("choices") or []
-
             for idx, choice in enumerate(choices):
                 if idx >= len(chat_result.generations):
                     break
                 message_dict = choice.get("message") or {}
-                # DeepSeek 把思维链放在 message.reasoning_content 中；
-                # 部分网关/代理也会放在 message.reasoning，这里一并兼容。
                 reasoning = message_dict.get("reasoning_content") or message_dict.get(
                     "reasoning"
                 )
@@ -136,7 +122,6 @@ def _build_deepseek_chat_openai_class():
                     generated_message.additional_kwargs["reasoning_content"] = (
                         reasoning
                     )
-
             return chat_result
 
     return _DeepSeekChatOpenAI
@@ -154,14 +139,7 @@ class LLMAnalysisResult:
                              仅作审计用途，绝不参与下一轮提示词拼接。
         from_cache         : 本次结果是否来自节流缓存（即并未真正发起 LLM
                              API 调用）。外层 service 用它来决定是否落库——
-                             我们只想保留"真正由 LLM 产出"的那一条记录，
-                             cache 命中的请求不应再次写入 signals 表，
-                             否则 30s 一次的循环会产生大量 reason/risk/
-                             suggestion 完全相同、只有 factors 在变的脏数据。
-    设计说明：
-        之所以单独包一层，是为了不污染 TradingSignal 的 schema
-        （它要直接 model_dump 给 API 调用方与数据库 reason/risk/suggestion
-        三个字段，不应混入推理过程）。
+                             只保留"真正由 LLM 产出"的那一条记录。
     """
 
     signal: TradingSignal
@@ -169,286 +147,111 @@ class LLMAnalysisResult:
     from_cache: bool = False
 
 
+# ====================================================================
+# Prompt 模板（精简到 4 块；plan 第 3.1 / 3.2 / 3.3 节）
+# --------------------------------------------------------------------
+# SYSTEM_PROMPT ~600 tokens：
+#   1) 角色定位（资深 desk trader）
+#   2) 工作方式（5 条决策风格，**不是**硬约束）
+#   3) 硬约束（schema 强约束的口语版，4 条）
+#   4) 输出语言
+# 没有 P1 / P2 / P3 强约束、没有 6 级决策优先级、没有 5 档校准锚点；
+# 让 LLM 看叙事数据自己判断方向。
+# ====================================================================
 SYSTEM_PROMPT = """\
-你是一名资深加密衍生品量化交易分析师。系统会给你一份多周期因子矩阵
-（5m / 15m / 1h / 4h / 1d）、规则引擎初判、爆仓滚动窗口、多周期关键价位列表、
-market regime（市场状态）、流动性地图、订单簿时序指标、散户/精英多空比，
-以及你最近 N 次判断的成绩单和近 24h 系统级评估指标
-（方向翻转率 / 胜率 / Sharpe / Brier）。
+你是一位资深加密永续合约 desk trader，专注 ETH-USDT-SWAP 中频交易（持仓数小时到 1 日）。
+该信号仅作交易建议，不会被自动下单。
 
-请基于这些信息输出**一个**严格符合给定 schema 的 JSON 对象，作为完整可执行的
-交易计划。该信号仅作交易建议，不会被自动下单。
+## 你的工作方式（像 desk trader，不像量化研究员）
 
-【输出语言要求】
-- reason / risk / suggestion 三个字段必须使用**简体中文**。
-- bias 字段保持 long / short / neutral 三个英文枚举值之一，**不要翻译**。
-- timeframe_alignment 的 value 也保持 long/short/neutral 英文枚举。
+1. 先识别市场状态（趋势 / 震荡 / 突破 / 假突破 / 诱多诱空）。
+2. 找当前的"核心矛盾"——价格行为与资金流是否一致？是否有 squeeze / 大资金撤退 / 订单簿真空？
+3. 多周期共振优先信任高周期（4h/1d 决定方向，1h 决定波段，15m/5m 决定时机）。
+4. 输出像在 trading desk 跟同事讨论，**禁止纯指标罗列**，必须解读因果。
+5. **不知道就说不知道**，证据不充分就 bias=neutral；不要为了出方向编造逻辑。
 
-【决策优先级（自上而下，前者覆盖后者；冲突必须按此顺序仲裁）】
-不允许以"低层证据更强"为由覆盖高层约束。
-  级别 1 ── P3 系统级评估硬约束（24h flip_rate / Sharpe / Brier / avg_pnl）
-  级别 2 ── P2 自我反馈硬约束（近 N 次判断质量段胜率、fill_rate）
-  级别 3 ── 风控硬下限（RR / SL / 仓位 / 失效条件数量；服务端 deterministic
-            post-check 会复算，违反必被强制 neutral）
-  级别 4 ── P1 regime 强约束（regime / retail_smart / funding_extreme / liquidity_vacuum）
-  级别 5 ── 多周期共振（alignment_score / dominant_bias）
-  级别 6 ── 单周期因子证据（net_flow / CVD / OI / 订单簿失衡等）
+## 硬约束（违反任一条都会被 schema 拒绝）
 
-【因子使用要点】
-- 综合考虑四类因子：资金流（capital_flow）、订单簿（orderbook）、衍生品（derivatives）、
-  市场结构（market_structure）。
-- 当前没有链上数据与参与者画像，请勿引用任何 on-chain / whale / smart money
-  相关信息，也不要编造。
-- 多周期权重：4h / 1d 决定主方向，1h 决定波段，15m / 5m 决定入场时机。
-  冲突时优先信任高周期，并在 reason 中显式说明你为什么舍弃了哪些低周期信号。
-- timeframe_alignment 必须把 5 个周期的方向都填上，缺一不可。
+1. **价位顺序**：long → sl < entry_low ≤ entry_high < tp1 < tp2；short 反向。
+2. **必填**：bias=long/short 时必须给齐 entry_zone（[low, high] 区间）、stop_loss、take_profit（≥ 2 档）；
+   neutral 时这些字段必须为 null / 空数组。
+3. **invalidation_conditions**：≥ 2 条量化失效条件，每条带具体价位 / 阈值
+   （如 "1h 收盘跌破 3505"、"funding 转负"）。
+4. **suggestion 末尾必须有**："仅供参考，不构成交易指令"。
 
-【可执行交易计划核心硬约束】
-- entry_zone：**区间**，宽度建议 0.2 × ATR(15m) ~ 0.5 × ATR(15m)。
-- stop_loss：必须落在结构关键位另一侧，且同时满足两条最小距离约束（取较大者）：
-    a) |entry_mid - sl| ≥ **1.5 × ATR(15m)**
-    b) |entry_mid - sl| / entry_mid ≥ **0.5%**
-  理由：ETH 永续 1m 随机噪声常见 0.05–0.15%，过窄 SL 是高频陷阱。
-- take_profit：至少 2 档，对应附近的对侧关键位 / 流动性池
-  （tp1 ~ 1h 阻力、tp2 ~ 4h 阻力 / 上一波等量目标）。
-- risk_reward_ratio：必须 ≥ **2.0**，按 |tp1 − entry_mid| / |entry_mid − sl| 计算。
-  服务端 post-check 会用同一公式 cross-check，自报与复算偏差 > 5% 也强制 neutral。
-- position_size_pct：上限建议 **0.10**（按 1% 账户风险预算 = 0.01 / (|entry_mid - sl| / entry_mid)
-  并按 conf 缩放：conf ≤ 0.5 给 0；conf ∈ (0.5, 0.7] 上限 0.05；conf > 0.7 上限 0.10）。
-  服务端会基于历史胜率 + 半凯利对该值再做最终 clamp，你的输出只是"上限建议"。
-- invalidation_conditions：≥ 2 条**量化**失效条件，必须含具体价位 / 阈值，
-  例如 "4h 收盘跌破 3500"、"1h CVD slope 转负且持续 30 分钟以上"。
-- neutral 时 entry_zone / stop_loss / take_profit / RR / position_size_pct 全部置 null。
-- reason 必须引用具体数值（净流入 USD / CVD slope / OI 变动 % / funding / 关键价位等），
-  不要写"看起来""似乎"等模糊表述。
-- suggestion 文末必须注明"仅供参考，不构成交易指令"。
+## 输出语言
 
-【降级规则】
-- RR < 2.0 时禁止给出趋势性 long/short 方向；可走"区间策略"，否则输出 neutral。
-- 多周期方向严重冲突（alignment_score 绝对值 < 0.4 且 dominant_bias=neutral）时，
-  优先尝试区间策略，仍不成立才 neutral。
+- bias / timeframe_alignment 的 value 固定 long / short / neutral 英文枚举（不要翻译）。
+- reason / risk / suggestion 用简体中文 desk 语气。
+- 对照写法（不要写左边，要写右边）：
 
-【区间策略（regime ∈ {{ranging, transitional}} 或多周期共振崩溃时）】
-逐项核对 5m **与** 15m 是否存在可交易区间：
-- 闸 A（区间内）：sup[0] < last_close < res[0]
-- 闸 B（宽度足够）：res[0] - sup[0] ≥ 0.6 × ATR(15m)（ATR(15m) 缺失时用
-  ATR(5m) × √3 估算，禁止以"ATR(15m) 缺失"为由跳过该闸）
-- 闸 C（更近一侧）：哪个边界更近就向哪一侧反弹/回踩
+不要写："CVD 走低 + alignment=0.20，bearish_warning"
+要写："1h CVD 持续走低与价格背离 = 上方有人在接盘出货；散户狂多 + 精英反向 = 典型诱多顶部结构；
+       共振崩溃，强行做趋势会被 whipsaw。"
 
-**边界来源白名单**：sup[0] / res[0] 必须取自因子矩阵
-``by_timeframe.<tf>.market_structure.supports / resistances`` 列表的首元素；
-**严禁**使用 liquidity_pool_above / liquidity_pool_below 中的 round_level / weak
-节点作为区间边界（流动性池仅可作为 take_profit[1] 的辅助参考）。
-
-5m / 15m 都通过时**优先选 15m**（更稳定）；任一通过即可走区间策略：
-- 距对侧边界 ≥ 0.4 × 区间宽度（**禁止贴边**）；
-- stop_loss 距边界 ≥ 1.5 × ATR(15m) buffer，仍满足绝对 0.5% 下限；
-- take_profit[0] 取另一侧边界附近（≥ 0.7 倍区间宽度），take_profit[1] 取另一侧 + 一档流动性池；
-- RR 仍必须 ≥ 2.0；做不到就退回 neutral 并显式写
-  "区间策略 RR=<计算值> < 2.0，退回 neutral"
-  （**禁止**改写为"区间不清晰"，混淆会让自我反馈机制无法识别真正瓶颈）；
-- **position_size_pct ≤ 0.05**（强制小仓位）；
-- reason 必须显式写出 "区间策略" + 选用周期（5m/15m）+ 区间上下沿具体价位 +
-  不做趋势单的核心因子证据。
-
-5m / 15m 都不通过时输出 neutral，并按格式
-"区间不可交易：5m 失败原因=<具体>；15m 失败原因=<具体>" 分别列出
-（不允许笼统写"无区间"，混淆会让自我反馈机制无法识别瓶颈）。
-
-【P1 强约束】
-1) regime ∈ {{ranging, transitional}} → 禁止 trending 仓位建议；区间策略时
-   position_size_pct ≤ 0.05；reason 必须显式提到 "regime=<值>"。
-2) regime ∈ {{breakout, breakdown}} → stop_loss 必须放在被突破的结构位另一侧少量 buffer
-   （breakout → SL 放被刺破 swing high 下方；breakdown → SL 放被刺破 swing low 上方）。
-3) retail_vs_smart_divergence='bearish_warning'（散户狂多 + 精英反向）→ confidence ≤ 0.6；
-   risk 字段必须明确写出"散户/精英背离风险"。bullish_warning 同理（不准盲目追多）。
-4) funding_extreme='long_squeeze_risk' + bias='long' → confidence ≤ 0.5；
-   short_squeeze_risk + 'short' 同理。
-5) liquidity_vacuum_above=true + bias='long' → take_profit 至少一档落在
-   "上方流动性池中第一档 strong/medium 节点" 附近 ±0.3% 范围内；vacuum_below + 'short' 同理。
-
-【P2 强约束（自我反馈）】
-你将看到自己最近 N 次判断的成绩单，按"是否曾入场"分两段：
-- 【判断质量段】仅统计 triggered_at 非空样本，胜率 = wins / (wins + losses)，
-  wins=tp1/tp2_hit，losses=sl_hit。"曾入场但超时"不计入分母。
-  (a) (wins + losses) ≥ 2 且胜率 ≤ 50% → confidence < 0.5，并在 reason 中具体反思失败模式
-      （例如"近 4 次曾入场样本中 3 次 sl_hit，多发生在 regime=ranging 时强行做趋势"）；
-  (b) (wins + losses) ≥ 1 且胜率 = 0% → confidence 上限 0.4。
-- 【触发率段】fill_rate < 30% 时本次 entry_zone 中点必须距当前价 ≤ 0.3%，
-  并在 reason 中说明"上 N 笔 fill_rate < 30%，本次贴近当前价挂单"。
-- (wins + losses) < 2 时不应用上述硬约束，但 reason 注明
-  "曾入场样本不足，未触发自我反馈降权"。
-- 不要因为 1 次大额胜利过度自信，也不要因为 1 次最大不利波动强行翻转方向；
-  优先看胜率 / 平均 PnL / 最大回撤三者的组合。
-- 本系统是"信号建议"层，不持仓、不下单。每次判断都应基于当前因子矩阵独立做出，
-  不要被成绩单里的旧方向绑架——方向冲突 / 净敞口控制是后续持仓管理层的职责。
-
-【P3 强约束（系统级评估，优先级最高）】
-1) direction_flip_rate > 30% → 市场近 24h whipsaw，本次必须**明显倾向 neutral 或区间策略**：
-   禁止 trending 单且 position_size_pct ≤ 0.05；若选 long/short，confidence 上限 0.5。
-2) sharpe_estimated < 0 或 avg_pnl_pct < 0 → 系统近 24h 净亏损，confidence 上限 0.5；
-   同时 brier_score > 0.30 时 confidence 上限 0.4，
-   reason 明确写"系统近 24h 处于负期望，本次降权"。
-3) 评估摘要为"无数据" → 跳过本节约束，但 reason 注明
-   "尚无系统级评估数据，按因子原始结论输出"。
-4) 系统级反馈优先级**高于**因子矩阵——即使因子矩阵看起来非常一致，
-   只要 24h 系统状态恶劣，必须降权或转 neutral。
-
-【confidence 校准锚点】
-本系统使用 Brier score 评估 confidence 校准（见 P3 评估摘要）；输出前请按下表自检
-confidence 是否匹配证据强度，避免均值回归到 0.6-0.7（Brier 失校的主因）：
-
-| 证据强度 | confidence 区间 | 入场条件 |
-|----------|-----------------|----------|
-| 极强 | 0.80-0.95 | 5/5 周期共振 + 主因子(net_flow/CVD/OI/结构) ≥ 3 类同向 + 衍生品(funding/精英比)不矛盾 + 流动性地图无 vacuum 反向 + P3 评估全部健康 + P2 胜率 ≥ 60% |
-| 强 | 0.65-0.79 | 4/5 周期共振 + 主因子 ≥ 2 类同向 + regime ≠ ranging + 无任何降权约束触发 |
-| 中 | 0.50-0.64 | 3/5 周期共振 + 主因子 ≥ 1 类同向；属"投机性方向"，建议小仓位 |
-| 弱 | 0.30-0.49 | 方向有证据但被衍生品 / 散户精英背离 / 历史胜率削弱 |
-| 极弱 | < 0.30 | 不要硬撑方向，直接 neutral |
-
-校准红线（违反任一条都属"过度自信"）：
-- reason 中没有列出 ≥ 3 条具体数值证据时，禁止 confidence > 0.7。
-- 任一 P1/P2/P3 降权约束触发时，必须按该约束规定的上限输出。
-- reason 中出现"看起来 / 似乎 / 可能 / 或许 / 大概"等模糊措辞时，confidence 上限 0.5。
-- regime ∈ {{ranging, transitional}} 时，trending 方向 confidence 上限 0.5；
-  区间策略下 confidence 上限 0.65。
-- P3 brier_score > 0.30 时本次 confidence 上限 0.4。
-
-【输出前自检（任一项不通过 → 修正后再输出，反复修不过 → 直接 neutral）】
-1. **RR 复算诚实性 + 业务下限**：自报 risk_reward_ratio 与
-   |tp1-entry_mid|/|entry_mid-sl| 复算偏差 < 5%，且 ≥ 2.0。
-2. **SL 双重距离下限**：|entry_mid - sl| 同时满足 ≥ 1.5×ATR(15m) 与 ≥ 0.5%×entry_mid。
-3. **价位顺序**：long → sl < ez_low ≤ ez_high < tp1 < tp2；short 反向。
-4. **必填字段**：take_profit ≥ 2 档；invalidation_conditions ≥ 2 条且每条都含具体价位 / 阈值；
-   timeframe_alignment 5 个周期填齐。
-5. **confidence 与【校准锚点】证据强度匹配**，所有触发的降权约束已按上限缩小。
-6. **reason 引用 ≥ 3 条具体数值证据，无模糊词**；
-   **【决策优先级】仲裁顺序正确**（P3 > P2 > 风控 > P1 > 共振 > 单周期）。
-
-通过所有自检后输出 JSON。下面通过几个 few-shot 示例演示合格的输入 / 输出形态，
-仅供参考结构与字段填法，**不要照抄数值**。
+下面通过 1 个 few-shot 示例演示"什么时候不出手"——这是最难学也最关键的能力。
 """
 
 
 # --------------------------------------------------------------------
-# few-shot 示例（C: trending long，D: 区间策略 RR 不达标退回 neutral，
-# E: short 因 funding_extreme=long_squeeze_risk + bullish_warning）
+# 紧凑 few-shot（仅 1 条拒绝交易示例 ≈ 1000 tokens）
 # --------------------------------------------------------------------
-# 设计要点（最佳实践来源：Anthropic Few-Shot Best Practices 2024、
-# LangChain FewShotChatMessagePromptTemplate 文档）：
-#   1) 以 (human, ai) message pair 形式注入 ChatPromptTemplate.from_messages，
-#      避免"system 里给数值锚点"导致 LLM 把示例数值当 anchor（Brier 失校主因）。
-#   2) AI message 仅保留**纯 JSON**，不夹杂 "本示例展示了..." 这类元注释，
-#      防止模型学会在自己输出里也写元注释。
-#   3) human_text 结构尽量贴近运行时 HUMAN_PROMPT，便于模型迁移；
-#      但内容压缩到必要字段，不复述训练时已有的格式。
-#   4) 数值经过校验：通过本系统的 schema / post-check（RR ≥ 2.0、
-#      SL 双重距离下限、价位顺序）。
+# 选"拒绝交易"而非"做多 / 做空"的理由（plan 第 3.3 节）：
+#   - 趋势单（long / short）LLM 天然会做，不需要示例；
+#   - "什么时候不出手"是 LLM 最难学也最关键的能力；
+#   - 1 条对比原 3 条省 ~2000 tokens。
 FEW_SHOT_EXAMPLES: List[Tuple[str, str]] = [
     (
-        # human C：trending long（4/5 共振 + breakout）
-        """合约: ETH-USDT-SWAP
-时间: 2026-04-15 09:00
+        # human：transitional + 共振崩溃 + funding 偏高 + 散户精英背离 + 多头爆仓
+        """合约: ETH-USDT-SWAP    时间: 2026-04-16 14:30    最新价: 2342.00
 
-规则引擎: bias=long score=0.62 confidence=0.55
+【市场状态】
+状态切换（transitional），高低周期方向不一致（4h=uptrend / 1d=downtrend）
+ATR(15m)=14.50（0.62%，正常波动），当前价 2342.00
+ADX(1h)=20.5 → 弱趋势 / 过渡区间
 
-===== 多周期因子矩阵（节选）=====
-4h trend=up + 1h trend=up + 15m trend=up + 5m trend=up（4/5 共振）
-1h CVD slope=+0.0023; net_flow_5m=+1.20M USD; oi_change_4h=+1.8%（OI 与价同升）
-ATR(15m)=15.2; last_close=3530
+【多周期方向】
+4h ↑ | 1h ↓ | 15m ↑ | 5m ↓ | 1d →    共振度 +0.10（dom=neutral）
+共振崩溃，方向不明 → 典型震荡市特征，强追趋势单容易被 whipsaw
 
-===== 多周期共振 =====
-alignment_score=+0.72; dominant_bias=long
+【主动资金 vs 价格】
+5m: net_flow -0.30K USD，CVD slope +0.0011 → 价格被动下压，主动卖盘未跟随 → 更像多头止损 / 诱空嫌疑
+1h: OI -0.40% → OI 减仓但价格未跟随，双方都在撤退
+综合：资金行为多周期分歧，需等待方向确认
 
-===== 衍生品 =====
-funding_rate=0.00012（中性偏多但远未挤压）
+【衍生品】
+funding +45.00bp 已偏高，多头持仓拥挤；任何反向触发（如 4h MA 跌破）都容易引发 long_squeeze
+散户多空比 2.45（极端多头 → 强反指利空）
+精英持仓比 0.78（偏空）
+散户/精英：散户狂多 + 精英反向 → 典型诱多顶部结构，警惕反转
 
-===== 关键价位 =====
-4h supports=[3505, 3470]; 4h resistances=[3625, 3680]
-1h supports=[3518, 3505]; 1h resistances=[3585, 3625]
+【关键价位】
+4h: 阻力 2360.00    支撑 2310.00, 2290.00
+1h: 阻力 2360.00    支撑 2318.00, 2310.00
+15m: 阻力 2360.00   支撑 2320.00
+当前 2342.00 ─ 距上方近阻 2360.00 1.2×ATR(15m)；距下方近撑 2320.00 1.5×ATR(15m)
 
-===== 市场状态 =====
-regime: breakout
+【流动性地图】
+上方止损池: 2360.00 (weak)
+下方止损池: 2310.00 (medium)
+订单簿: 上方真空 → 突破后价位容易被快速穿透，追多需谨慎
+距离: 上方最近池 0.77%
 
-===== 主力 / 散户 =====
-account_long_short_ratio=1.45（散户偏空 → 反指利多）
-top_trader_position_ratio=2.10（精英偏多）
-divergence=neutral
+【Liquidations 滚动窗口】
+近 5m:  long_liq 2.40 ETH | short_liq 0.10 ETH → 多头被清量级显著占优
+近 15m: long_liq 5.20 ETH | short_liq 0.30 ETH | cascade=true → 多头被清量级显著占优
+近 1h:  long_liq 14.50 ETH | short_liq 1.20 ETH（多头爆仓主导）
+→ 持续大额多头爆仓，短期反弹动力多来自空头回补而非新增买盘，cascade 在进行 → 清仓潮正在加速
 
-===== 流动性地图 =====
-liquidity_pool_above=[strong:3625, medium:3680]; vacuum_above=false
-
-===== 系统级评估（近 24h）=====
-win_rate=0.55; flip_rate=0.18; avg_pnl=+0.42%; Sharpe=0.85; Brier=0.22（健康）
-
-===== 自我反馈 =====
-近 5 笔曾入场 3 笔，胜率 67%（2赢 1输），无降权
+请基于以上市场状态判断方向，并按 schema 输出完整 JSON。
 """,
-        # ai C：trending long
-        """{
-  "bias": "long",
-  "confidence": 0.75,
-  "reason": "4/5 周期共振（5m/15m/1h/4h 同向，1d 中性），alignment=+0.72；主因子三类同向：net_flow_5m=+1.2M USD、CVD slope(1h)=+0.0023、OI(4h) +1.8% 与价同升；衍生品端 funding=1.2bp 未挤压、精英持仓 2.10 偏多、散户 1.45 反指利多；regime=breakout，SL=3475 落在被刺破 4h swing high 3505 下方 ≈ 3.24×ATR(15m) buffer，|entry_mid-sl|/entry_mid = 49.25/3524.25 = 1.40% > 0.5%；RR 复算 = |3625-3524.25|/|3524.25-3475| = 100.75/49.25 = 2.05 ≥ 2.0；P3 评估健康（Brier=0.22 < 0.25 校准良好），P2 近 5 笔胜率 67% 无降权。",
-  "risk": "若 1h CVD slope 转负且 funding 上行至 0.03% 以上需警惕 long_squeeze_risk；4h 收盘跌破 3505 即 breakout 失败回踩。",
-  "suggestion": "建议在 [3520.5, 3528.0] 区间分批入场跟随 long；tp1=3625（4h 阻力 + 强档流动性池）、tp2=3680（4h 量度目标 + 中档流动性池）；SL=3475。仅供参考，不构成交易指令。",
-  "entry_zone": [3520.5, 3528.0],
-  "stop_loss": 3475.0,
-  "take_profit": [3625.0, 3680.0],
-  "risk_reward_ratio": 2.05,
-  "position_size_pct": 0.075,
-  "timeframe_alignment": {"5m": "long", "15m": "long", "1h": "long", "4h": "long", "1d": "neutral"},
-  "invalidation_conditions": [
-    "4h 收盘跌破 3505（breakout 回踩失败）",
-    "1h CVD slope 转负且持续 ≥ 30 分钟"
-  ]
-}""",
-    ),
-    (
-        # human D：transitional + 共振崩溃 + bearish_warning + flip_rate 警戒 → 区间策略 RR 不达标
-        """合约: ETH-USDT-SWAP
-时间: 2026-04-16 14:30
-
-规则引擎: bias=neutral score=0.05 confidence=0.30
-
-===== 多周期因子矩阵（节选）=====
-4h trend=up; 1h trend=down; 15m trend=up; 5m trend=down（共振崩溃）
-net_flow_5m=-0.30M（弱空）; CVD slope(15m)=+0.0011（弱多）; OI(1h)=-0.4%（缩量）
-ATR(15m)=14.5; last_close=2342
-
-===== 多周期共振 =====
-alignment_score=+0.10; dominant_bias=neutral
-
-===== 衍生品 =====
-funding_rate=0.00045（多头资金费偏高）
-
-===== 关键价位 =====
-4h supports=[2310, 2290]; 4h resistances=[2360]
-5m supports=[2310]; 5m resistances=[2360]; close=2342（W=50）
-
-===== 市场状态 =====
-regime: transitional
-
-===== 主力 / 散户 =====
-account_long_short_ratio=2.45（散户狂多）
-top_trader_position_ratio=0.78（精英偏空）
-divergence=bearish_warning
-
-===== 流动性地图 =====
-liquidity_pool_above=[weak:2360]; vacuum_above=true
-
-===== 系统级评估（近 24h）=====
-flip_rate=0.34（> 30% whipsaw 警戒）; avg_pnl=-0.12%; Brier=0.31（失校警戒）
-
-===== 自我反馈 =====
-近 5 笔曾入场 4 笔，2 win 2 sl_hit，胜率 50%（命中硬约束阈值）
-""",
-        # ai D：区间策略 RR 不达标 → neutral
+        # ai：诚实拒绝交易
         """{
   "bias": "neutral",
   "confidence": 0.0,
-  "reason": "多周期共振崩溃（4h up / 1h down / 15m up / 5m down，alignment=+0.10 < 0.4），按降级规则尝试区间策略：5m sup[0]=2310 / res[0]=2360 / close=2342（W=50），闸 A、闸 B 均通过；距上沿 18 / 距下沿 32 → bias=short 贴上沿。区间策略 RR 复算：取 EZ=[2348,2353]、entry_mid=2350.5、SL=res[0]+1.5×ATR(15m)=2360+22=2382（|entry_mid-sl|=31.5，比例 1.34% 满足下限）、tp1=2310（≥0.7×W=35 满足）→ RR=|2310-2350.5|/|2350.5-2382|=40.5/31.5≈1.29 < 2.0，**区间策略 RR=1.29 < 2.0，退回 neutral**；同时 P3 flip_rate=34% > 30% 触发级别 1 降权、retail_vs_smart=bearish_warning 触发级别 4 降权、P2 胜率 50% 命中级别 2 阈值 (wins+losses)=4 ≥ 2，三层降权叠加进一步强化 neutral。",
-  "risk": "transitional + flip_rate 高 + Brier 失校 = whipsaw 高发期，任何方向交易都属于负期望博弈。",
-  "suggestion": "本周期建议观望，等待：(a) 4h 收盘明确选边（站上 2360 或跌破 2310）；(b) 24h flip_rate 回落至 25% 以下；(c) Brier 回落至 0.25 以下，至少满足两项再考虑出手。仅供参考，不构成交易指令。",
+  "reason": "共振崩溃明显——4h 仍上行但 1h 已转头向下，5m 跌破短期支撑；高低周期方向不一致。散户多空比 2.45 极端多头 + 精英持仓 0.78 偏空 = 典型诱多顶部结构，funding +45bp 偏高多头持仓拥挤，long_squeeze 一触即发；多头爆仓 cascade 在进行，反弹动力多来自空头回补而非新增买盘。当前 2342 距上沿 2360 仅 0.77% 做多无空间；做空又卡在区间正中（追空容易被反弹打止损）。震荡末端 + 顶部背离同时出现，方向判断 = 抛硬币，不出手。",
+  "risk": "transitional + 共振崩溃 + funding 偏高 + 多头清仓潮叠加，任何方向都属于负期望博弈。",
+  "suggestion": "本周期观望，等以下任一信号确认再考虑入场：(a) 4h 收盘跌破 2310 配合 funding 转负 → 高确定性做空；(b) 4h 收盘站上 2360 + OI 同步加仓 → 高确定性做多突破；(c) 共振度恢复到 ±0.5 以上方向明确。仅供参考，不构成交易指令。",
   "entry_zone": null,
   "stop_loss": null,
   "take_profit": [],
@@ -458,66 +261,7 @@ flip_rate=0.34（> 30% whipsaw 警戒）; avg_pnl=-0.12%; Brier=0.31（失校警
   "invalidation_conditions": []
 }""",
     ),
-    (
-        # human E：trending short（4/5 共振 + funding_extreme=long_squeeze_risk + bullish_warning）
-        """合约: ETH-USDT-SWAP
-时间: 2026-04-17 07:15
-
-规则引擎: bias=short score=-0.55 confidence=0.50
-
-===== 多周期因子矩阵（节选）=====
-4h trend=down + 1h trend=down + 15m trend=down + 5m trend=neutral（4/5 共振空）
-CVD slope(1h)=-0.0031（持续抛压）; net_flow_5m=-0.85M USD（净流出）
-ATR(15m)=14.5; last_close=3296
-
-===== 多周期共振 =====
-alignment_score=-0.68; dominant_bias=short
-
-===== 衍生品 =====
-funding_rate=0.00038（连续 6 个结算 > 0.03% 偏高）
-funding_extreme=long_squeeze_risk
-
-===== 关键价位 =====
-4h supports=[3245, 3180]; 4h resistances=[3340]
-
-===== 市场状态 =====
-regime: trending（4h down 已持续 3 根）
-
-===== 主力 / 散户 =====
-account_long_short_ratio=2.85（散户极度多头）
-top_trader_position_ratio=0.62（精英偏空）
-divergence=bullish_warning（散户狂多 + 精英反向）
-
-===== 流动性地图 =====
-liquidity_pool_below=[strong:3245, medium:3180]
-
-===== 系统级评估（近 24h）=====
-win_rate=0.60; flip_rate=0.15; avg_pnl=+0.55%; Brier=0.21（健康）
-
-===== 自我反馈 =====
-近 5 笔曾入场 3 笔，胜率 67%，无降权
-""",
-        # ai E：trending short
-        """{
-  "bias": "short",
-  "confidence": 0.55,
-  "reason": "4/5 周期共振空（仅 5m 中性），alignment=-0.68 强；CVD slope(1h)=-0.0031 + net_flow_5m=-0.85M 双重抛压；funding 连续 6 个结算 > 0.03% 触发 long_squeeze_risk；retail=2.85 极度多头 / 精英 0.62 偏空 → retail_vs_smart=bullish_warning。按 P1-3：bullish_warning 时 confidence ≤ 0.6；按 P1-4：long_squeeze_risk + bias=short 同向不触发降权；综合校准锚点 4/5 共振 + 主因子两类同向 = 强证据档但被 bullish_warning 削弱一档 → 0.55。SL=3322 落在 4h 阻力 3340 下方，|entry_mid-sl|=25.5 = 1.76×ATR(15m) 满足结构距离，比例 25.5/3296.5=0.77% 满足 0.5% 下限；RR 复算 = |3245-3296.5|/|3296.5-3322| = 51.5/25.5 = 2.02 ≥ 2.0。",
-  "risk": "极端多头持仓被强平时短期反弹也很激烈，若 1h 出现 > 1×ATR(1h) 的反向跳空需立即按 invalidation 退出；funding 转负代表 squeeze 完成，趋势可能反转。",
-  "suggestion": "建议在 [3293.0, 3300.0] 区间逢反弹做空；tp1=3245（4h support 强档流动性池）、tp2=3180（量度目标 + 第二档流动性池）；SL=3322。注意：position_size_pct 已按 conf=0.55 落入 (0.5, 0.7] 上限 0.05。仅供参考，不构成交易指令。",
-  "entry_zone": [3293.0, 3300.0],
-  "stop_loss": 3322.0,
-  "take_profit": [3245.0, 3180.0],
-  "risk_reward_ratio": 2.02,
-  "position_size_pct": 0.05,
-  "timeframe_alignment": {"5m": "neutral", "15m": "short", "1h": "short", "4h": "short", "1d": "short"},
-  "invalidation_conditions": [
-    "1h 收盘站上 3322（趋势结构破坏）",
-    "funding 转负且 retail_long_short_ratio 跌破 1.0（squeeze 完成，反向反指消失）"
-  ]
-}""",
-    ),
 ]
-
 
 
 # 思考模式（deepseek-reasoner）专用的格式硬约束。
@@ -535,42 +279,40 @@ JSON Schema:
 {format_instructions}
 """
 
+
+# --------------------------------------------------------------------
+# 紧凑 HUMAN_PROMPT（7 段 desk 叙事 + 1 段当前价）
+# --------------------------------------------------------------------
+# 与老 12 段 ASCII 表对照：
+#   * 删除指标堆砌段（mtf_factor_table / orderbook_text / regime_text 等），
+#     改由 NarrativeRenderer 输出 desk 叙事；
+#   * 删除自反馈 / 离线评估 / 浅模型打分 等"反 LLM"参考视角段；
+#   * 新增 liquidations 第 7 段（plan 第 2.4 节）。
 HUMAN_PROMPT = """\
-{self_feedback_block}{evaluation_block}合约: {symbol}
-时间: {ts}
+合约: {symbol}    时间: {ts}    最新价: {last_close}
 
-规则引擎: bias={rule_bias} score={rule_score} confidence={rule_confidence}
-规则引擎贡献度: {rule_contributions}
+【市场状态】
+{market_state}
 
-===== 多周期因子矩阵 =====
-{mtf_factor_table}
+【多周期方向】
+{mtf_direction}
 
-===== 多周期共振 =====
-{mtf_alignment_text}
+【主动资金 vs 价格】
+{capital_action}
 
-===== 衍生品 =====
-{derivatives_text}
+【衍生品】
+{derivatives}
 
-===== 爆仓（滚动窗口）=====
-{liquidations_table}
+【关键价位】（从大到小）
+{key_levels}
 
-===== 关键价位（从大周期到小周期）=====
-{key_levels_text}
+【流动性地图】
+{liquidity}
 
-===== 订单簿快照（最新一次，跨周期共享）=====
-{orderbook_text}
+【Liquidations 滚动窗口】
+{liquidations}
 
-===== 市场状态 =====
-{regime_text}
-
-===== 订单簿动态 =====
-{orderbook_dynamic_text}
-
-===== 主力 / 散户 =====
-{position_ratios_text}
-
-===== 流动性地图 =====
-{liquidity_text}
+请基于以上市场状态判断方向，并按 schema 输出完整 JSON。
 """
 
 
@@ -578,81 +320,48 @@ class LLMAgent:
     """
     LangChain DeepSeek 调用封装（基于 signals 表的 DB 节流）。
     --------------------------------------------------------------
-    设计目标：
-    - DeepSeek API 是按 token 收费的，但规则引擎 / 信号循环每 30s
-      就会触发一次 ``analyze``。如果每次都真打 LLM，一天会产生上千次
-      调用，浪费且没必要——加密市场短期波动并没有这么快。
-    - 节流的"上一次判断时间"以 **signals 表里该 symbol 最后一条记录
-      的 ts 为准**，而不是进程内存。这样：
-        * 进程重启后状态不会丢失，不会出现"重启即重打 LLM"。
-        * 多副本横向部署时，所有实例共享同一份"上次调用时间"
-          （PostgreSQL 是唯一真源），节流不会被绕过。
-        * 调试时手动清空 signals 表，下一轮即触发新一次 LLM 调用。
-    - 在 ``settings.llm_min_interval_seconds`` 窗口内（默认 900 秒，
-      即 15 分钟），analyze 不会真正发起 LLM 请求；而是直接从
-      signals 表读出最近一条 LLM 判断，重建 ``LLMAnalysisResult``
-      返回给上层（带 ``from_cache=True`` 标记）。
-    - 上层 service 仅在 ``from_cache=False`` 时落库，从而保证：
-      入库节奏 = LLM 真实调用节奏 = ``LLM_MIN_INTERVAL_SECONDS`` 节奏。
+    节流策略：
+    - "上一次判断时间"取自 signals 表里该 symbol 最后一条记录的 ts。
+    - 进程重启 / 多副本部署时所有实例共享同一份"上次调用时间"
+      （PostgreSQL 是唯一真源），节流不会被绕过。
+    - 在 ``compute_min_interval(factors)`` 计算出的窗口内，analyze
+      不会真正发起 LLM 请求，而是从 signals 表读出最近一条 LLM 判断，
+      重建 ``LLMAnalysisResult`` 返回（带 ``from_cache=True`` 标记）。
+    - 上层 service 仅在 ``from_cache=False`` 时落库，保证入库节奏 =
+      LLM 真实调用节奏 = 节流窗口节奏。
     - 通过按 symbol 的 ``asyncio.Lock`` 防止同一 symbol 在窗口刚到
-      时被并发调用打多次接口（DB 写入与读出之间存在窄竞态窗口）。
+      时被并发调用打多次接口。
     - 设置 ``LLM_MIN_INTERVAL_SECONDS=0`` 可完全关闭节流（调试用）。
     """
 
     def __init__(self, settings: Settings, repos: Repositories):
         self.settings = settings
-        # repos：用于查询 signals 表里"最后一条 LLM 判断的时间戳"以执行
-        # DB 节流，以及在节流命中时把判断字段重建成 LLMAnalysisResult。
         self.repos = repos
-        self._chain = None  # build lazily
-        # 标记当前 chain 是否走"思考模式"（即未使用 function_calling，
-        # 模型直接吐 JSON 文本，需要在 analyze() 里手动 parse）。
+        self._chain = None
+        # 思考模式 vs 非思考模式只影响"如何解析返回值"，build 时确定一次。
         self._chain_thinking_mode: bool = False
         # 按 symbol 维度的并发锁，保证窗口刚到时不会被并发调用打多次接口。
-        # 注意：跨进程的并发还是要靠"以 DB 时间戳为准"的语义来保证，本锁
-        # 只防同一 worker 进程内的高并发竞争。
+        # 跨进程并发由"以 DB 时间戳为准"的语义保证，本锁只防同进程内竞态。
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._renderer = NarrativeRenderer()
 
     def _build_chain(self):
         """
         构建 LangChain 调用链。
         --------------------------------------------------------------
-        关键点：
         - 通过 ChatOpenAI 的 OpenAI 兼容协议调用 DeepSeek。
         - **思考模式（deepseek-reasoner）**：
-          * 服务端会把 deepseek-v4-pro 等带思考能力的别名路由到
-            ``deepseek-reasoner`` 引擎。
-          * **该引擎不支持 ``tool_choice``**（即不支持 function calling），
-            如果在这种模式下调用 ``with_structured_output(method="function_calling")``
-            会被服务端 400：``deepseek-reasoner does not support this tool_choice``。
-          * 因此思考模式下改走"提示词约束 + JSON 解析"路线：
-            用 PydanticOutputParser 把 schema 注入 system prompt，模型
-            直接以 JSON 文本作为 content 返回，由 ``analyze`` 手动解析。
-          * extra_body={"thinking": {"type": "enabled"}} 透传给底层 OpenAI
-            client 开启思维链；reasoning_effort 控制思考强度。这两个参数
-            ChatOpenAI 都支持作为顶层 kwargs，比塞进 model_kwargs 更干净，
-            也能避免 langchain 抛 "should be specified explicitly" 的 UserWarning。
-          * 思考模式下 temperature 不生效，因此不再传入。
+          * 不支持 ``tool_choice`` → 走"提示词约束 + JSON 解析"路线。
+          * 使用 ``_build_deepseek_chat_openai_class()`` 透传 reasoning_content。
+          * extra_body={"thinking": {"type": "enabled"}} 开启思维链。
+          * temperature 在思考模式下不生效，不传入。
         - **非思考模式（deepseek-chat）**：
-          * 仍然走 ``with_structured_output(method="function_calling")``，
-            走 schema 校验路径，准确率最高。
-
-        返回的是已经构建好的 Runnable；同时把"是否思考模式"记到
-        ``self._chain_thinking_mode``，供 ``analyze`` 决定如何解析返回值。
-
-        ChatOpenAI 类的选择策略：
-            - 思考模式：使用 ``_build_deepseek_chat_openai_class()`` 返回的
-              子类，它会把 DeepSeek 的 ``reasoning_content`` 透传到
-              AIMessage.additional_kwargs，否则 langchain-openai 会丢字段，
-              导致 signals.reasoning_content 永远写入 NULL。
-            - 非思考模式：原生 ``ChatOpenAI`` 即可（响应里本就没有该字段）。
+          * 走 ``with_structured_output(method="function_calling")``。
         """
         from langchain_openai import ChatOpenAI
 
         if not self.settings.deepseek_api_key:
-            logger.warning(
-                "未配置 DEEPSEEK_API_KEY，运行时将跳过 LLM 分析"
-            )
+            logger.warning("未配置 DEEPSEEK_API_KEY，运行时将跳过 LLM 分析")
 
         thinking_enabled = bool(self.settings.deepseek_thinking_enabled)
         chat_openai_cls = (
@@ -695,25 +404,23 @@ class LLMAgent:
         # ----------------------------------------------------------------
         # few-shot 示例以 message history 注入（最佳实践）
         # ----------------------------------------------------------------
-        # 把 FEW_SHOT_EXAMPLES 的 (human_text, ai_text) 二元组转成
-        # HumanMessage / AIMessage 实例，**插在 system 与运行期 human
-        # 之间**。直接用 BaseMessage 实例可以跳过 ChatPromptTemplate 的
-        # f-string 渲染（不需要把 JSON 中的 ``{`` ``}`` 双写转义），
-        # 也不会被 partial(format_instructions=...) 注入污染。
-        # 设计来源：LangChain FewShotChatMessagePromptTemplate 文档
-        # + Anthropic Few-Shot Best Practices 2024。
+        # 把 (human_text, ai_text) 转成 HumanMessage / AIMessage 实例，
+        # 插在 system 与运行期 human 之间。直接用 BaseMessage 实例可以
+        # 跳过 ChatPromptTemplate 的 f-string 渲染（不需要把 JSON 中的
+        # ``{`` ``}`` 双写转义），也不会被 partial 注入污染。
         few_shot_messages: List[Any] = []
         for human_text, ai_text in FEW_SHOT_EXAMPLES:
             few_shot_messages.append(HumanMessage(content=human_text))
             few_shot_messages.append(AIMessage(content=ai_text))
 
-        # 思考模式 / 非思考模式都共用同一份 few-shot；两条分支只在
-        # 是否追加 THINKING_OUTPUT_INSTRUCTIONS 与是否走 function_calling
-        # 上有差别。
         base_messages: List[Any] = [("system", SYSTEM_PROMPT), *few_shot_messages]
 
+        logger.info(
+            "构建 LangChain 调用链（thinking=%s，few-shot=%d）",
+            thinking_enabled, len(FEW_SHOT_EXAMPLES),
+        )
+
         if thinking_enabled:
-            # 思考模式：deepseek-reasoner 不支持 tool_choice，走 prompt + 手动解析。
             parser = PydanticOutputParser(pydantic_object=TradingSignal)
             messages = base_messages + [
                 ("system", THINKING_OUTPUT_INSTRUCTIONS),
@@ -723,13 +430,8 @@ class LLMAgent:
                 format_instructions=parser.get_format_instructions()
             )
             self._chain_thinking_mode = True
-            # 直接返回 AIMessage（不挂解析器），analyze() 里负责 reasoning_content
-            # 抽取 + JSON 解析；如果在链上挂解析器，解析失败会在 chain 内抛错，
-            # 我们就拿不到原始 content 用于排错日志了。
             return prompt | llm
 
-        # 非思考模式：走 function calling，用 langchain 的 structured_output
-        # 直接给我们 dict {"raw": AIMessage, "parsed": TradingSignal, ...}。
         structured = llm.with_structured_output(
             TradingSignal, method="function_calling", include_raw=True
         )
@@ -741,18 +443,13 @@ class LLMAgent:
 
     @property
     def enabled(self) -> bool:
-        """
-        是否启用 LLM。
-        --------------------------------------------------------------
-        以是否配置了 DeepSeek API Key 为准；未配置时整个 LLM 链路降级，
-        外层 service 会回退到纯规则引擎结果。
-        """
+        """是否启用 LLM。以是否配置了 DeepSeek API Key 为准。"""
         return bool(self.settings.deepseek_api_key)
 
     @property
     def min_interval(self) -> int:
         """
-        LLM 调用最小间隔（秒）—— P0 静态版，作为自适应节流的兜底
+        LLM 调用最小间隔（秒）—— 静态版，作为自适应节流的兜底
         --------------------------------------------------------------
         从 settings 读取，方便单元测试通过 monkeypatch 修改 settings 调整。
         compute_min_interval(factors) 抛任何异常时统一回退到该值。
@@ -761,110 +458,82 @@ class LLMAgent:
 
     def compute_min_interval(self, factors: Optional[Dict[str, Any]]) -> int:
         """
-        P1 自适应 LLM 节流：根据当前因子矩阵动态计算下一次允许调用的最小间隔
+        自适应 LLM 节流：根据当前因子矩阵动态计算下一次允许调用的最小间隔
         --------------------------------------------------------------
         参数：
-            factors: FactorAggregator.compute 的输出（多周期模式）；
-                     None 或老格式时直接走兜底
+            factors: FactorAggregator.compute 的输出
         返回：
             建议的 min_interval 秒数；失败 / 关闭时回退到 self.min_interval
-        规则（P3 升级版）：
+        档位（plan 第 5.2 节）：
             volatility_ratio = atr_5m × 12 / atr_1h
-                （把 5m ATR 折算到 1h 尺度后与 1h ATR 比较，> 1 表示 5 分钟波动异常放大）
-            volatility_ratio >= 1.5 或 regime ∈ {breakout, breakdown} → 900s（15 分钟）
-            volatility_ratio >= 1.2 或 |alignment_score| >= 0.5       → 600s（10 分钟）
-            其他                                                      → 1800s（30 分钟）
+                （5m ATR 折算到 1h 尺度后与 1h ATR 比较，> 1 表示 5 分钟波动异常放大）
 
-            P3 强制下限：当 regime ∈ {ranging, transitional} 时，无论上面命中
-            哪一档都强制 interval = max(interval, 1800)。原因：在窄幅震荡 /
-            状态切换期里 LLM 价值最低（叙事好但预测准确率接近随机），把节流
-            拉满省钱也避免 whipsaw。
+            volatility_ratio ≥ 1.5 或 regime ∈ {breakout, breakdown}
+              → llm_min_interval_high_vol（默认 300s = 5 分钟）
+            volatility_ratio ≥ 1.2 或 |alignment_score| ≥ 0.5
+              → llm_min_interval_mid（默认 600s = 10 分钟）
+            其他
+              → llm_min_interval_default（默认 1800s = 30 分钟）
 
-            alignment 阈值从 0.75 降到 0.5：原值要求 5/5 周期共振才能加速,
-            实测过严，多数有意义的趋势期都打不到；0.5 对应"5 票里有 3 票
-            同向"，更接近真实可交易场景。
-
-            上下限通过 settings.llm_min_interval_seconds_min/max 钳制。
+            注：删除了"regime ∈ {ranging, transitional} 强制 1800s 下限"
+            的老逻辑——突破临界点本就在 ranging 末端发生，强制拉满会错过最佳入场。
         """
-        # 关闭开关：直接回退到 P0 静态节流
-        if not bool(getattr(self.settings, "enable_adaptive_throttle", False)):
-            return self.min_interval
         try:
-            base_default = int(self.min_interval) if self.min_interval > 0 else 1800
-            lo = int(getattr(self.settings, "llm_min_interval_seconds_min", 900))
-            hi = int(getattr(self.settings, "llm_min_interval_seconds_max", 1800))
+            hi_vol = int(getattr(self.settings, "llm_min_interval_high_vol", 300))
+            mid = int(getattr(self.settings, "llm_min_interval_mid", 600))
+            default = int(getattr(self.settings, "llm_min_interval_default", 1800))
+
             if not factors or not isinstance(factors, dict):
-                return self._clamp_interval(base_default, lo, hi)
+                return default if self.min_interval > 0 else 0
 
             by_tf = factors.get("by_timeframe") or {}
             ms_5m = ((by_tf.get("5m") or {}).get("market_structure")) or {}
             ms_1h = ((by_tf.get("1h") or {}).get("market_structure")) or {}
-            atr_5m = ms_5m.get("atr_14")
-            atr_1h = ms_1h.get("atr_14")
+            atr_5m = _to_float_safe(ms_5m.get("atr_14"))
+            atr_1h = _to_float_safe(ms_1h.get("atr_14"))
             volatility_ratio: Optional[float] = None
-            try:
-                if atr_5m is not None and atr_1h is not None and float(atr_1h) > 0:
-                    volatility_ratio = float(atr_5m) * 12.0 / float(atr_1h)
-            except (TypeError, ValueError):
-                volatility_ratio = None
+            if atr_5m is not None and atr_1h is not None and atr_1h > 0:
+                volatility_ratio = atr_5m * 12.0 / atr_1h
 
             regime = factors.get("regime")
             mtf = factors.get("mtf_alignment") or {}
-            try:
-                alignment_score = abs(float(mtf.get("alignment_score") or 0.0))
-            except (TypeError, ValueError):
-                alignment_score = 0.0
+            alignment_score = abs(_to_float_safe(mtf.get("alignment_score")) or 0.0)
 
             if (volatility_ratio is not None and volatility_ratio >= 1.5) or regime in (
                 "breakout",
                 "breakdown",
             ):
-                interval = 900
+                interval = hi_vol
             elif (
                 volatility_ratio is not None and volatility_ratio >= 1.2
             ) or alignment_score >= 0.5:
-                interval = 600
+                interval = mid
             else:
-                interval = 1800
+                interval = default
 
-            # P3：窄幅震荡 / 状态切换期强制拉满节流
-            if regime in ("ranging", "transitional"):
-                interval = max(interval, 1800)
+            # 兜底：if user explicitly set llm_min_interval_seconds=0 means
+            # 完全关闭节流（调试用），尊重此设置。
+            if self.min_interval <= 0:
+                return 0
 
-            clamped = self._clamp_interval(interval, lo, hi)
             logger.debug(
-                "自适应 LLM 节流：volatility_ratio=%s regime=%s alignment=%.3f → %ds (clamped to %ds)",
+                "自适应 LLM 节流：volatility_ratio=%s regime=%s alignment=%.3f → %ds",
                 ("%.3f" % volatility_ratio) if volatility_ratio is not None else "-",
                 regime,
                 alignment_score,
                 interval,
-                clamped,
             )
-            return clamped
+            return int(interval)
         except Exception:
             logger.warning(
-                "compute_min_interval 计算失败，回退到 P0 默认 %ds",
+                "compute_min_interval 计算失败，回退到默认 %ds",
                 self.min_interval,
                 exc_info=True,
             )
             return self.min_interval
 
-    @staticmethod
-    def _clamp_interval(interval: int, lo: int, hi: int) -> int:
-        """
-        把建议节流秒数钳制到 [lo, hi]
-        """
-        if lo > hi:
-            lo, hi = hi, lo
-        return int(max(lo, min(int(interval), hi)))
-
     def _get_lock(self, symbol: str) -> asyncio.Lock:
-        """
-        获取或创建指定 symbol 对应的并发锁。
-        --------------------------------------------------------------
-        每个 symbol 独立加锁，避免多 symbol 之间互相阻塞；同一个 symbol
-        即使在缓存 miss 的瞬间被并发调用，也只会真正打一次 LLM。
-        """
+        """获取或创建指定 symbol 对应的并发锁。"""
         lock = self._locks.get(symbol)
         if lock is None:
             lock = asyncio.Lock()
@@ -876,8 +545,6 @@ class LLMAgent:
         """
         把 signals 表行里的"结构化交易计划"列规整成 TradingSignal 构造 kwargs
         --------------------------------------------------------------
-        P0 Quant 修复 #3 的辅助函数。
-
         类型转换说明：
             - NUMERIC 列经 asyncpg 默认返回 ``decimal.Decimal``；TradingSignal
               的字段是 float，这里统一转 float（精度损失对交易计划无影响）。
@@ -887,14 +554,7 @@ class LLMAgent:
               让 TradingSignal 走默认值；如果 bias != neutral 又凑不齐
               entry_zone / stop_loss / 2 档 take_profit，model_validator
               会抛 ValueError，调用方 catch 后会让本轮走真 LLM 调用。
-
-        参数：
-            row: fetch_latest_signal_judgment 返回的 dict
-        返回：
-            可直接 **kwargs 解包给 TradingSignal(...) 的字典；
-            缺什么字段就不放什么键，不会硬塞 None 进去。
         """
-
         def _to_float(v: Any) -> Optional[float]:
             if v is None:
                 return None
@@ -905,7 +565,6 @@ class LLMAgent:
 
         kwargs: Dict[str, Any] = {}
 
-        # entry_zone：JSONB 存成 [low, high]，TradingSignal 期望 tuple
         ez = row.get("entry_zone")
         if isinstance(ez, (list, tuple)) and len(ez) == 2:
             ez_low = _to_float(ez[0])
@@ -937,7 +596,6 @@ class LLMAgent:
 
         tfa = row.get("timeframe_alignment")
         if isinstance(tfa, dict) and tfa:
-            # 仅保留 value 是 str 的项，避免脏数据破坏 schema
             kwargs["timeframe_alignment"] = {
                 str(k): str(v) for k, v in tfa.items() if isinstance(v, str)
             }
@@ -954,39 +612,26 @@ class LLMAgent:
         self,
         symbol: str,
         min_interval: Optional[int] = None,
-        factors: Optional[Dict[str, Any]] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         若指定 symbol 在节流窗口内已有 LLM 判断（落在 signals 表里），
         则把它重建成 LLMAnalysisResult 返回；否则返回 None 让上层调用 LLM。
         --------------------------------------------------------------
         参数：
-            symbol:       合约代码
-            min_interval: P1 自适应节流窗口（秒）。None 时回退到 self.min_interval。
-            factors:      当前最新因子矩阵（可选）。仅用于"缓存价格漂移检查"——
-                          缓存命中且 bias ∈ {long, short} 时，对比缓存的 entry_mid
-                          和当前 last_close(15m) 的偏差是否 ≥ 阈值 × ATR(15m)。
-                          None 时跳过漂移检查（行为退回纯节流缓存）。
+            symbol      : 合约代码
+            min_interval: 节流窗口（秒）。None 时回退到 self.min_interval。
         步骤：
             1) ``effective_interval <= 0``：节流关闭，直接返回 None（每次都真调）。
-            2) 查 signals 表里该 symbol 最近一条记录的 ts；
-               表为空则视为未节流，让上层去打 LLM。
+            2) 查 signals 表里该 symbol 最近一条记录的 ts；表为空 / 查询失败
+               都返回 None 让上层去打 LLM。
             3) 计算 ``now - ts``；
                - ``< effective_interval``：节流命中，把那一行的 bias / confidence
-                 / reason / risk / suggestion / reasoning_content 重建成
-                 LLMAnalysisResult，并把 ``from_cache`` 置 True 返回。
-                 service 层据此跳过本次入库，避免重复行。
+                 / reason / risk / suggestion / reasoning_content / plan 字段
+                 重建成 LLMAnalysisResult，置 ``from_cache=True`` 返回。
                - ``>= effective_interval``：节流过期，返回 None。
-            4) **B 增量**：第 3 步命中缓存后，再做一道"价格漂移检查"——
-               若当前价距缓存 entry_mid 漂移 ≥ 阈值 × ATR(15m)，视为缓存
-               价位过期，返回 None 让上层强制真打一次 LLM。这能避免在
-               1800s 节流窗口内透出"价格已经回不去"的过期入场建议。
-               配套节流冷却 (decision_cache_stale_min_age_seconds，默认 300s)
-               保证刚返回的缓存不会被 1m 抖动反复触发重调，守住成本预算下限。
         异常处理：
-            DB 查询失败时（如连接被 reset），不应阻塞 LLM 调用；记一行
-            warning 后返回 None，让上层退化为"直接打 LLM"——成本上界仍是
-            effective_interval，最差也只是少一次节流命中。
+            DB 查询失败 / 历史脏行无法重建 schema 时不应阻塞 LLM 调用；
+            记一行 warning 后返回 None，让上层退化为"直接打 LLM"。
         """
         effective_interval = (
             int(min_interval) if min_interval is not None else self.min_interval
@@ -1008,8 +653,6 @@ class LLMAgent:
         last_ts: Optional[datetime] = row.get("ts")
         if last_ts is None:
             return None
-        # 兼容部分驱动 / 历史数据返回 naive datetime 的情形：把它当作 UTC。
-        # signals.ts 的 schema 是 TIMESTAMPTZ，正常情况下 asyncpg 会带 tzinfo。
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
 
@@ -1017,21 +660,6 @@ class LLMAgent:
         if elapsed >= effective_interval:
             return None
 
-        # P0 Quant 修复 #3：完整重建 TradingSignal（含结构化交易计划）
-        # ------------------------------------------------------------
-        # 旧版逻辑：先用 bias="neutral" 构造让 model_validator 通过，
-        # 再 object.__setattr__ 覆盖 bias 回真实值。这绕过了 schema 强约束，
-        # 会向上游透出"bias=long、entry_zone=None、take_profit=[]"的脏信号
-        # （前端 service.generate 里 final.model_dump() 是无差别透出的）。
-        #
-        # 新版逻辑：从 row 里把 P0 升级新增的 7 个结构化列一并取出来，
-        # 完整构造 TradingSignal 让 model_validator 真实通过。
-        # 副作用：
-        #   - 历史脏行（旧版 LLM 没产 plan 就入库的）会触发 ValueError，
-        #     我们 catch 后返回 None，让本轮去真打一次 LLM 重新建判断；
-        #     这恰恰是我们想要的行为：宁可多调一次 LLM，也不能透出脏 plan。
-        #   - schema 里 RR < 1.5 会强制降级为 neutral 并清空 plan，
-        #     与"真正调用 LLM 时的语义"保持一致。
         cached_plan_kwargs = self._collect_cached_plan_kwargs(row)
         try:
             cached_signal = TradingSignal(
@@ -1043,46 +671,18 @@ class LLMAgent:
                 **cached_plan_kwargs,
             )
         except Exception:
-            # 历史脏数据 / schema 不匹配 / 几何不合规：不强行卡死节流通道；
-            # 记日志后当作没有缓存处理，让本轮去真打一次 LLM 重建判断。
             logger.warning(
-                "无法从 signals 表行重建 %s 的 TradingSignal（多半是历史脏行/"
-                "结构化字段缺失）；将按未命中缓存重新调用 LLM",
+                "无法从 signals 表行重建 %s 的 TradingSignal（多半是历史脏行"
+                " / 结构化字段缺失）；将按未命中缓存重新调用 LLM",
                 symbol,
                 exc_info=True,
             )
             return None
 
-        # ----------------------------------------------------------------
-        # B 增量：缓存"价位过期"漂移检查
-        # ----------------------------------------------------------------
-        # 详细背景见本方法 docstring。这里只做一次轻量计算：
-        #   - 仅当传入了 factors（service 调用路径）才检查；
-        #   - 仅当缓存的 bias ∈ {long, short} 且 entry_zone 完整时检查；
-        #   - 仅当缓存年龄 ≥ decision_cache_stale_min_age_seconds 时检查
-        #     （刚返回的缓存不会被 1m 抖动立刻打挂）；
-        #   - 计算结果由 _is_cache_stale_by_price 给出布尔 + 调试 detail。
-        # 触发漂移则返回 None，外层会真正调用一次 LLM、写一条新 signal，
-        # 隐式刷新节流窗口，下一轮起再以新的 ts 为准。
-        if factors is not None and elapsed >= float(
-            getattr(self.settings, "decision_cache_stale_min_age_seconds", 300)
-        ):
-            stale, stale_detail = self._is_cache_stale_by_price(
-                cached_signal=cached_signal,
-                factors=factors,
-            )
-            if stale:
-                logger.info(
-                    "LLM 缓存价格漂移触发强制刷新 %s（已过 %.0fs，detail=%s）；"
-                    "本轮将真打一次 LLM 重建判断",
-                    symbol,
-                    elapsed,
-                    stale_detail,
-                )
-                return None
-
         remaining = effective_interval - elapsed
-        logger.info(
+        # 节流命中是常态轮询事件（每个 signal 周期都会触发），打 INFO 会刷屏。
+        # 真正想观察"什么时候才会发起下一次 LLM 调用"时，把日志级别调到 DEBUG 即可。
+        logger.debug(
             "LLM 数据库节流命中 %s（已过 %.0fs，下次调用还需 %.0fs，min_interval=%ds）",
             symbol,
             elapsed,
@@ -1095,147 +695,27 @@ class LLMAgent:
             from_cache=True,
         )
 
-    def _is_cache_stale_by_price(
-        self,
-        cached_signal: TradingSignal,
-        factors: Optional[Dict[str, Any]],
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        判断"缓存信号是否因为价格漂移而过期"
-        --------------------------------------------------------------
-        参数：
-            cached_signal : 从 signals 表重建出的 TradingSignal
-                            （已通过 schema 强约束，bias=long/short 时 entry_zone 必有）
-            factors       : FactorAggregator.compute 输出的最新因子矩阵
-        返回：
-            (stale, detail)
-            - stale  : True 表示需要强制重调 LLM；False 表示缓存仍可用
-            - detail : 调试用字典，键含 current_price / cached_entry_mid /
-                       drift / threshold；触发时打日志好排查。
-                       未触发时也填了关键中间值，便于 debug 级别复现。
-        判定规则（任一不满足即视为"无法判定 → 不触发漂移"，保留缓存）：
-            1) decision_cache_stale_drift_atr_15m 阈值 > 0；
-            2) factors 是 dict 且能拿到 by_timeframe.15m.market_structure；
-            3) cached_signal.bias ∈ {long, short} 且 entry_zone 是 (low, high) 元组；
-            4) ATR(15m) 与 last_close(15m) 都非空且 > 0。
-        触发条件：
-            |last_close(15m) - cached_entry_mid| >= threshold × ATR(15m)
-        设计取舍：
-            - 阈值用 ATR(15m) 而不是绝对百分比：让阈值随波动率自适应，
-              低波动期不会误触发，高波动期及时刷新。
-            - 仅看 last_close(15m) 而不取 1m close：1m 噪声大，与本机制
-              "防止透出过期入场建议"的目标不一致——15m close 已经过滤掉
-              短期插针，刚好对应"行情已经走了一根 15m K 线"的级别。
-        """
-        # 默认调试详情结构，保证返回的 detail 一定有这些键
-        detail: Dict[str, Any] = {
-            "threshold_atr_mult": None,
-            "atr_15m": None,
-            "current_price": None,
-            "cached_entry_mid": None,
-            "drift": None,
-            "drift_threshold": None,
-            "skip_reason": None,
-        }
-        threshold_mult = self._safe_float(
-            getattr(self.settings, "decision_cache_stale_drift_atr_15m", None)
-        )
-        detail["threshold_atr_mult"] = threshold_mult
-        if threshold_mult is None or threshold_mult <= 0:
-            detail["skip_reason"] = "threshold_disabled"
-            return False, detail
-
-        if not isinstance(factors, dict):
-            detail["skip_reason"] = "factors_not_dict"
-            return False, detail
-
-        bias = getattr(cached_signal, "bias", None)
-        if bias not in ("long", "short"):
-            detail["skip_reason"] = f"bias_not_directional({bias})"
-            return False, detail
-
-        ez = getattr(cached_signal, "entry_zone", None)
-        if not isinstance(ez, (list, tuple)) or len(ez) != 2:
-            detail["skip_reason"] = "entry_zone_missing"
-            return False, detail
-        ez_low = self._safe_float(ez[0])
-        ez_high = self._safe_float(ez[1])
-        if ez_low is None or ez_high is None:
-            detail["skip_reason"] = "entry_zone_invalid"
-            return False, detail
-        cached_entry_mid = (ez_low + ez_high) / 2.0
-        detail["cached_entry_mid"] = cached_entry_mid
-
-        by_tf = factors.get("by_timeframe") or {}
-        ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
-        atr_15m = self._safe_float(ms_15m.get("atr_14"))
-        current_price = self._safe_float(ms_15m.get("last_close"))
-        detail["atr_15m"] = atr_15m
-        detail["current_price"] = current_price
-        if atr_15m is None or atr_15m <= 0 or current_price is None:
-            detail["skip_reason"] = "missing_atr_or_price_15m"
-            return False, detail
-
-        drift = abs(current_price - cached_entry_mid)
-        drift_threshold = float(threshold_mult) * float(atr_15m)
-        detail["drift"] = drift
-        detail["drift_threshold"] = drift_threshold
-
-        if drift >= drift_threshold:
-            return True, detail
-        return False, detail
-
-    @staticmethod
-    def _safe_float(v: Any) -> Optional[float]:
-        """
-        把任意输入转 float，失败 / NaN / Inf 一律返回 None
-        --------------------------------------------------------------
-        与模块顶部 ``_to_float_safe`` 同语义；这里加一个类静态版本
-        是为了让 _is_cache_stale_by_price 这种实例方法可以
-        直接 self._safe_float(...) 调用，避免在多处重复 import。
-        """
-        return _to_float_safe(v)
-
     # ------------------------------------------------------------------
-    # Prompt 构造（多周期因子矩阵 → 紧凑中文表格）
+    # Prompt 构造（NarrativeRenderer 7 段叙事 + 当前价）
     # ------------------------------------------------------------------
     def _build_prompt_inputs(
         self,
         symbol: str,
         factors: Dict[str, Any],
-        rule_signal: TradingSignal,
-        rule_score: float,
-        rule_contributions: Dict[str, float],
-        recent_settled: Optional[List[Dict[str, Any]]] = None,
-        evaluation_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        把多周期因子矩阵渲染成紧凑中文表格，作为 ChatPromptTemplate 输入
-        ---------------------------------------------------------------
+        渲染 HUMAN_PROMPT 占位符所需的 dict
+        --------------------------------------------------------------
         参数：
-            symbol / factors / rule_signal / rule_score / rule_contributions:
-                同 analyze() 形参
-            recent_settled:
-                近 N 条已结算 lifecycle 行（可选）。**注意**：这里不再接收
-                "上一条未结算"作为输入——本系统只产建议、不掌握用户是否
-                实际下单，把 lifecycle 的 open 行当成"持仓"是概念错位，
-                会导致 LLM 被自己 30 分钟前的旧判断绑架。方向冲突 / 净敞口
-                控制属于后续持仓管理层职责，已从 prompt 中彻底移除。
-            evaluation_summary:
-                P3 升级新增。``signal_evaluation`` 表中近 24h 那一行
-                （window_minutes=1440）。用于渲染"系统级评估"段，把胜率/
-                翻转率/Sharpe/Brier 等宏观指标灌给 LLM 做自适应放慢决策。
-                None 时段落显示"无系统级评估数据"，behavior 与 P2 完全一致。
+            symbol  : 合约代码（必须通过 _SYMBOL_PATTERN 白名单）
+            factors : FactorAggregator.compute 输出
         返回：
             ChatPromptTemplate.format 所需的全部 key-value 字典。
         说明：
-            - 多周期模式下逐周期渲染表格行；缺失字段统一显示 '-'。
-            - 老格式（无 by_timeframe）下，自动降级为单行 / 单段表格，
-              保证回滚通道 LLM 仍然能拿到结构化输入。
-            - symbol 必须通过 ``_SYMBOL_PATTERN`` 白名单校验；否则直接抛
-              ``ValueError``。这是防 prompt injection 的轻量保护——symbol
-              会被原样拼到 system / human 文本与下游 reason 中，必须保证
-              不含任何控制字符 / 多行符 / 注入语义。
+            - symbol 必须通过白名单校验，防 prompt injection
+              （symbol 会被原样拼到 system / human / 下游 reason 中）。
+            - NarrativeRenderer 内部容错：任一段数据缺失时返回提示文本，
+              不会因为一个字段空导致 KeyError。
         """
         if not _SYMBOL_PATTERN.match(symbol):
             raise ValueError(
@@ -1243,583 +723,39 @@ class LLMAgent:
                 f"长度 3–32（首字符必须为字母或数字）"
             )
 
-        is_mtf = "by_timeframe" in factors
-
         ts = factors.get("computed_at") or ""
 
-        if is_mtf:
-            mtf_factor_table = self._render_mtf_factor_table(factors)
-            mtf_alignment_text = self._render_alignment(factors)
-            derivatives_text = self._render_derivatives_text(factors)
-            liquidations_table = self._render_liquidations_table(factors)
-            key_levels_text = self._render_key_levels(factors)
-            orderbook_text = self._render_orderbook(factors, mtf=True)
-            regime_text = self._render_regime(factors)
-            orderbook_dynamic_text = self._render_orderbook_dynamic(factors)
-            position_ratios_text = self._render_position_ratios(factors)
-            liquidity_text = self._render_liquidity(factors)
-        else:
-            mtf_factor_table = self._render_legacy_factor_block(factors)
-            mtf_alignment_text = "（老聚合器模式：未提供多周期共振）"
-            derivatives_text = self._render_legacy_derivatives(factors)
-            liquidations_table = "（老聚合器模式：未提供爆仓窗口）"
-            key_levels_text = self._render_legacy_key_levels(factors)
-            orderbook_text = self._render_orderbook(factors, mtf=False)
-            regime_text = "regime: -（老聚合器模式不提供 regime）"
-            orderbook_dynamic_text = "（老聚合器模式：未提供订单簿时序）"
-            position_ratios_text = "（老聚合器模式：未提供散户/精英多空比）"
-            liquidity_text = "（老聚合器模式：未提供流动性地图）"
+        by_tf = factors.get("by_timeframe") or {}
+        ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
+        last_close_v = _to_float_safe(ms_15m.get("last_close"))
+        last_close = f"{last_close_v:.2f}" if last_close_v is not None else "-"
 
-        # P2：自我反馈段（注入到 HUMAN_PROMPT 的最前面）
-        # ----------------------------------------------------------
-        # 仅当 enable_llm_self_feedback=True 时渲染；
-        # recent_settled 为空时 _render_self_feedback 自身会输出"样本不足"段。
-        # open_lifecycle 注入链路已彻底移除（详见 _build_prompt_inputs docstring）。
-        if bool(getattr(self.settings, "enable_llm_self_feedback", False)):
-            self_feedback_block = self._render_self_feedback(
-                symbol=symbol,
-                recent_settled=recent_settled or [],
-            )
-        else:
-            self_feedback_block = ""
-
-        # P3：系统级评估段（注入到 self_feedback_block 之后）
-        # ----------------------------------------------------------
-        # 仅当 enable_signal_evaluation=True 且评估器写过表时才有内容；
-        # 任一条件不满足都退化为"无数据"提示，避免 prompt 中出现噪声。
-        if bool(getattr(self.settings, "enable_signal_evaluation", False)):
-            evaluation_block = self._render_evaluation_block(
-                symbol=symbol, evaluation=evaluation_summary
-            )
-        else:
-            evaluation_block = ""
+        sections = self._renderer.render_sections(factors)
 
         return {
             "symbol": symbol,
             "ts": ts,
-            "rule_bias": rule_signal.bias,
-            "rule_confidence": round(float(rule_signal.confidence), 4),
-            "rule_score": round(rule_score, 4),
-            "rule_contributions": json.dumps(rule_contributions, ensure_ascii=False),
-            "mtf_factor_table": mtf_factor_table,
-            "mtf_alignment_text": mtf_alignment_text,
-            "derivatives_text": derivatives_text,
-            "liquidations_table": liquidations_table,
-            "key_levels_text": key_levels_text,
-            "orderbook_text": orderbook_text,
-            "regime_text": regime_text,
-            "orderbook_dynamic_text": orderbook_dynamic_text,
-            "position_ratios_text": position_ratios_text,
-            "liquidity_text": liquidity_text,
-            "self_feedback_block": self_feedback_block,
-            "evaluation_block": evaluation_block,
+            "last_close": last_close,
+            "market_state": sections["market_state"],
+            "mtf_direction": sections["mtf_direction"],
+            "capital_action": sections["capital_action"],
+            "derivatives": sections["derivatives"],
+            "key_levels": sections["key_levels"],
+            "liquidity": sections["liquidity"],
+            "liquidations": sections["liquidations"],
         }
-
-    @classmethod
-    def _render_self_feedback(
-        cls,
-        symbol: str,
-        recent_settled: List[Dict[str, Any]],
-    ) -> str:
-        """
-        渲染近 N 次成绩单（P2 自我反馈，aggressive 修订版）
-        ---------------------------------------------------------------
-        参数：
-            symbol         : 合约
-            recent_settled : 近 N 条已结算 lifecycle（含 join 出来的 signals 字段）
-        返回：
-            紧凑中文表格 + 统计摘要；总长度严格控制在 ~1500 token 以内。
-
-        修订点（相对历史版本）：
-            1) 不再渲染"⚠️ 上一条信号 #N 仍未结算"段：信号引擎只产建议，
-               不掌握用户实际持仓。方向冲突属于持仓管理层职责，不应在
-               LLM prompt 里强制 neutral。
-            2) 把成绩单按"是否真正入过场"拆成两段：
-                 - 判断质量段（triggered_at IS NOT NULL）：仅统计
-                   wins / (wins + losses)，expired-after-triggered（曾入场
-                   但超时退出）单独列出，不污染胜率分母；
-                 - 触发率段（fill rate）：triggered_count / total，反映
-                   入场区间是否合理；fill_rate 偏低提示 reason 自我反思
-                   "区间过窄/过远"，但不强制降置信度。
-            3) 这样既保留"判断方向准不准"信号给 LLM，又不会把"价格没回到
-               入场区间"误判成"判断错"，避免历史版本"5次全 expired→胜率0%
-               →强压 confidence 至 0.3"的吸收态。
-        """
-        lines: List[str] = []
-        n = len(recent_settled)
-        lines.append(f"===== 你最近 {n} 次判断的成绩单（{symbol}）=====")
-
-        if not recent_settled:
-            lines.append("（样本不足：lifecycle 表里还没有该 symbol 的已结算记录）")
-            lines.append("")
-            return "\n".join(lines) + "\n"
-
-        # 按"是否曾入场"切分两组
-        triggered_rows: List[Dict[str, Any]] = []
-        untriggered_rows: List[Dict[str, Any]] = []
-        for row in recent_settled:
-            if row.get("triggered_at") is not None:
-                triggered_rows.append(row)
-            else:
-                untriggered_rows.append(row)
-
-        # ----------------------------------------------------------------
-        # 第 1 段：判断质量（仅曾入场的样本）
-        # ----------------------------------------------------------------
-        lines.append("")
-        lines.append(
-            f"【判断质量段】曾入场样本 = {len(triggered_rows)} / {n}"
-        )
-        wins = 0
-        losses = 0
-        expired_after_triggered = 0
-        pnl_acc: List[float] = []
-        if not triggered_rows:
-            lines.append("（无曾入场样本：所有信号均未触发，无法评估方向准确性）")
-        else:
-            lines.append(
-                "| ts | bias | conf | regime | 入场区间 | 触发价 | 终态 | PnL% | 最大有利% | 最大不利% |"
-            )
-            lines.append(
-                "|----|------|------|--------|----------|--------|------|------|-----------|-----------|"
-            )
-            for row in triggered_rows:
-                ts = row.get("signal_ts")
-                ts_str = ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else "-"
-                bias = row.get("bias") or "-"
-                conf = row.get("confidence")
-                conf_str = f"{float(conf):.2f}" if conf is not None else "-"
-                regime = cls._extract_regime_from_factors(row.get("factors"))
-                ez_low = row.get("entry_zone_low")
-                ez_high = row.get("entry_zone_high")
-                ez_str = (
-                    f"[{float(ez_low):.2f},{float(ez_high):.2f}]"
-                    if ez_low is not None and ez_high is not None
-                    else "-"
-                )
-                trig = row.get("triggered_price")
-                trig_str = f"{float(trig):.2f}" if trig is not None else "-"
-                status = row.get("status") or "-"
-                pnl = row.get("pnl_pct")
-                pnl_str = f"{float(pnl) * 100:+.2f}" if pnl is not None else "-"
-                mfp = row.get("max_favorable_pct")
-                mfp_str = f"{float(mfp) * 100:+.2f}" if mfp is not None else "-"
-                map_ = row.get("max_adverse_pct")
-                map_str = f"{float(map_) * 100:+.2f}" if map_ is not None else "-"
-                lines.append(
-                    f"| {ts_str} | {bias} | {conf_str} | {regime} | {ez_str} | "
-                    f"{trig_str} | {status} | {pnl_str} | {mfp_str} | {map_str} |"
-                )
-                if status in ("tp1_hit", "tp2_hit"):
-                    wins += 1
-                elif status == "sl_hit":
-                    losses += 1
-                elif status == "expired":
-                    expired_after_triggered += 1
-                if pnl is not None:
-                    pnl_acc.append(float(pnl))
-
-            decided = wins + losses
-            win_rate = (wins / decided) if decided > 0 else 0.0
-            avg_pnl = sum(pnl_acc) / len(pnl_acc) if pnl_acc else 0.0
-            lines.append(
-                f"统计（仅曾入场）：胜率={win_rate:.0%}（{wins}赢 / {losses}输；"
-                f"另有 {expired_after_triggered} 笔曾入场但超时未到 SL/TP，不计入分母）"
-                f"  平均PnL={avg_pnl * 100:+.2f}%  样本={decided}"
-            )
-
-        # ----------------------------------------------------------------
-        # 第 2 段：触发率（fill rate）—— 衡量入场区间设置是否合理
-        # ----------------------------------------------------------------
-        lines.append("")
-        triggered_total = len(triggered_rows)
-        fill_rate = triggered_total / n if n > 0 else 0.0
-        lines.append(
-            f"【触发率段】fill_rate={fill_rate:.0%}（{triggered_total}/{n} 触发入场）；"
-            f"未触发 {len(untriggered_rows)} 笔（价格从未回到 entry_zone 即超时/作废）"
-        )
-        if untriggered_rows and fill_rate < 0.3:
-            lines.append(
-                "提示：fill_rate 偏低（< 30%）通常意味着入场区间过窄或方向偏移过早，"
-                "建议在 reason 中反思入场设计，但不必单方面降低 confidence。"
-            )
-
-        lines.append("")
-        return "\n".join(lines) + "\n"
-
-    @classmethod
-    def _render_evaluation_block(
-        cls,
-        symbol: str,
-        evaluation: Optional[Dict[str, Any]],
-    ) -> str:
-        """
-        渲染近 24h 系统级评估摘要（P3 升级新增）
-        ---------------------------------------------------------------
-        参数：
-            symbol     : 合约（仅作标题展示）
-            evaluation : ``signal_evaluation`` 表近 24h 那一行；None 表示
-                         "评估器尚未跑过 / 无样本"。
-        返回：
-            一段紧凑中文文本，结尾带换行；保证 prompt 结构稳定。
-        说明：
-            - 任意字段缺失时显示 "-"，避免把 None / Decimal 直接拼进 prompt。
-            - 与 P3 强约束段（SYSTEM_PROMPT 末尾）配合：LLM 看到
-              direction_flip_rate > 30%、avg_pnl_pct < 0、brier_score > 0.30
-              时会主动降低 confidence。
-        """
-        lines: List[str] = [
-            f"===== 系统级评估（近 24h，{symbol}）====="
-        ]
-        if not evaluation:
-            lines.append(
-                "（暂无系统级评估数据：评估器尚未跑过或 24h 内无 LLM 信号）"
-            )
-            lines.append("")
-            return "\n".join(lines) + "\n"
-
-        def _pct(v: Any, digits: int = 2) -> str:
-            """把 [0, 1] 比例 / [-1, 1] 收益率渲染成百分比字符串"""
-            f = _to_float_safe(v)
-            if f is None:
-                return "-"
-            return f"{f * 100:+.{digits}f}%"
-
-        def _num(v: Any, digits: int = 4) -> str:
-            f = _to_float_safe(v)
-            if f is None:
-                return "-"
-            return f"{f:.{digits}f}"
-
-        total = evaluation.get("total_signals") or 0
-        triggered = evaluation.get("triggered_count") or 0
-        wins = evaluation.get("wins")
-        losses = evaluation.get("losses")
-        decided = (int(wins or 0) + int(losses or 0)) if (wins is not None or losses is not None) else 0
-        flip_rate = _to_float_safe(evaluation.get("direction_flip_rate"))
-        avg_pnl = _to_float_safe(evaluation.get("avg_pnl_pct"))
-        sharpe = _to_float_safe(evaluation.get("sharpe_estimated"))
-        brier = _to_float_safe(evaluation.get("brier_score"))
-
-        lines.append(
-            f"信号总数={total}，触发入场={triggered}，"
-            f"触发率={_pct(evaluation.get('fill_rate'), 1)}，"
-            f"胜率={_pct(evaluation.get('win_rate'), 1)}（{decided} 笔决定性）"
-        )
-        lines.append(
-            f"平均PnL={_pct(avg_pnl, 2)}，"
-            f"累计PnL={_pct(evaluation.get('total_pnl_pct'), 2)}，"
-            f"估算Sharpe={_num(sharpe, 3)}，Brier={_num(brier, 4)}"
-        )
-        lines.append(
-            f"方向翻转={evaluation.get('direction_flip_count')} 次，"
-            f"翻转率={_pct(flip_rate, 1)}"
-        )
-
-        # 自动写出主要预警信号（与 P3 强约束段配合）
-        warnings: List[str] = []
-        if flip_rate is not None and flip_rate > 0.30:
-            warnings.append(
-                f"方向翻转率 {flip_rate * 100:.0f}% 高于 30%，市场近 24h whipsaw"
-            )
-        if avg_pnl is not None and avg_pnl < 0:
-            warnings.append(
-                f"平均PnL {avg_pnl * 100:+.2f}% 为负，系统近 24h 净亏损"
-            )
-        if sharpe is not None and sharpe < 0:
-            warnings.append(f"Sharpe {sharpe:.2f} < 0，风险调整收益为负")
-        if brier is not None and brier > 0.30:
-            warnings.append(
-                f"Brier {brier:.3f} > 0.30，置信度严重失校"
-            )
-        if warnings:
-            lines.append(
-                "P3 预警：" + "；".join(warnings) + "（参见 SYSTEM_PROMPT P3 强约束段）"
-            )
-
-        lines.append("")
-        return "\n".join(lines) + "\n"
-
-    @staticmethod
-    def _extract_regime_from_factors(factors_blob: Any) -> str:
-        """
-        从 signals.factors JSONB 中尽力取出 regime 字段（成绩单展示用）
-        """
-        if not isinstance(factors_blob, dict):
-            return "-"
-        inner = factors_blob.get("factors") if "factors" in factors_blob else factors_blob
-        if isinstance(inner, dict):
-            r = inner.get("regime")
-            if isinstance(r, str) and r:
-                return r
-        return "-"
-
-    @staticmethod
-    def _fmt(value: Any, digits: int = 4) -> str:
-        """
-        统一的数值格式化：None -> '-'；float 保留指定位数；其它走 str
-        ---------------------------------------------------------------
-        参数：
-            value:  原始值
-            digits: float 保留的小数位
-        返回：
-            渲染后的字符串。
-        """
-        if value is None:
-            return "-"
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, (int,)):
-            return str(value)
-        if isinstance(value, float):
-            return f"{value:.{digits}f}"
-        try:
-            return f"{float(value):.{digits}f}"
-        except (TypeError, ValueError):
-            return str(value)
-
-    @classmethod
-    def _render_mtf_factor_table(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染多周期"主因子表"（Markdown 风格 ASCII 表）
-        ---------------------------------------------------------------
-        列：周期 / trend / net_flow_usd / cvd_slope / taker_buy% /
-            oi_change% / oi_price / atr_14 / last_close
-        """
-        by_tf = factors.get("by_timeframe") or {}
-        header = (
-            "| 周期 | trend | net_flow_usd | cvd_slope | taker_buy% | "
-            "oi_change% | oi_price | atr_14 | last_close |"
-        )
-        sep = "|------|-------|--------------|-----------|------------|-----------|----------|--------|------------|"
-        rows = [header, sep]
-        for tf in ("5m", "15m", "1h", "4h", "1d"):
-            block = by_tf.get(tf) or {}
-            cap = block.get("capital_flow") or {}
-            deriv = block.get("derivatives") or {}
-            struct = block.get("market_structure") or {}
-            taker = cap.get("taker_buy_ratio")
-            taker_pct = (
-                f"{taker * 100:.2f}%" if isinstance(taker, (int, float)) else "-"
-            )
-            oi_chg = deriv.get("oi_change_pct")
-            oi_pct = (
-                f"{oi_chg * 100:+.3f}%"
-                if isinstance(oi_chg, (int, float))
-                else "-"
-            )
-            rows.append(
-                f"| {tf:<4} | {struct.get('trend') or '-':<7} | "
-                f"{cls._fmt(cap.get('net_flow_usd'), 0):>12} | "
-                f"{cls._fmt(cap.get('cvd_slope'), 6):>9} | "
-                f"{taker_pct:>10} | "
-                f"{oi_pct:>9} | "
-                f"{deriv.get('oi_price_relation') or '-':<9} | "
-                f"{cls._fmt(struct.get('atr_14'), 4):>6} | "
-                f"{cls._fmt(struct.get('last_close'), 4):>10} |"
-            )
-        return "\n".join(rows)
-
-    @classmethod
-    def _render_alignment(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染多周期共振指标
-        """
-        mtf = factors.get("mtf_alignment") or {}
-        votes = mtf.get("trend_votes") or {}
-        return (
-            f"trend_votes={json.dumps(votes, ensure_ascii=False)}  "
-            f"alignment_score={cls._fmt(mtf.get('alignment_score'), 3)}  "
-            f"dominant_bias={mtf.get('dominant_bias') or '-'}"
-        )
-
-    @classmethod
-    def _render_derivatives_text(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染衍生品概要（funding 全周期共享，因此抽 1h block 即可）
-        """
-        by_tf = factors.get("by_timeframe") or {}
-        deriv = ((by_tf.get("1h") or {}).get("derivatives")) or {}
-        funding = deriv.get("funding_rate_now")
-        next_settlement = deriv.get("next_settlement_at") or "-"
-        return (
-            f"funding_rate={cls._fmt(funding, 8)}（最新一次结算时间 {next_settlement}）"
-        )
-
-    @classmethod
-    def _render_liquidations_table(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染爆仓滚动窗口表
-        """
-        liq = factors.get("liquidations") or {}
-        header = "| 窗口 | long_liq(ETH) | short_liq(ETH) | imbalance | cascade |"
-        sep = "|------|----------------|-----------------|-----------|---------|"
-        rows = [header, sep]
-        for w in (5, 15, 60):
-            rows.append(
-                f"| {w}m | "
-                f"{cls._fmt(liq.get(f'long_{w}m'), 4):>14} | "
-                f"{cls._fmt(liq.get(f'short_{w}m'), 4):>15} | "
-                f"{cls._fmt(liq.get(f'imbalance_{w}m'), 3):>9} | "
-                f"{cls._fmt(liq.get('cascade_signal'))} |"
-            )
-        rows.append(
-            f"last_minute_size={cls._fmt(liq.get('last_minute_size'), 4)} "
-            f"last_hour_avg_per_min={cls._fmt(liq.get('last_hour_avg_per_min'), 4)}"
-        )
-        return "\n".join(rows)
-
-    @classmethod
-    def _render_key_levels(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染从大周期到小周期的 supports / resistances（4h / 1h / 15m）
-        """
-        by_tf = factors.get("by_timeframe") or {}
-        lines = []
-        for tf in ("4h", "1h", "15m"):
-            block = by_tf.get(tf) or {}
-            struct = block.get("market_structure") or {}
-            sup = struct.get("supports") or []
-            res = struct.get("resistances") or []
-            lines.append(
-                f"{tf}: supports={sup}  resistances={res}  "
-                f"last_close={struct.get('last_close')}"
-            )
-        return "\n".join(lines)
-
-    @classmethod
-    def _render_orderbook(cls, factors: Dict[str, Any], mtf: bool) -> str:
-        """
-        渲染最新订单簿快照（多周期模式下取 5m 那份；老模式下取顶层）
-        """
-        if mtf:
-            block = (factors.get("by_timeframe") or {}).get("5m") or {}
-            ob = block.get("orderbook") or {}
-        else:
-            ob = factors.get("orderbook") or {}
-        if not ob.get("available"):
-            return "（订单簿快照不可用）"
-        return (
-            f"best_bid={ob.get('best_bid')}  best_ask={ob.get('best_ask')}  "
-            f"spread={ob.get('spread')}  imbalance={ob.get('imbalance')}  "
-            f"bid_walls={ob.get('bid_walls')}  ask_walls={ob.get('ask_walls')}"
-        )
-
-    @classmethod
-    def _render_legacy_factor_block(cls, factors: Dict[str, Any]) -> str:
-        """
-        老聚合器模式下渲染单段因子摘要（保留回滚通道）
-        """
-        cap = factors.get("capital_flow") or {}
-        struct = factors.get("market_structure") or {}
-        return (
-            f"capital_flow={json.dumps(cap, ensure_ascii=False, default=str)}\n"
-            f"market_structure={json.dumps(struct, ensure_ascii=False, default=str)}"
-        )
-
-    @classmethod
-    def _render_legacy_derivatives(cls, factors: Dict[str, Any]) -> str:
-        """
-        老聚合器模式下渲染衍生品摘要
-        """
-        deriv = factors.get("derivatives") or {}
-        return json.dumps(deriv, ensure_ascii=False, default=str)
-
-    @classmethod
-    def _render_legacy_key_levels(cls, factors: Dict[str, Any]) -> str:
-        """
-        老聚合器模式下渲染单一窗口的关键价位
-        """
-        struct = factors.get("market_structure") or {}
-        return (
-            f"supports={struct.get('supports')}  "
-            f"resistances={struct.get('resistances')}  "
-            f"last_price={struct.get('last_price')}"
-        )
-
-    @classmethod
-    def _render_regime(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染 regime 段：当前市场状态 + 决定性指标（1h_adx_14 / 4h_bb_width）
-        """
-        regime = factors.get("regime") or "-"
-        by_tf = factors.get("by_timeframe") or {}
-        ms_1h = ((by_tf.get("1h") or {}).get("market_structure")) or {}
-        ms_4h = ((by_tf.get("4h") or {}).get("market_structure")) or {}
-        return (
-            f"regime: {regime}   "
-            f"1h_adx_14={cls._fmt(ms_1h.get('adx_14'), 2)}   "
-            f"4h_bb_width={cls._fmt(ms_4h.get('bb_width'), 6)}   "
-            f"4h_trend={ms_4h.get('trend') or '-'}"
-        )
-
-    @classmethod
-    def _render_orderbook_dynamic(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染订单簿时序段：取 5m 周期块（订单簿因子主要挂在 5m / 15m）
-        """
-        by_tf = factors.get("by_timeframe") or {}
-        ob = ((by_tf.get("5m") or {}).get("orderbook")) or {}
-        if not ob.get("available"):
-            return "（订单簿时序不可用）"
-        return (
-            f"imbalance_now={cls._fmt(ob.get('imbalance_now'), 4)}  "
-            f"slope_5m={cls._fmt(ob.get('imbalance_slope_5m'), 8)}  "
-            f"zscore_15m={cls._fmt(ob.get('imbalance_zscore_15m'), 3)}\n"
-            f"vacuum_above={cls._fmt(ob.get('liquidity_vacuum_above'))}  "
-            f"vacuum_below={cls._fmt(ob.get('liquidity_vacuum_below'))}\n"
-            f"bid_wall_persistence_avg_s={cls._fmt(ob.get('bid_wall_persistence_avg_s'), 1)}  "
-            f"ask_wall_persistence_avg_s={cls._fmt(ob.get('ask_wall_persistence_avg_s'), 1)}\n"
-            f"wall_distance_pct={ob.get('wall_distance_pct')}  "
-            f"spread_bp_now={cls._fmt(ob.get('spread_bp_now'), 2)}"
-        )
-
-    @classmethod
-    def _render_position_ratios(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染散户/精英多空比段
-        """
-        pr = factors.get("position_ratios") or {}
-        return (
-            f"account_long_short_ratio={cls._fmt(pr.get('account_long_short_ratio'), 4)}（散户币种，反指）\n"
-            f"account_contract_ratio={cls._fmt(pr.get('account_contract_ratio'), 4)}（散户合约，反指）\n"
-            f"top_trader_position_ratio={cls._fmt(pr.get('top_trader_position_ratio'), 4)}（精英持仓，顺指）\n"
-            f"divergence={pr.get('retail_vs_smart_divergence') or 'unknown'}"
-        )
-
-    @classmethod
-    def _render_liquidity(cls, factors: Dict[str, Any]) -> str:
-        """
-        渲染流动性地图段：上下方各取前 3 档（按 strength 排序）
-        """
-        liq = factors.get("liquidity") or {}
-        above = (liq.get("liquidity_pool_above") or [])[:3]
-        below = (liq.get("liquidity_pool_below") or [])[:3]
-        cur = liq.get("current_price")
-        return (
-            f"current_price={cur}\n"
-            f"上方止损池: {above}  nearest_above_pct={liq.get('nearest_above_pct')}\n"
-            f"下方止损池: {below}  nearest_below_pct={liq.get('nearest_below_pct')}"
-        )
 
     @staticmethod
     def _extract_token_usage(raw_message: Any) -> Tuple[int, int, int]:
         """
         从 LangChain AIMessage 中提取 (input_tokens, output_tokens, total_tokens)
         --------------------------------------------------------------
-        参数：
-            raw_message: 思考模式下 chain 返回的 AIMessage；非思考模式下
-                         ``with_structured_output`` 返回 dict 的 ``raw`` 字段。
-        返回：
-            三元组 (in_tok, out_tok, total_tok)。任一字段缺失时填 -1，
-            不抛异常——可观测性是非侵入式增强，不能阻塞主决策路径。
-        说明：
-            兼容两套常见来源（langchain-openai 0.3+ 同时透传两套）：
-            1) ``AIMessage.usage_metadata``（langchain 标准化字段）：
-               ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}``。
-            2) ``AIMessage.response_metadata["token_usage"]``（OpenAI 协议原貌）：
-               ``{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}``。
-            优先取 (1)；缺失时回退到 (2)。
+        兼容两套常见来源（langchain-openai 0.3+ 同时透传两套）：
+        1) ``AIMessage.usage_metadata``（langchain 标准化字段）：
+           ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}``。
+        2) ``AIMessage.response_metadata["token_usage"]``（OpenAI 协议原貌）：
+           ``{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}``。
+        任一字段缺失时填 -1，不抛异常——可观测性不能阻塞主决策路径。
         """
         if raw_message is None:
             return (-1, -1, -1)
@@ -1828,7 +764,6 @@ class LLMAgent:
         out_tok = -1
         total_tok = -1
 
-        # langchain 标准化字段
         usage_meta = getattr(raw_message, "usage_metadata", None)
         if isinstance(usage_meta, dict):
             in_tok_v = usage_meta.get("input_tokens")
@@ -1841,7 +776,6 @@ class LLMAgent:
             if isinstance(total_v, (int, float)):
                 total_tok = int(total_v)
 
-        # 回退到 OpenAI 协议原貌
         if in_tok < 0 or out_tok < 0 or total_tok < 0:
             response_meta = getattr(raw_message, "response_metadata", None)
             if isinstance(response_meta, dict):
@@ -1867,28 +801,17 @@ class LLMAgent:
         """
         从 LangChain AIMessage / dict 中抽取 DeepSeek 思考模式的思维链原文
         --------------------------------------------------------------
-        说明：
-            DeepSeek（OpenAI 兼容协议）在思考模式下，会把思维链放在响应
-            消息的 ``reasoning_content`` 字段里。``langchain-openai`` 的
-            ChatOpenAI 在解析时，会把这个字段透传到 AIMessage 的
-            ``additional_kwargs["reasoning_content"]``。
-            部分版本也可能把它放到 ``response_metadata`` 里，这里同时兼容。
-        参数：
-            raw_message: with_structured_output(include_raw=True) 返回的
-                         "raw" 字段（可能是 AIMessage 实例，也可能是 dict）
-        返回：
-            思维链字符串；未拿到时返回 None。
+        DeepSeek 在思考模式下把思维链放在 ``reasoning_content`` 字段，
+        我们子类化 ChatOpenAI 后透传到 ``additional_kwargs["reasoning_content"]``。
+        部分版本也可能放到 response_metadata 里，这里同时兼容。
         """
         if raw_message is None:
             return None
 
         candidates: list[Any] = []
 
-        # AIMessage 实例
         additional = getattr(raw_message, "additional_kwargs", None)
         if isinstance(additional, dict):
-            # 优先用 reasoning_content（DeepSeek 原生字段名 / 我们子类透传名）；
-            # 兜底再看 reasoning（部分网关/未来 langchain 升级后的别名）。
             candidates.append(additional.get("reasoning_content"))
             candidates.append(additional.get("reasoning"))
         response_meta = getattr(raw_message, "response_metadata", None)
@@ -1896,7 +819,6 @@ class LLMAgent:
             candidates.append(response_meta.get("reasoning_content"))
             candidates.append(response_meta.get("reasoning"))
 
-        # dict 形态（旧版本或测试桩）
         if isinstance(raw_message, dict):
             candidates.append(raw_message.get("reasoning_content"))
             candidates.append(raw_message.get("reasoning"))
@@ -1919,10 +841,9 @@ class LLMAgent:
           - 在 JSON 外面包一层 ```json ... ``` 代码围栏
           - 在 JSON 前后多写几句解释
         这里做容错：先尝试整体 json.loads，失败再用第一个 ``{`` 到最后一个
-        ``}`` 之间的子串重试。仍失败则记 ERROR 并返回 None，外层降级到规则引擎。
+        ``}`` 之间的子串重试。仍失败则记 ERROR 并返回 None，外层降级。
         """
         if isinstance(content, list):
-            # OpenAI 多模态格式：content 可能是 [{"type":"text","text":"..."}]
             text_parts = [
                 p.get("text", "")
                 for p in content
@@ -1934,7 +855,6 @@ class LLMAgent:
             return None
 
         text = content.strip()
-        # 去掉 ```json ... ``` / ``` ... ``` 代码围栏
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
@@ -1962,64 +882,39 @@ class LLMAgent:
         return None
 
     # ------------------------------------------------------------------
-    # P0-5：LLM 输出的 deterministic post-validation
+    # LLM 输出 deterministic post-check（极简版）
     # ------------------------------------------------------------------
-    # Post-check 默认值（与 rules.py / settings 默认值保持同源）
-    # ----------------------------------------------------------
-    # 这些常量是 LLM 输出"内部一致性"的兜底门槛，不是市场宏观闸门
-    # （宏观闸门在 service.py 里实现：ATR 太低 / 冷静期 / 方向稳定性 /
-    # 规则冲突）。两套机制目的不同，**不重叠**：
-    #   service 层闸门 → 决定"要不要让 LLM 出手 / 出手后是否覆盖结论"
-    #   llm_agent post-check → 决定"LLM 已出手的这一条输出是否数值自洽"
-    _POST_CHECK_DEFAULT_MIN_RR_RATIO: float = 2.0
-    _POST_CHECK_DEFAULT_MIN_SL_ATR_MULT: float = 1.5
-    _POST_CHECK_DEFAULT_MIN_SL_PCT: float = 0.005
-    # RR 自报 vs 复算的容忍偏差（默认 5%）
-    # 业务含义：LLM 自报 risk_reward_ratio 与按
-    #   |tp1 - entry_mid| / |entry_mid - sl|
-    # 复算结果偏差 > 该阈值时，视为"自报失真"——这是 prompt 自检清单第 1 条
-    # 的 deterministic 强制版本，避免 LLM 在 RR 字段上"四舍五入造数"。
-    _POST_CHECK_DEFAULT_RR_TOLERANCE: float = 0.05
+    # 设计原则：
+    #   schema 已经强约束：价位顺序 + 必填字段 + 数学自洽（risk>0, RR>0）。
+    #   post-check 只做"内部一致性"的最后一道防御，**不**包含任何业务下限
+    #   （如 RR < 2.0 / SL < 1.5×ATR 之类），方向判断完全交给 LLM。
+    # 仅保留 2 项 hard 校验：
+    #   1) RR 自报诚实性：自报 RR 与按 |tp1-entry_mid|/|entry_mid-sl|
+    #      复算的 RR 偏差 ≤ 5%；否则视为 LLM 自报失真。
+    #   2) take_profit ≥ 2 档（schema 已强约束，防御重复校验）。
+    _POST_CHECK_RR_TOLERANCE: float = 0.05
 
     @classmethod
     def _post_check_signal(
         cls,
         signal: TradingSignal,
-        factors: Dict[str, Any],
-        settings: Settings,
     ) -> Tuple[TradingSignal, List[str]]:
         """
-        对 LLM 输出做 deterministic post-validation（P0-5）
+        对 LLM 输出做极简版 deterministic post-check
         --------------------------------------------------------------
         参数：
-            signal   : LLM 已通过 schema 校验的 TradingSignal
-            factors  : 当前因子矩阵（用于取 ATR(15m)）
-            settings : 全局配置（用于读门槛阈值）
+            signal : LLM 已通过 schema 校验的 TradingSignal
         返回：
             (final_signal, issues)
-            - issues 为空：原 signal 透传，未做修改
-            - issues 非空：返回被强制降级为 neutral 的新 signal，原 reason
-              被替换为"[LLM post-check 强制降级] + issues 列表"
-
-        校验项（hard）—— 任一不通过 → 强制 neutral：
+            - issues 为空：原 signal 透传
+            - issues 非空：返回降级为 neutral 的新 signal
+        校验项（hard）—— 任一不通过 → 降级 neutral：
           1) RR 自报诚实性：|self - recalc| / self > tolerance（默认 5%）
-          2) RR 业务下限：复算 RR < decision_min_rr_ratio（默认 2.0）
-          3) SL 距离 ATR 倍数：|entry_mid-sl| < min_sl_atr_mult × ATR(15m)
-          4) SL 距离绝对百分比：|entry_mid-sl|/entry_mid < min_sl_pct
-          5) take_profit 数量 < 2（schema 已强约束，这里做防御）
+          2) take_profit 数量 < 2（schema 已强约束，防御）
 
-        校验项（soft）—— 仅记录，不触发降级（避免误伤）：
-          6) invalidation_conditions 数量 < 2（prompt 要求但 schema 未强约束）
-          7) timeframe_alignment 缺周期（不齐 5 个）
-
-        设计取舍：
-          - 与 service 层 4 道决策闸门**不重叠**：service 层关注"市场宏观状态
-            是否值得让 LLM 出手"，本方法关注"LLM 既已出手的这条输出是否内部
-            自洽"。
-          - ATR(15m) 缺失时跳过第 3 项校验，因为我们不应用"缺数据"惩罚 LLM
-            （这种情况主路径会有别的告警）。
-          - issues 即便是 soft 也写日志 / 拼到新 reason，便于事后回溯
-            "LLM 输出哪些项不达标"。
+        校验项（soft）—— 仅记录，不触发降级：
+          3) invalidation_conditions 数量 < 2（prompt 要求但 schema 未强约束）
+          4) timeframe_alignment 缺周期（不齐 5 个）
         """
         if signal.bias == "neutral":
             return signal, []
@@ -2031,8 +926,6 @@ class LLMAgent:
         sl = signal.stop_loss
         tps = list(signal.take_profit or [])
 
-        # 防御性：schema 已经在 bias != neutral 时强约束齐 ez/sl/2 档 tp，
-        # 但缓存重建 / 旁路构造可能存在边界情况，这里再兜底一次。
         if ez is None or sl is None or len(tps) < 2:
             hard_issues.append(
                 f"plan 字段不完整：entry_zone={ez} stop_loss={sl} take_profit_n={len(tps)}"
@@ -2054,79 +947,26 @@ class LLMAgent:
         rr_recalc = reward / risk
         rr_self = signal.risk_reward_ratio
 
-        # ---- 1) RR 自报诚实性 ---------------------------------------
-        rr_tolerance = float(
-            getattr(
-                settings,
-                "llm_post_check_rr_tolerance",
-                cls._POST_CHECK_DEFAULT_RR_TOLERANCE,
-            )
-        )
         if (
             rr_self is not None
             and rr_self > 0
-            and abs(rr_recalc - float(rr_self)) / float(rr_self) > rr_tolerance
+            and abs(rr_recalc - float(rr_self)) / float(rr_self) > cls._POST_CHECK_RR_TOLERANCE
         ):
             hard_issues.append(
                 f"自报 RR={float(rr_self):.3f} 与复算 RR={rr_recalc:.3f} 偏差 "
                 f"{abs(rr_recalc - float(rr_self)) / float(rr_self) * 100:.1f}% "
-                f"> 容忍 {rr_tolerance * 100:.0f}%"
+                f"> 容忍 {cls._POST_CHECK_RR_TOLERANCE * 100:.0f}%"
             )
 
-        # ---- 2) RR 业务下限 -----------------------------------------
-        min_rr = float(
-            getattr(settings, "decision_min_rr_ratio", cls._POST_CHECK_DEFAULT_MIN_RR_RATIO)
-        )
-        if rr_recalc < min_rr:
-            hard_issues.append(
-                f"复算 RR={rr_recalc:.3f} < 业务下限 {min_rr:.2f}"
-            )
-
-        # ---- 3) SL 距离 ATR 倍数 ------------------------------------
-        # ATR(15m) 缺失时跳过：不应用"数据缺失"惩罚 LLM。
-        by_tf = (factors or {}).get("by_timeframe") or {}
-        ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
-        atr_15m = _to_float_safe(ms_15m.get("atr_14"))
-        min_atr_mult = float(
-            getattr(
-                settings,
-                "decision_min_sl_distance_atr_15m",
-                cls._POST_CHECK_DEFAULT_MIN_SL_ATR_MULT,
-            )
-        )
-        if atr_15m is not None and atr_15m > 0 and risk < min_atr_mult * atr_15m:
-            hard_issues.append(
-                f"SL 距离 {risk:.4f} < {min_atr_mult:.2f}×ATR(15m)="
-                f"{min_atr_mult * atr_15m:.4f}"
-            )
-
-        # ---- 4) SL 距离绝对百分比 -----------------------------------
-        min_pct = float(
-            getattr(
-                settings,
-                "decision_min_sl_distance_pct",
-                cls._POST_CHECK_DEFAULT_MIN_SL_PCT,
-            )
-        )
-        if entry_mid > 0:
-            ratio = risk / entry_mid
-            if ratio < min_pct:
-                hard_issues.append(
-                    f"SL 比例 {ratio * 100:.3f}% < 下限 {min_pct * 100:.2f}%"
-                )
-
-        # ---- 5) take_profit 数量（schema 已强约束，防御）-----------
         if len(tps) < 2:
             hard_issues.append(f"take_profit 仅 {len(tps)} 档 < 2")
 
-        # ---- 6) invalidation_conditions（soft，仅记录）-------------
         if len(signal.invalidation_conditions) < 2:
             soft_issues.append(
                 f"invalidation_conditions 仅 {len(signal.invalidation_conditions)} 条 < 2 "
                 "（prompt 要求 ≥ 2 条，但不触发强制降级）"
             )
 
-        # ---- 7) timeframe_alignment 完整性（soft，仅记录）---------
         tfa = signal.timeframe_alignment or {}
         missing_tf = [tf for tf in ("5m", "15m", "1h", "4h", "1d") if tf not in tfa]
         if missing_tf:
@@ -2165,16 +1005,10 @@ class LLMAgent:
         返回：
             一条 neutral TradingSignal：
                 - bias=neutral，schema 自动清空 plan 字段
-                - confidence=0.0（被守门员拦截，下游不应据此估算仓位）
+                - confidence=0.0
                 - reason 拼接 [LLM post-check 强制降级] 前缀 + issues 列表
-                - risk / suggestion 显式提示用户"本周期不下单"
                 - timeframe_alignment 保留原始 5 周期投票（事后审计有用）
                 - invalidation_conditions 清空（neutral 时无意义）
-        说明：
-            与 service 层 _make_gated_neutral_signal 的区别：
-              - 那个是"LLM 调用前就拦下来"的全新 neutral 信号，没有 LLM 文本
-              - 这个是"LLM 已出手但内部不自洽"的事后降级，原始文本会被覆写
-                到 reason 里供 reasoning_content 不可用时排查
         """
         issues_text = "；".join(issues) if issues else "未知"
         new_reason = (
@@ -2191,7 +1025,7 @@ class LLMAgent:
                 "强制降级观望。原 risk 字段：" + (signal.risk or "（空）")
             ),
             suggestion=(
-                "本周期 LLM 输出未通过内部一致性校验（RR / SL / TP），"
+                "本周期 LLM 输出未通过内部一致性校验（RR 自报失真 / plan 不完整），"
                 "强制降级观望，等待下一轮重新判断。仅供参考，不构成交易指令"
             ),
             timeframe_alignment=dict(signal.timeframe_alignment or {}),
@@ -2202,58 +1036,38 @@ class LLMAgent:
         self,
         symbol: str,
         factors: Dict[str, Any],
-        rule_signal: TradingSignal,
-        rule_score: float,
-        rule_contributions: Dict[str, float],
-        recent_settled: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[LLMAnalysisResult]:
         """
         执行一次 LLM 分析，带按 symbol 的节流缓存。
         --------------------------------------------------------------
         参数：
-            symbol             ：合约代码，缓存与并发锁的隔离粒度
-            factors            ：因子聚合结果（JSON 可序列化字典）
-            rule_signal        ：规则引擎的初判 TradingSignal
-            rule_score         ：规则引擎打分（[-1, 1] 区间）
-            rule_contributions ：各因子对规则打分的贡献度
-            recent_settled     ：近 N 条已结算 lifecycle（自我反馈用，可选）。
-                                 注意：不再接收"上一条未结算"参数——见
-                                 _build_prompt_inputs docstring。
+            symbol  : 合约代码，缓存与并发锁的隔离粒度
+            factors : 因子聚合结果（JSON 可序列化字典）
         返回：
             LLMAnalysisResult  ：包含 TradingSignal 与 reasoning_content
                                  （来自缓存时同样会带回首次调用的思维链原文）
             None               ：LLM 未启用 / 链构建失败 / 调用失败 / schema 校验失败
         节流策略：
             "上一次判断时间"取自 signals 表里该 symbol 最后一条记录的 ts。
-            同一 symbol 在 ``min_interval`` 秒内的请求会直接把那条记录的
-            判断字段重建成 LLMAnalysisResult 返回（``from_cache=True``），
-            不会真正发起 API 调用，也不会再次落库。
+            同一 symbol 在 ``compute_min_interval`` 计算出的窗口内的请求会
+            直接把那条记录的判断字段重建成 LLMAnalysisResult 返回
+            （``from_cache=True``），不会真正发起 API 调用，也不会再次落库。
         """
-
         if not self.enabled:
-            logger.info("LLM 已禁用（未配置 DEEPSEEK_API_KEY），将使用规则引擎结果")
+            logger.info("LLM 已禁用（未配置 DEEPSEEK_API_KEY），返回 None")
             return None
 
-        # P1 自适应节流：每轮根据当前因子矩阵动态计算 min_interval；
-        # 失败时方法内部已自动回退到 self.min_interval（P0 行为）。
         adaptive_interval = self.compute_min_interval(factors)
 
-        # 快速路径：先在锁外查一次 DB，避免抢锁。
-        # B 增量：把 factors 透传进去，让 _load_recent_judgment 命中缓存后
-        # 再做一次"价格漂移检查"——若当前价距缓存 entry_mid 偏离 ≥
-        # decision_cache_stale_drift_atr_15m × ATR(15m)，视为缓存过期，
-        # 强制本轮真打一次 LLM。详见 _load_recent_judgment / _is_cache_stale_by_price。
-        cached = await self._load_recent_judgment(
-            symbol, min_interval=adaptive_interval, factors=factors
-        )
+        # 快速路径：先在锁外查一次 DB，避免抢锁
+        cached = await self._load_recent_judgment(symbol, min_interval=adaptive_interval)
         if cached is not None:
             return cached
 
-        # 慢速路径：拿锁后再查一次（double-checked locking），
-        # 防止同一 symbol 在节流刚过期的瞬间被并发调用打多次接口。
         async with self._get_lock(symbol):
+            # 慢速路径：拿锁后再查一次（double-checked locking）
             cached = await self._load_recent_judgment(
-                symbol, min_interval=adaptive_interval, factors=factors
+                symbol, min_interval=adaptive_interval
             )
             if cached is not None:
                 return cached
@@ -2267,47 +1081,19 @@ class LLMAgent:
 
             try:
                 logger.info(
-                    "LLM 发起调用 -> %s（自适应最小间隔=%ss，P0 默认=%ss）",
+                    "LLM 发起调用 -> %s（自适应最小间隔=%ss，默认=%ss）",
                     symbol,
                     adaptive_interval,
                     self.min_interval,
                 )
-                # P3：拉取近 24h 系统级评估摘要（无则 None，prompt 段降级为
-                # "无数据"）。失败吞掉只记 debug：评估系统是"锦上添花"，
-                # 不能因为它把整轮 LLM 调用打挂。
-                evaluation_summary: Optional[Dict[str, Any]] = None
-                if bool(getattr(self.settings, "enable_signal_evaluation", False)):
-                    try:
-                        evaluation_summary = (
-                            await self.repos.fetch_latest_signal_evaluation(
-                                symbol=symbol, window_minutes=1440
-                            )
-                        )
-                    except Exception:
-                        logger.debug(
-                            "拉取 signal_evaluation 失败 symbol=%s（不影响主路径）",
-                            symbol,
-                            exc_info=True,
-                        )
-                        evaluation_summary = None
-                prompt_inputs = self._build_prompt_inputs(
-                    symbol=symbol,
-                    factors=factors,
-                    rule_signal=rule_signal,
-                    rule_score=rule_score,
-                    rule_contributions=rule_contributions,
-                    recent_settled=recent_settled,
-                    evaluation_summary=evaluation_summary,
-                )
-                # P0-3：端到端延迟测量，外层 try 内只测 ainvoke 部分
-                # （prompt 构建错误本身不算 LLM 延迟）。
+                prompt_inputs = self._build_prompt_inputs(symbol=symbol, factors=factors)
                 _llm_call_start = time.monotonic()
                 result = await self._chain.ainvoke(prompt_inputs)
                 _llm_call_latency_ms = int(
                     (time.monotonic() - _llm_call_start) * 1000
                 )
             except Exception:
-                logger.exception("LangChain 调用失败，回退到规则引擎")
+                logger.exception("LangChain 调用失败，返回 None")
                 return None
 
             # 两条返回路径：
@@ -2326,7 +1112,6 @@ class LLMAgent:
             elif isinstance(result, TradingSignal):
                 parsed = result
             elif hasattr(result, "content"):
-                # 思考模式 AIMessage：手动从 content 抽 JSON。
                 raw_message = result
                 content = getattr(result, "content", "")
                 parsed = self._parse_json_content(content, symbol)
@@ -2336,9 +1121,7 @@ class LLMAgent:
                 parsed = result
 
             if parsing_error is not None:
-                logger.error(
-                    "LLM 结构化解析错误 %s：%s", symbol, parsing_error
-                )
+                logger.error("LLM 结构化解析错误 %s：%s", symbol, parsing_error)
                 return None
 
             signal: Optional[TradingSignal]
@@ -2351,18 +1134,11 @@ class LLMAgent:
                     logger.exception("LLM 输出未通过 schema 校验")
                     return None
             else:
-                logger.error(
-                    "LLM 解析结果类型异常 %s：%r", symbol, type(parsed)
-                )
+                logger.error("LLM 解析结果类型异常 %s：%r", symbol, type(parsed))
                 return None
 
             reasoning_content = self._extract_reasoning(raw_message)
-            # ----------------------------------------------------------
-            # P0-3：LLM 调用可观测性（成本 + 延迟）
-            # ----------------------------------------------------------
-            # 单行结构化日志，便于 ELK / Loki 聚合统计 token 花费与
-            # P50 / P99 延迟（参考：OpenAI Production Best Practices §
-            # "Cost & Latency"）。任一字段缺失记 -1，不抛异常。
+
             in_tok, out_tok, total_tok = self._extract_token_usage(raw_message)
             logger.info(
                 "LLM 调用完成 symbol=%s latency_ms=%d in_tok=%d out_tok=%d total_tok=%d "
@@ -2378,38 +1154,16 @@ class LLMAgent:
             if reasoning_content:
                 logger.debug(
                     "已捕获 LLM 思维链 %s（%d 字符）",
-                    symbol,
-                    len(reasoning_content),
+                    symbol, len(reasoning_content),
                 )
             elif self.settings.deepseek_thinking_enabled:
-                # 思考模式下仍未拿到 reasoning_content，多半是 LangChain
-                # 没把该字段透传过来；不致命，但记一行日志便于排查。
                 logger.debug(
                     "思考模式已启用，但 %s 的原始消息中未找到 reasoning_content",
                     symbol,
                 )
 
-            # ----------------------------------------------------------
-            # P0-5：deterministic post-validation
-            # ----------------------------------------------------------
-            # schema 已经校验过字段顺序、价位单调性、RR ≥ 1.5；
-            # 这里再做"业务级"的内部一致性校验：
-            #   - RR 自报 vs 复算偏差（防 LLM 编造 RR 字段）
-            #   - RR ≥ 业务下限（默认 2.0，比 schema 的 1.5 严）
-            #   - SL ≥ 1.5×ATR(15m) 与 ≥ 0.5%×entry_mid 双重距离下限
-            #   - take_profit ≥ 2 档（防御）
-            # 任一 hard 校验失败 → 强制降级 neutral，原 LLM 输出落到日志 +
-            # （思考模式时）reasoning_content；下游 service 层无需改动。
-            #
-            # 与 service 层 4 道决策闸门**正交不重叠**：
-            #   - service 闸门：LLM 调用前的市场宏观条件审查
-            #   - 本 post-check：LLM 已出手后的输出内部自洽性审查
             try:
-                signal, post_check_issues = self._post_check_signal(
-                    signal=signal,
-                    factors=factors,
-                    settings=self.settings,
-                )
+                signal, post_check_issues = self._post_check_signal(signal=signal)
                 if post_check_issues:
                     logger.info(
                         "LLM post-check 命中 %s：原 bias=%s 校验失败 %d 项 → 已处理",
@@ -2418,16 +1172,11 @@ class LLMAgent:
                         len(post_check_issues),
                     )
             except Exception:
-                # post-check 自身异常不应阻塞主路径：宁可放过一条边界信号，
-                # 也不能因为校验代码 bug 把整条 LLM 链路打挂。
                 logger.exception(
                     "LLM post-check 异常 symbol=%s（信号原样透传）",
                     symbol,
                 )
 
-            # from_cache=False 标记本次是真正发起了一次 LLM 调用，service
-            # 层会据此把这条结果写入 signals 表——这条 INSERT 同时也是下一
-            # 轮 _load_recent_judgment 的"上次调用时间戳"来源，构成隐式缓存。
             return LLMAnalysisResult(
                 signal=signal,
                 reasoning_content=reasoning_content,
