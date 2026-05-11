@@ -271,8 +271,27 @@ def serialize_signal_full(
     bias = str(row.get("bias") or "neutral")
     source = str(row.get("source") or "llm")
     confidence = _to_float(row.get("confidence"))
+    # reasoning_content 单条可达数十 KB，列表视图不会展示全文，
+    # ``fetch_recent_signals_full`` 已经改为只 SELECT 派生列
+    # ``reasoning_available`` / ``reasoning_total_chars``，避免一次性
+    # 拉 100 条思维链把网络/超时打爆。这里同时兼容两种 row：
+    #   - 详情页/最新一条：含 reasoning_content 全文
+    #   - 列表页：只含派生列，row.get("reasoning_content") 为 None
     reasoning_text: Optional[str] = row.get("reasoning_content") or None
-    reasoning_chars = len(reasoning_text) if isinstance(reasoning_text, str) else 0
+    if isinstance(reasoning_text, str):
+        reasoning_chars = len(reasoning_text)
+        reasoning_available = True
+    else:
+        raw_chars = row.get("reasoning_total_chars")
+        try:
+            reasoning_chars = int(raw_chars) if raw_chars is not None else 0
+        except (TypeError, ValueError):
+            reasoning_chars = 0
+        raw_available = row.get("reasoning_available")
+        if raw_available is None:
+            reasoning_available = reasoning_chars > 0
+        else:
+            reasoning_available = bool(raw_available)
 
     entry_zone = _serialize_entry_zone(row.get("entry_zone"))
     entry_mid = entry_zone.get("mid") if entry_zone else None
@@ -393,7 +412,7 @@ def serialize_signal_full(
             "liquidations": liquidations_summary,
             "liquidity": liquidity_summary,
         },
-        "reasoning_available": bool(reasoning_text),
+        "reasoning_available": reasoning_available,
         "reasoning_total_chars": reasoning_chars,
     }
 

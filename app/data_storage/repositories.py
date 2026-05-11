@@ -957,7 +957,7 @@ class Repositories:
         only_persisted: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        读取指定 symbol 最近 N 条信号的"全字段视图"
+        读取指定 symbol 最近 N 条信号的"全字段视图"（列表场景，不含思维链全文）
         ---------------------------------------------------------------
         参数：
             symbol         : 合约代码
@@ -966,7 +966,23 @@ class Repositories:
             source_like    : 可选 ILIKE 模式（如 '%llm%' 只看 LLM 路径）
             only_persisted : 默认 True，No-op 占位，保留参数语义。
         返回：
-            按 ts 倒序的 dict 列表，字段同 fetch_latest_signal_full。
+            按 ts 倒序的 dict 列表。
+
+        与 ``fetch_latest_signal_full`` 的差异（关键性能修复）：
+            列表视图永远不会展示思维链全文（前端详情页才走
+            ``fetch_signal_full_by_id`` 单条拉取），但
+            ``reasoning_content`` 单条可达数十 KB。一次拉 100 条会让单次
+            网络传输 5 MB+，叠加 asyncpg 默认 30s ``command_timeout`` 极易
+            超时；超时后 pool release 还会触发
+            ``cannot switch to state X; another operation in progress``，
+            连带后续写库连接全部坏掉。
+
+            因此本方法**不再 SELECT reasoning_content 原文**，而是用 SQL
+            端的 ``length()`` / ``IS NOT NULL`` 派生出
+            ``reasoning_total_chars`` 与 ``reasoning_available``，
+            ``serialize_signal_full`` 在 ``include_reasoning=False``
+            场景下兼容这两个派生列；详情页（include_reasoning=True）
+            仍走 ``fetch_signal_full_by_id`` 单条拉取。
         """
         safe_limit = max(1, min(int(limit), 200))
         clauses = ["symbol = $1"]
@@ -983,7 +999,9 @@ class Repositories:
             SELECT
                 id, ts, symbol, bias, confidence,
                 reason, risk, suggestion,
-                factors, source, reasoning_content,
+                factors, source,
+                (reasoning_content IS NOT NULL)        AS reasoning_available,
+                COALESCE(length(reasoning_content), 0) AS reasoning_total_chars,
                 entry_zone, stop_loss, take_profit,
                 risk_reward_ratio, position_size_pct,
                 timeframe_alignment, invalidation_conditions
@@ -993,8 +1011,10 @@ class Repositories:
             LIMIT ${len(params)}
         """
         _ = only_persisted
+        # 显式给 60s 超时：列表查询要拉 100 条 factors JSONB（每条几十 KB），
+        # 比单点写库更耗时，pool 默认 30s 不够用，宽松一点避免误判超时。
         async with self.db.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
+            rows = await conn.fetch(sql, *params, timeout=60.0)
         return [dict(r) for r in rows]
 
     async def fetch_signal_full_by_id(

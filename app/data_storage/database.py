@@ -20,12 +20,18 @@ T = TypeVar("T")
 # - ConnectionResetError:        TCP RST
 # - OSError:                     Windows WinError 121 / 64 等 socket 异常
 # - asyncio.TimeoutError:        命令级别超时
+# - InternalClientError:         asyncpg 状态机错乱
+#                                （"cannot switch to state X; another
+#                                operation in progress"），上一次查询超时
+#                                后 pool release 时残留的协议状态，连接已
+#                                不可用，需要丢弃 + 重建。
 # 这些错误在写操作上都是可以重试的——前提是写入本身幂等
 # （本项目的 INSERT 全部带 ON CONFLICT DO NOTHING/UPDATE）。
 TRANSIENT_DB_ERRORS: Tuple[Type[BaseException], ...] = (
     asyncpg.exceptions.ConnectionDoesNotExistError,
     asyncpg.exceptions.InterfaceError,
     asyncpg.exceptions.ConnectionFailureError,
+    asyncpg.exceptions.InternalClientError,
     ConnectionResetError,
     OSError,
     asyncio.TimeoutError,
