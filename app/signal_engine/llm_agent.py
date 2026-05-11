@@ -8,13 +8,14 @@
    渲染成 7 段 desk trader 叙事 + 当前价；
 2. 拼成紧凑 prompt（system + 1 条 few-shot + human）调用 DeepSeek；
 3. 校验 LLM 输出的"数学自洽性"（schema 强约束 + 轻量 post-check）；
-4. 通过基于 PostgreSQL ``signals`` 表 ts 的节流缓存控制成本。
+4. 通过基于 PostgreSQL ``signals`` 表 ts 的**固定窗口**节流缓存控制成本。
 
 ** 不做 ** 的事情：
 - 不渲染任何 ASCII 表格 / 数值堆砌段；
 - 不注入"历史成绩单 / 系统级评估摘要 / 规则引擎打分"作为参考；
 - 不做 RR / SL 业务下限校验（schema 已保证数学自洽，业务下限由 LLM 自决）；
-- 不做"价格漂移强制刷新"补丁；节流由 ``compute_min_interval`` 一处控制。
+- 不做"价格漂移强制刷新"补丁，也不做"按波动率自适应节流"——
+  节流就是固定的 ``LLM_MIN_INTERVAL_SECONDS``（默认 1800s），一处控制。
 
 输出语言：reason / risk / suggestion 简体中文 desk 语气，bias 保持
 long / short / neutral 英文枚举（与 ``signals.bias`` CHECK 约束对齐）。
@@ -320,18 +321,24 @@ class LLMAgent:
     """
     LangChain DeepSeek 调用封装（基于 signals 表的 DB 节流）。
     --------------------------------------------------------------
-    节流策略：
+    节流策略（**固定窗口**，不再做"按波动率自适应"）：
     - "上一次判断时间"取自 signals 表里该 symbol 最后一条记录的 ts。
     - 进程重启 / 多副本部署时所有实例共享同一份"上次调用时间"
       （PostgreSQL 是唯一真源），节流不会被绕过。
-    - 在 ``compute_min_interval(factors)`` 计算出的窗口内，analyze
-      不会真正发起 LLM 请求，而是从 signals 表读出最近一条 LLM 判断，
-      重建 ``LLMAnalysisResult`` 返回（带 ``from_cache=True`` 标记）。
+    - 在 ``self.min_interval``（即 ``LLM_MIN_INTERVAL_SECONDS``，默认 1800s）
+      窗口内，analyze 不会真正发起 LLM 请求，而是从 signals 表读出最近一条
+      LLM 判断，重建 ``LLMAnalysisResult`` 返回（带 ``from_cache=True`` 标记）。
     - 上层 service 仅在 ``from_cache=False`` 时落库，保证入库节奏 =
       LLM 真实调用节奏 = 节流窗口节奏。
     - 通过按 symbol 的 ``asyncio.Lock`` 防止同一 symbol 在窗口刚到
       时被并发调用打多次接口。
     - 设置 ``LLM_MIN_INTERVAL_SECONDS=0`` 可完全关闭节流（调试用）。
+
+    设计取舍：之前版本曾按 ATR 比 / regime / alignment 做"自适应节流"
+    （高波动 300s / 中波动 600s / 默认 1800s），但实际运行中"高波动"
+    分支命中过于频繁，把 LLM 调用节奏压到 5–10 分钟一次，单日 DeepSeek
+    调用成本明显超预算。当前策略：**完全忽略波动**，固定 1800s 一次，
+    每次都拿数据库最新因子矩阵喂给 LLM 重新判断。
     """
 
     def __init__(self, settings: Settings, repos: Repositories):
@@ -449,88 +456,13 @@ class LLMAgent:
     @property
     def min_interval(self) -> int:
         """
-        LLM 调用最小间隔（秒）—— 静态版，作为自适应节流的兜底
+        LLM 调用最小间隔（秒）—— 固定窗口节流，唯一真源
         --------------------------------------------------------------
-        从 settings 读取，方便单元测试通过 monkeypatch 修改 settings 调整。
-        compute_min_interval(factors) 抛任何异常时统一回退到该值。
+        从 ``settings.llm_min_interval_seconds`` 读取（默认 1800s = 30 分钟），
+        单元测试可通过 monkeypatch settings 来调整。
+        设为 0 / 负数则完全关闭节流（调试用）。
         """
         return max(0, int(self.settings.llm_min_interval_seconds))
-
-    def compute_min_interval(self, factors: Optional[Dict[str, Any]]) -> int:
-        """
-        自适应 LLM 节流：根据当前因子矩阵动态计算下一次允许调用的最小间隔
-        --------------------------------------------------------------
-        参数：
-            factors: FactorAggregator.compute 的输出
-        返回：
-            建议的 min_interval 秒数；失败 / 关闭时回退到 self.min_interval
-        档位（plan 第 5.2 节）：
-            volatility_ratio = atr_5m × 12 / atr_1h
-                （5m ATR 折算到 1h 尺度后与 1h ATR 比较，> 1 表示 5 分钟波动异常放大）
-
-            volatility_ratio ≥ 1.5 或 regime ∈ {breakout, breakdown}
-              → llm_min_interval_high_vol（默认 300s = 5 分钟）
-            volatility_ratio ≥ 1.2 或 |alignment_score| ≥ 0.5
-              → llm_min_interval_mid（默认 600s = 10 分钟）
-            其他
-              → llm_min_interval_default（默认 1800s = 30 分钟）
-
-            注：删除了"regime ∈ {ranging, transitional} 强制 1800s 下限"
-            的老逻辑——突破临界点本就在 ranging 末端发生，强制拉满会错过最佳入场。
-        """
-        try:
-            hi_vol = int(getattr(self.settings, "llm_min_interval_high_vol", 300))
-            mid = int(getattr(self.settings, "llm_min_interval_mid", 600))
-            default = int(getattr(self.settings, "llm_min_interval_default", 1800))
-
-            if not factors or not isinstance(factors, dict):
-                return default if self.min_interval > 0 else 0
-
-            by_tf = factors.get("by_timeframe") or {}
-            ms_5m = ((by_tf.get("5m") or {}).get("market_structure")) or {}
-            ms_1h = ((by_tf.get("1h") or {}).get("market_structure")) or {}
-            atr_5m = _to_float_safe(ms_5m.get("atr_14"))
-            atr_1h = _to_float_safe(ms_1h.get("atr_14"))
-            volatility_ratio: Optional[float] = None
-            if atr_5m is not None and atr_1h is not None and atr_1h > 0:
-                volatility_ratio = atr_5m * 12.0 / atr_1h
-
-            regime = factors.get("regime")
-            mtf = factors.get("mtf_alignment") or {}
-            alignment_score = abs(_to_float_safe(mtf.get("alignment_score")) or 0.0)
-
-            if (volatility_ratio is not None and volatility_ratio >= 1.5) or regime in (
-                "breakout",
-                "breakdown",
-            ):
-                interval = hi_vol
-            elif (
-                volatility_ratio is not None and volatility_ratio >= 1.2
-            ) or alignment_score >= 0.5:
-                interval = mid
-            else:
-                interval = default
-
-            # 兜底：if user explicitly set llm_min_interval_seconds=0 means
-            # 完全关闭节流（调试用），尊重此设置。
-            if self.min_interval <= 0:
-                return 0
-
-            logger.debug(
-                "自适应 LLM 节流：volatility_ratio=%s regime=%s alignment=%.3f → %ds",
-                ("%.3f" % volatility_ratio) if volatility_ratio is not None else "-",
-                regime,
-                alignment_score,
-                interval,
-            )
-            return int(interval)
-        except Exception:
-            logger.warning(
-                "compute_min_interval 计算失败，回退到默认 %ds",
-                self.min_interval,
-                exc_info=True,
-            )
-            return self.min_interval
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
         """获取或创建指定 symbol 对应的并发锁。"""
@@ -1049,26 +981,26 @@ class LLMAgent:
             None               ：LLM 未启用 / 链构建失败 / 调用失败 / schema 校验失败
         节流策略：
             "上一次判断时间"取自 signals 表里该 symbol 最后一条记录的 ts。
-            同一 symbol 在 ``compute_min_interval`` 计算出的窗口内的请求会
-            直接把那条记录的判断字段重建成 LLMAnalysisResult 返回
-            （``from_cache=True``），不会真正发起 API 调用，也不会再次落库。
+            同一 symbol 在 ``self.min_interval``（即 ``LLM_MIN_INTERVAL_SECONDS``，
+            默认 1800s）窗口内的请求会直接把那条记录的判断字段重建成
+            LLMAnalysisResult 返回（``from_cache=True``），不会真正发起
+            API 调用，也不会再次落库。**完全不考虑波动率 / regime / alignment**——
+            每次真实调用都是基于当下数据库里最新的因子矩阵重新判断。
         """
         if not self.enabled:
             logger.info("LLM 已禁用（未配置 DEEPSEEK_API_KEY），返回 None")
             return None
 
-        adaptive_interval = self.compute_min_interval(factors)
+        interval = self.min_interval
 
         # 快速路径：先在锁外查一次 DB，避免抢锁
-        cached = await self._load_recent_judgment(symbol, min_interval=adaptive_interval)
+        cached = await self._load_recent_judgment(symbol, min_interval=interval)
         if cached is not None:
             return cached
 
         async with self._get_lock(symbol):
             # 慢速路径：拿锁后再查一次（double-checked locking）
-            cached = await self._load_recent_judgment(
-                symbol, min_interval=adaptive_interval
-            )
+            cached = await self._load_recent_judgment(symbol, min_interval=interval)
             if cached is not None:
                 return cached
 
@@ -1081,10 +1013,9 @@ class LLMAgent:
 
             try:
                 logger.info(
-                    "LLM 发起调用 -> %s（自适应最小间隔=%ss，默认=%ss）",
+                    "LLM 发起调用 -> %s（固定节流间隔=%ds）",
                     symbol,
-                    adaptive_interval,
-                    self.min_interval,
+                    interval,
                 )
                 prompt_inputs = self._build_prompt_inputs(symbol=symbol, factors=factors)
                 _llm_call_start = time.monotonic()

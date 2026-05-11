@@ -101,9 +101,11 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     # LLM 单次调用超时（秒）。思考模式推理较慢，建议放大到 120s 起。
     llm_timeout: int = 300
-    # LLM 调用最小间隔（秒）。在该窗口内同 symbol 复用上一次 LLM 返回，
-    # 避免高频付费调用。设为 0 可调试期实时调用。
-    llm_min_interval_seconds: int = 900
+    # LLM 调用最小间隔（秒）。固定窗口节流，**不考虑波动率**：
+    # 在该窗口内同 symbol 复用 signals 表里上一次 LLM 返回，避免高频付费调用。
+    # 默认 1800 秒（30 分钟），由 ``LLMAgent.analyze`` 一处控制。
+    # 设为 0 可调试期实时调用（每轮都打 LLM）。
+    llm_min_interval_seconds: int = 1800
 
     # ==================================================================
     # 信号 / 因子参数
