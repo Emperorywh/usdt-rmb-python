@@ -56,6 +56,12 @@ class SignalService:
         # 后台邮件发送任务集合：仅作"防 GC"强引用，避免 asyncio.create_task
         # 创建的任务在 loop 还没调度前被垃圾回收掉。任务结束后从集合中移除。
         self._email_tasks: set[asyncio.Task[Any]] = set()
+        # 上一轮 ATR floor 状态（按 symbol 维度记忆），用于"边沿触发"日志：
+        # - None：上一轮未触发（或还没跑过）
+        # - "atr_too_low" 等 reason：上一轮已触发
+        # 仅在状态变化（进入 / 切换 reason / 退出）时打 INFO，持续命中走 DEBUG，
+        # 避免长时间低波动行情下反复刷屏。
+        self._last_atr_floor_reason: Dict[str, Optional[str]] = {}
         self._stopping = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -89,11 +95,19 @@ class SignalService:
         # 0.25%）由 settings.decision_min_atr_pct_15m 控制，置 0 / 负数
         # 即可完全关闭该底线（不推荐）。
         atr_floor_reason = self._atr_floor_check(factors)
+        # 边沿触发日志：与上一轮相同（持续触发 / 持续未触发）时不打 INFO，
+        # 仅在状态变化（进入 / 切换 reason / 退出）那一轮打 INFO。
+        # 持续命中时降级到 DEBUG，开 DEBUG 日志仍可追踪每轮的拦截记录。
+        prev_atr_floor_reason = self._last_atr_floor_reason.get(symbol)
+        self._last_atr_floor_reason[symbol] = atr_floor_reason
         if atr_floor_reason is not None:
-            final = self._make_atr_floor_neutral_signal(atr_floor_reason)
-            logger.info(
-                "ATR floor 触发：symbol=%s 跳过 LLM 调用（reason=%s）", symbol, atr_floor_reason,
+            is_atr_state_change = prev_atr_floor_reason != atr_floor_reason
+            log_method = logger.info if is_atr_state_change else logger.debug
+            log_method(
+                "ATR floor 触发：symbol=%s 跳过 LLM 调用（reason=%s）",
+                symbol, atr_floor_reason,
             )
+            final = self._make_atr_floor_neutral_signal(atr_floor_reason)
             return {
                 "id": None,
                 "symbol": symbol,
@@ -103,6 +117,13 @@ class SignalService:
                 "factors": factors,
                 "reasoning_content": None,
             }
+        if prev_atr_floor_reason is not None:
+            # 退出边沿：上一轮还在 ATR floor 拦截，这一轮已恢复正常波动率。
+            # 打一条 INFO 让运维 / 日志读者清楚"观望状态已解除"。
+            logger.info(
+                "ATR floor 解除：symbol=%s 波动率恢复正常（prev_reason=%s）",
+                symbol, prev_atr_floor_reason,
+            )
 
         # llm_agent.analyze 返回 LLMAnalysisResult（包装了 TradingSignal +
         # 思考模式下的 reasoning_content）；调用失败 / 未启用时返回 None。
@@ -526,18 +547,28 @@ class SignalService:
                 symbol,
             )
 
+        # 上一轮 source，用于"边沿触发"日志：当 source 以 "atr_floor:" 开头
+        # 且与上一轮完全一致时，说明 ATR floor 状态未变化，本轮日志降级到
+        # DEBUG，与 generate() 内的 ATR floor 边沿日志保持一致，避免刷屏。
+        last_source: Optional[str] = None
         while not self._stopping.is_set():
             try:
                 result = await self.generate(symbol)
                 signal_payload = result.get("signal") or {}
                 source = result["source"]
-                # source=="llm(cache)" 表示本轮只是命中了 LLM 节流缓存、未发起真实
-                # LLM 调用，每个轮询周期都会出现一次，按 INFO 打会刷屏；只有真正
-                # 有意义的事件（真实 LLM 调用 / ATR 兜底 neutral / LLM 不可用 等）
-                # 才走 INFO，缓存复用走 DEBUG。
-                log_method = (
-                    logger.debug if source == "llm(cache)" else logger.info
-                )
+                # 日志级别决策：
+                # - source=="llm(cache)"：命中 LLM 节流缓存，每轮都会出现，
+                #   按 INFO 打会刷屏，走 DEBUG。
+                # - source 以 "atr_floor:" 开头且与上一轮相同：ATR floor 持续
+                #   触发，状态未变，走 DEBUG（与 generate() 边沿日志对齐）。
+                # - 其它情况（真实 LLM 调用 / ATR floor 进入或切换 reason /
+                #   LLM 不可用 等）走 INFO。
+                if source == "llm(cache)":
+                    log_method = logger.debug
+                elif source.startswith("atr_floor:") and source == last_source:
+                    log_method = logger.debug
+                else:
+                    log_method = logger.info
                 log_method(
                     "信号[%s] %s confidence=%.2f source=%s",
                     symbol,
@@ -545,6 +576,7 @@ class SignalService:
                     float(signal_payload.get("confidence") or 0.0),
                     source,
                 )
+                last_source = source
             except Exception:
                 logger.exception("信号生成失败 %s", symbol)
             try:
