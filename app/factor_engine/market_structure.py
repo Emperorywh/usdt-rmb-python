@@ -1,11 +1,6 @@
 """市场结构因子（多周期版本）。
 
-P0 升级要点
-============
-- 老接口 ``compute_market_structure(trades)`` 仍然保留，由老聚合器
-  在 ``enable_mtf_factors=False`` 时使用。
-- 新增 ``compute_market_structure_from_klines(klines)``：直接基于
-  指定周期的 K 线序列（最近 N 根 bar，N=80 默认）计算：
+基于指定周期的 K 线序列（最近 N 根 bar，N=80 默认）计算：
 
   ===========================  =======================================================
   字段                          公式
@@ -29,37 +24,6 @@ import numpy as np
 # ----------------------------------------------------------------------
 # 公共辅助
 # ----------------------------------------------------------------------
-def _resample_minute_ohlc(trades: List[Dict[str, Any]]) -> List[Dict[str, float]]:
-    """
-    把成交按 1 分钟粒度聚合成 OHLC bar
-    -----------------------------------------------------------------
-    参数：
-        trades: 按 ts 升序排列的成交 dict 列表
-    返回：
-        包含 o/h/l/c/v/ts 的 bar 列表，仅供老接口使用。
-    """
-    if not trades:
-        return []
-    bars: Dict[int, Dict[str, float]] = {}
-    order: List[int] = []
-    for t in trades:
-        ts = t["ts"]
-        epoch = int(ts.timestamp() // 60)
-        price = float(t["price"])
-        if epoch not in bars:
-            bars[epoch] = {
-                "o": price, "h": price, "l": price, "c": price,
-                "v": 0.0, "ts": epoch * 60,
-            }
-            order.append(epoch)
-        bar = bars[epoch]
-        bar["h"] = max(bar["h"], price)
-        bar["l"] = min(bar["l"], price)
-        bar["c"] = price
-        bar["v"] += float(t["size"])
-    return [bars[k] for k in order]
-
-
 def _find_pivot_indices(
     values: np.ndarray, left: int = 2, right: int = 2, kind: str = "high"
 ) -> List[int]:
@@ -373,62 +337,7 @@ def _classify_trend(highs: np.ndarray, lows: np.ndarray) -> str:
 
 
 # ----------------------------------------------------------------------
-# 老接口（保留兼容）
-# ----------------------------------------------------------------------
-def compute_market_structure(
-    trades: List[Dict[str, Any]],
-    levels_count: int = 3,
-) -> Dict[str, Any]:
-    """
-    老版市场结构因子：基于 trades 重采样到 1 分钟 bar
-    -----------------------------------------------------------------
-    参数：
-        trades:       按 ts 升序排列的成交 dict 列表
-        levels_count: 支撑 / 阻力位最多保留的档位数
-    返回：
-        含 trend / supports / resistances / last_price / bar_count / slope 的 dict
-    说明：
-        在 enable_mtf_factors=False 时由老聚合器调用，作为安全回退路径。
-    """
-    bars = _resample_minute_ohlc(trades)
-    if len(bars) < 6:
-        return {
-            "available": False,
-            "trend": "neutral",
-            "supports": [],
-            "resistances": [],
-            "last_price": float(bars[-1]["c"]) if bars else None,
-            "bar_count": len(bars),
-        }
-    highs = np.array([b["h"] for b in bars], dtype=float)
-    lows = np.array([b["l"] for b in bars], dtype=float)
-    closes = np.array([b["c"] for b in bars], dtype=float)
-
-    last_close = float(closes[-1])
-    high_pivots = highs[_find_pivot_indices(highs, kind="high")]
-    low_pivots = lows[_find_pivot_indices(lows, kind="low")]
-
-    resistances = sorted(
-        {round(float(p), 4) for p in high_pivots if p >= last_close}
-    )[:levels_count]
-    supports = sorted(
-        {round(float(p), 4) for p in low_pivots if p <= last_close},
-        reverse=True,
-    )[:levels_count]
-
-    return {
-        "available": True,
-        "trend": _classify_trend(highs, lows),
-        "supports": supports,
-        "resistances": resistances,
-        "last_price": last_close,
-        "bar_count": len(bars),
-        "slope": round(_linear_regression_slope(closes) or 0.0, 6),
-    }
-
-
-# ----------------------------------------------------------------------
-# 多周期版（P0 主接口）
+# 多周期版（主接口）
 # ----------------------------------------------------------------------
 def compute_market_structure_from_klines(
     klines: List[Dict[str, Any]],

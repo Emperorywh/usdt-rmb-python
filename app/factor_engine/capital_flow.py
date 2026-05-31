@@ -1,11 +1,6 @@
 """资金流因子（多周期版本）。
 
-P0 升级要点
-============
-- 老接口 ``compute_capital_flow(trades)`` 仍然保留，向后兼容老聚合器
-  在 ``enable_mtf_factors=False`` 时直接复用。
-- 新增 ``compute_capital_flow_from_klines(klines)``：直接基于多周期
-  K 线表（OHLCV + buy/sell volume + cvd_close）计算下列字段：
+基于多周期 K 线表（OHLCV + buy/sell volume + cvd_close）计算资金流因子：
 
   ===========================  ==========================================================
   字段                          公式
@@ -26,45 +21,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-
-# ----------------------------------------------------------------------
-# 老接口（保留向后兼容）
-# ----------------------------------------------------------------------
-def compute_capital_flow(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    旧版资金流因子：基于一段时间窗口内的 trades 列表
-    -----------------------------------------------------------------
-    参数：
-        trades: 按 ts 升序排列的成交 dict 列表
-    返回：
-        含 buy_volume / sell_volume / net_flow / cvd / trade_count 的 dict
-    说明：
-        在 enable_mtf_factors=False 时由老聚合器调用，作为安全回退路径。
-    """
-    buy_vol = 0.0
-    sell_vol = 0.0
-    cvd = 0.0
-    for t in trades:
-        price = float(t["price"])
-        size = float(t["size"])
-        notional = price * size
-        if t["side"] == "buy":
-            buy_vol += notional
-            cvd += size
-        else:
-            sell_vol += notional
-            cvd -= size
-    return {
-        "buy_volume": round(buy_vol, 4),
-        "sell_volume": round(sell_vol, 4),
-        "net_flow": round(buy_vol - sell_vol, 4),
-        "cvd": round(cvd, 6),
-        "trade_count": len(trades),
-    }
+from app.utils import safe_float
 
 
 # ----------------------------------------------------------------------
-# 多周期版（P0 主用接口）
+# 多周期版（主用接口）
 # ----------------------------------------------------------------------
 def compute_capital_flow_from_klines(
     klines: List[Dict[str, Any]],
@@ -171,21 +132,8 @@ def _empty_capital_flow() -> Dict[str, Any]:
     }
 
 
-def _safe_float(value: Any) -> float:
-    """
-    把任意 numeric 值转 float，None / 异常时返回 0.0
-    -----------------------------------------------------------------
-    参数：
-        value: 任意值
-    返回：
-        float
-    """
-    if value is None:
-        return 0.0
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+# _safe_float 已迁移到 app.utils.safe_float（此处保留别名以兼容内部调用）
+_safe_float = lambda v: safe_float(v, default=0.0)
 
 
 def _linear_regression_slope(series: np.ndarray) -> Optional[float]:

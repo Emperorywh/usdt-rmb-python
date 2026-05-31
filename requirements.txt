@@ -31,10 +31,6 @@ langchain-openai>=0.2.9,<0.4
 # 数值计算：numpy 2.3.2 起提供 cp314 wheel。
 numpy>=2.3.2,<3
 
-# Logging
-# 结构化日志：纯 Python 实现，对解释器版本无要求。
-structlog>=24.4.0,<26
-
 # Email (Resend)
 # 邮件发送：基于 Resend HTTP API（HTTPS REST + JSON），相比 smtplib 更稳，
 # 不依赖出口 25/465/587 端口，国内云主机直接可用。SDK 自带同步阻塞接口，

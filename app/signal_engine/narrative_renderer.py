@@ -8,7 +8,7 @@
 1. 市场状态（regime + ATR 波动语义 + ADX 趋势强度）
 2. 多周期方向（5 周期箭头 + 共振度 + 主导方向解读）
 3. 主动资金 vs 价格（CVD / OI / net_flow / taker 的**因果解读**）
-4. 衍生品（funding 极端值 + 散户 / 精英背离结论）
+4. 衍生品（funding 极端值 + OI/价散度）
 5. 关键价位（多周期 supports / resistances + 距当前价 X×ATR）
 6. 流动性地图（上下方止损池 + 真空区警示）
 7. **Liquidations 滚动窗口**（多头 / 空头爆仓 + cascade → 反转动力解读）
@@ -37,26 +37,9 @@
 """
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
-
-def _to_float(v: Any) -> Optional[float]:
-    """
-    任意值 → float；失败 / NaN / Inf → None
-    --------------------------------------------------------------
-    与 llm_agent 的同名工具语义一致；本模块独立实现是为了让
-    narrative_renderer.py 不依赖 llm_agent，方便单测和未来抽离。
-    """
-    if v is None:
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(f):
-        return None
-    return f
+from app.utils import safe_float as _to_float
 
 
 def _fmt_price(v: Any, digits: int = 2) -> str:
@@ -97,7 +80,7 @@ class NarrativeRenderer:
               "market_state": str,    # 市场状态（regime + ATR + ADX）
               "mtf_direction": str,   # 多周期方向 + 共振解读
               "capital_action": str,  # 主动资金 vs 价格的因果解读
-              "derivatives": str,     # funding + 散户精英背离结论
+              "derivatives": str,     # funding + OI/价散度
               "key_levels": str,      # 关键价位 + 距当前价 ATR 倍数
               "liquidity": str,       # 流动性地图解读
               "liquidations": str,    # 爆仓滚动窗口 → 反转动力解读
@@ -306,7 +289,7 @@ class NarrativeRenderer:
         return "\n".join(lines)
 
     # ==================================================================
-    # 第 4 段：衍生品（funding + 散户精英背离）
+    # 第 4 段：衍生品（funding 极端值 + OI/价散度）
     # ==================================================================
     def render_derivatives(self, factors: Dict[str, Any]) -> str:
         """
@@ -315,51 +298,25 @@ class NarrativeRenderer:
         参数：
             factors: 多周期 factors dict
         返回：
-            约 100-150 tokens。例如：
+            约 50-100 tokens。例如：
             "funding +12.00bp（偏高，多头持仓拥挤；任何反向触发都容易诱发挤压）
-             散户多空比 1.45（偏多 → 弱反指）
-             精英持仓比 2.10（明显偏多）
-             散户/精英：一致偏多，无背离风险"
+             OI/价散度：OI 创新高但价格未创新高 → potential_top"
         """
         by_tf = factors.get("by_timeframe") or {}
         deriv_1h = ((by_tf.get("1h") or {}).get("derivatives")) or {}
         funding = _to_float(deriv_1h.get("funding_rate_now"))
-
-        position_ratios = factors.get("position_ratios") or {}
-        retail = _to_float(position_ratios.get("account_long_short_ratio"))
-        elite = _to_float(position_ratios.get("top_trader_position_ratio"))
-        divergence = (position_ratios.get("retail_vs_smart_divergence") or "").lower()
+        oi_divergence = (deriv_1h.get("oi_price_divergence") or "").lower()
 
         lines: List[str] = []
 
         funding_desc = self._funding_label(funding)
         lines.append(funding_desc if funding is not None else "funding 数据缺失")
 
-        if retail is not None:
-            lines.append(
-                f"散户多空比 {retail:.2f}（{self._retail_ratio_label(retail)}）"
-            )
-        if elite is not None:
-            lines.append(
-                f"精英持仓比 {elite:.2f}（{self._elite_ratio_label(elite)}）"
-            )
+        if oi_divergence and oi_divergence != "none":
+            oi_div_zh = self._oi_divergence_label(oi_divergence)
+            lines.append(f"OI/价散度：{oi_div_zh}")
 
-        if divergence:
-            div_zh = self._divergence_label(divergence)
-            lines.append(f"散户/精英：{div_zh}")
-        elif retail is not None and elite is not None:
-            if retail > 1.5 and elite < 1.0:
-                lines.append(
-                    "散户/精英：散户狂多 + 精英偏空 → 典型诱多顶部结构，警惕反转"
-                )
-            elif retail < 0.7 and elite > 1.5:
-                lines.append(
-                    "散户/精英：散户狂空 + 精英偏多 → 典型诱空底部结构，警惕反弹"
-                )
-            else:
-                lines.append("散户/精英：方向一致，无显著背离风险")
-
-        return "\n".join(lines) if lines else "（衍生品 / 散户精英数据全部缺失）"
+        return "\n".join(lines) if lines else "（衍生品数据缺失）"
 
     # ==================================================================
     # 第 5 段：关键价位 + 距当前价 ATR 倍数
@@ -619,44 +576,11 @@ class NarrativeRenderer:
         return f"funding {bp:+.2f}bp 中性，远未挤压"
 
     @staticmethod
-    def _retail_ratio_label(ratio: float) -> str:
-        """散户多空比解读（反指）"""
-        if ratio >= 2.5:
-            return "极端多头 → 强反指利空"
-        if ratio >= 1.8:
-            return "明显偏多 → 反指利空"
-        if ratio >= 1.2:
-            return "偏多 → 弱反指"
-        if ratio <= 0.6:
-            return "极端空头 → 强反指利多"
-        if ratio <= 0.8:
-            return "明显偏空 → 反指利多"
-        return "中性"
-
-    @staticmethod
-    def _elite_ratio_label(ratio: float) -> str:
-        """精英持仓比解读（顺指）"""
-        if ratio >= 2.0:
-            return "明显偏多"
-        if ratio >= 1.3:
-            return "偏多"
-        if ratio <= 0.5:
-            return "明显偏空"
-        if ratio <= 0.8:
-            return "偏空"
-        return "中性"
-
-    @staticmethod
-    def _divergence_label(divergence: str) -> str:
-        """retail_vs_smart_divergence → desk 中文"""
+    def _oi_divergence_label(divergence: str) -> str:
+        """oi_price_divergence → desk 中文"""
         return {
-            "bullish_warning": (
-                "散户狂空 + 精英偏多 → 典型诱空底部结构，警惕反弹"
-            ),
-            "bearish_warning": (
-                "散户狂多 + 精英反向 → 典型诱多顶部结构，警惕反转"
-            ),
-            "neutral": "方向一致，无显著背离风险",
+            "potential_top": "OI 创新高但价格未创新高 → 资金在入场但价格乏力，潜在顶部",
+            "potential_bottom": "OI 创新低但价格未创新低 → 空头撤退但价格企稳，潜在底部",
         }.get(divergence, divergence)
 
     @staticmethod
@@ -704,16 +628,18 @@ class NarrativeRenderer:
             net_flow_dir = 1 if net_flow > 0 else -1 if net_flow < 0 else 0
             cvd_dir = 1 if cvd_slope > 0 else -1 if cvd_slope < 0 else 0
             if net_flow_dir > 0 and cvd_dir > 0:
-                bits.append("主动买盘真实，无被动拉盘嫌疑")
+                bits.append("做多证据：net_flow↑ + CVD↑ = 主动买盘真实；做空证据：无")
             elif net_flow_dir < 0 and cvd_dir < 0:
-                bits.append("主动卖盘真实，无被动砸盘嫌疑")
+                bits.append("做多证据：无；做空证据：net_flow↓ + CVD↓ = 主动卖盘真实")
             elif net_flow_dir > 0 and cvd_dir < 0:
                 bits.append(
-                    "价格被动抬升，主动买盘未跟随 → 更像空头回补 / 诱多嫌疑"
+                    "做多证据：无（价格上行但主动买盘未跟随，非真实推升）；"
+                    "做空证据：被动拉盘 = 上涨持续性存疑，可能为空头回补"
                 )
             elif net_flow_dir < 0 and cvd_dir > 0:
                 bits.append(
-                    "价格被动下压，主动卖盘未跟随 → 更像多头止损 / 诱空嫌疑"
+                    "做多证据：被动砸盘 = 下跌持续性存疑，可能为多头止损回补；"
+                    "做空证据：无（价格下行但主动卖盘未跟随，非真实推跌）"
                 )
 
         return "；".join(bits)
@@ -727,7 +653,8 @@ class NarrativeRenderer:
         """
         cvd_dirs: List[int] = []
         nf_dirs: List[int] = []
-        deception_tfs: List[str] = []
+        deception_tfs_bull: List[str] = []
+        deception_tfs_bear: List[str] = []
         for tf in ("5m", "15m", "1h"):
             block = by_tf.get(tf) or {}
             cap = block.get("capital_flow") or {}
@@ -742,14 +669,26 @@ class NarrativeRenderer:
             if cvd_dir != 0:
                 cvd_dirs.append(cvd_dir)
             if nf_dir > 0 and cvd_dir < 0:
-                deception_tfs.append(tf)
+                deception_tfs_bull.append(tf)
+            elif nf_dir < 0 and cvd_dir > 0:
+                deception_tfs_bear.append(tf)
         if not nf_dirs and not cvd_dirs:
             return None
-        if deception_tfs:
-            return (
-                f"{'/'.join(deception_tfs)} 出现 net_flow 与 CVD 背离 → "
-                "警惕被动拉盘 / 诱多，方向可信度下降"
+        parts: List[str] = []
+        if deception_tfs_bull:
+            parts.append(
+                f"{'/'.join(deception_tfs_bull)} net_flow↑ 与 CVD↓ 背离 → "
+                "做多证据：无（价格上行但主动买盘未跟随）；"
+                "做空证据：被动拉盘 = 上涨非资金推动，方向可信度下降"
             )
+        if deception_tfs_bear:
+            parts.append(
+                f"{'/'.join(deception_tfs_bear)} net_flow↓ 与 CVD↑ 背离 → "
+                "做空证据：无（价格下行但主动卖盘未跟随）；"
+                "做多证据：被动砸盘 = 下跌非资金推动，方向可信度下降"
+            )
+        if parts:
+            return "；".join(parts)
         if nf_dirs and all(d == nf_dirs[0] for d in nf_dirs) and cvd_dirs and all(
             d == cvd_dirs[0] for d in cvd_dirs
         ):

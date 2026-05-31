@@ -84,8 +84,8 @@ class TestEmailRequest(BaseModel):
 async def health(container: AppContainer = Depends(get_container)) -> Dict[str, Any]:
     return {
         "status": "ok",
-        "symbols": container.settings.symbols,
-        "exchanges": container.settings.exchanges,
+        "symbols": container.settings.ingestion.symbols,
+        "exchanges": container.settings.ingestion.exchanges,
         "llm_enabled": container.llm_agent.enabled,
     }
 
@@ -128,8 +128,8 @@ async def healthz(container: AppContainer = Depends(get_container)) -> Dict[str,
 def _resolve_symbol(symbol: Optional[str], container: AppContainer) -> str:
     if symbol:
         return symbol
-    if container.settings.symbols:
-        return container.settings.symbols[0]
+    if container.settings.ingestion.symbols:
+        return container.settings.ingestion.symbols[0]
     raise HTTPException(status_code=400, detail="No symbol configured")
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Awaitable, Callable, Optional, Tuple, Type, TypeVar
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Type, TypeVar
 
 import asyncpg
 
@@ -63,6 +63,7 @@ class Database:
         min_size: int = 2,
         max_size: int = 10,
         max_inactive_connection_lifetime: float = 60.0,
+        acquire_timeout: float = 10.0,
         write_max_retries: int = 2,
         write_retry_backoff: float = 0.2,
     ):
@@ -76,6 +77,8 @@ class Database:
                                                 Windows 下空闲 TCP 容易被
                                                 防火墙/OS 静默断开，缩短此
                                                 值能极大降低"僵尸连接"概率
+            acquire_timeout:                    从连接池获取连接的最大等待秒数；
+                                                池耗尽时快速失败而非无限阻塞
             write_max_retries:                  幂等写入瞬时失败时的重试次数
             write_retry_backoff:                首次重试前的等待秒数
                                                 （之后按 2^n 指数退避）
@@ -84,6 +87,7 @@ class Database:
         self._min_size = min_size
         self._max_size = max_size
         self._max_inactive = float(max_inactive_connection_lifetime)
+        self._acquire_timeout = max(1.0, float(acquire_timeout))
         self._write_max_retries = max(0, int(write_max_retries))
         self._write_retry_backoff = max(0.0, float(write_retry_backoff))
         self._pool: Optional[asyncpg.Pool] = None
@@ -120,7 +124,25 @@ class Database:
         return self._pool
 
     def acquire(self):
-        return self.pool.acquire()
+        return self.pool.acquire(timeout=self._acquire_timeout)
+
+    def pool_stats(self) -> Dict[str, Any]:
+        """
+        返回连接池当前状态（用于监控 / 排障日志）
+        ---------------------------------------------------------------
+        返回：
+            {"size": 当前总连接数, "idle": 空闲连接数,
+             "min": 池下限, "max": 池上限}
+        """
+        p = self._pool
+        if p is None:
+            return {"size": 0, "idle": 0, "min": self._min_size, "max": self._max_size}
+        return {
+            "size": p.get_size(),
+            "idle": p.get_idle_size(),
+            "min": self._min_size,
+            "max": self._max_size,
+        }
 
     async def run_with_retry(
         self,

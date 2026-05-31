@@ -24,8 +24,9 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     exchange        TEXT        NOT NULL,
     symbol          TEXT        NOT NULL,
     ts              TIMESTAMPTZ NOT NULL,
-    bids            JSONB       NOT NULL,
-    asks            JSONB       NOT NULL
+    bids            JSONB       NOT NULL CHECK (jsonb_typeof(bids) = 'array'),
+    asks            JSONB       NOT NULL CHECK (jsonb_typeof(asks) = 'array'),
+    CONSTRAINT uq_ob_snapshot UNIQUE (exchange, symbol, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_snapshots (symbol, ts DESC);
 
@@ -55,18 +56,6 @@ CREATE TABLE IF NOT EXISTS open_interest (
 );
 CREATE INDEX IF NOT EXISTS idx_oi_symbol_ts ON open_interest (symbol, ts DESC);
 
--- 5) 链上指标（预留，先用 mock）
-CREATE TABLE IF NOT EXISTS onchain_metrics (
-    id                  BIGSERIAL PRIMARY KEY,
-    ts                  TIMESTAMPTZ NOT NULL,
-    exchange_inflow     NUMERIC(30, 10),
-    exchange_outflow    NUMERIC(30, 10),
-    whale_tx_count      INTEGER,
-    gas_fee_gwei        NUMERIC(20, 6),
-    burn_rate           NUMERIC(30, 10)
-);
-CREATE INDEX IF NOT EXISTS idx_onchain_ts ON onchain_metrics (ts DESC);
-
 -- 6) 信号输出
 --   reasoning_content：DeepSeek 思考模式下模型先输出的"思维链"原文，
 --   仅用于审计 / 复盘，不参与下游决策。普通模式下为 NULL。
@@ -74,7 +63,7 @@ CREATE TABLE IF NOT EXISTS signals (
     id                 BIGSERIAL PRIMARY KEY,
     ts                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     symbol             TEXT        NOT NULL,
-    bias               TEXT        NOT NULL CHECK (bias IN ('long', 'short', 'neutral')),
+    bias               TEXT        NOT NULL CHECK (bias IN ('long', 'short', 'neutral', 'observe')),
     confidence         NUMERIC(6, 4) NOT NULL,
     reason             TEXT,
     risk               TEXT,
@@ -257,6 +246,12 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS position_size_pct        NUMERIC(8,
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe_alignment      JSONB;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS invalidation_conditions  JSONB;
 
+-- signals JSONB 数组约束（P1 新增）
+ALTER TABLE signals DROP CONSTRAINT IF EXISTS ck_entry_zone;
+ALTER TABLE signals ADD CONSTRAINT ck_entry_zone CHECK (jsonb_typeof(entry_zone) = 'array');
+ALTER TABLE signals DROP CONSTRAINT IF EXISTS ck_take_profit;
+ALTER TABLE signals ADD CONSTRAINT ck_take_profit CHECK (jsonb_typeof(take_profit) = 'array');
+
 -- ============================================================
 -- P1 升级：订单簿时序 + 主力/散户持仓比
 -- ============================================================
@@ -299,40 +294,6 @@ CREATE TABLE IF NOT EXISTS orderbook_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_orderbook_metrics_symbol_ts
     ON orderbook_metrics (symbol, ts DESC);
-
--- 11) 主力 / 散户多空 / 持仓比
---   ratio_type：
---     'account'             - 散户层多空账户比（按 ccy）
---     'account_contract'    - 散户层多空账户比（按 instId，更精确）
---     'top_trader_account'  - 精英账户多空比（按账户数）
---     'top_trader_position' - 精英账户多空比（按持仓量，更顺指）
---   long_ratio / short_ratio：百分比形式（0~1），来自 OKX 原始
---   ratio：long / short 比值（OKX 部分接口直接提供）
---   设计取舍：
---     - 不为每种 ratio_type 单独建表：4 种维度 schema 完全一致，
---       单表 + ratio_type 列让读侧可以一次拉齐多维度，省一次 JOIN。
---     - UNIQUE 含 ratio_type，避免不同维度互相挤占同一时间戳。
-CREATE TABLE IF NOT EXISTS position_ratios (
-    id           BIGSERIAL PRIMARY KEY,
-    exchange     TEXT        NOT NULL,
-    symbol       TEXT        NOT NULL,
-    ts           TIMESTAMPTZ NOT NULL,
-    ratio_type   TEXT        NOT NULL CHECK (
-        ratio_type IN (
-            'account', 'account_contract',
-            'top_trader_account', 'top_trader_position'
-        )
-    ),
-    long_ratio   NUMERIC(10, 6),
-    short_ratio  NUMERIC(10, 6),
-    ratio        NUMERIC(12, 6),
-    CONSTRAINT position_ratios_unique
-        UNIQUE (exchange, symbol, ts, ratio_type)
-);
-CREATE INDEX IF NOT EXISTS idx_position_ratios_symbol_ts
-    ON position_ratios (symbol, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_position_ratios_symbol_type_ts
-    ON position_ratios (symbol, ratio_type, ts DESC);
 
 -- ============================================================
 -- LLM-First 重构（plan 第 1.7 节）：以下 3 张表已整体下线

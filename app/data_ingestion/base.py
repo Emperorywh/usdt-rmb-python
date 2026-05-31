@@ -39,14 +39,3 @@ class ExchangeRestClient(abc.ABC):
     @abc.abstractmethod
     async def close(self) -> None:
         ...
-
-
-class OnchainProvider(abc.ABC):
-    """Abstract on-chain metrics provider."""
-
-    name: str = "base"
-
-    @abc.abstractmethod
-    async def fetch_metrics(self) -> Dict[str, Any]:
-        """Return latest snapshot of on-chain metrics."""
-        ...

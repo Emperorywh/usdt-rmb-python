@@ -62,6 +62,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
         depth: int = 5,
         contract_values: Optional[Dict[str, float]] = None,
         default_contract_value: float = 1.0,
+        ping_interval: float = 25.0,
     ):
         """
         构造函数
@@ -72,12 +73,14 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
             depth:                  订单簿深度（<=5 用 books5，否则 books）
             contract_values:        {symbol: ctVal} 合约面值映射，可空
             default_contract_value: 在 contract_values 中找不到时使用的兜底值
+            ping_interval:          心跳 ping 间隔（秒）
         """
         self.ws_url = ws_url
         self.symbols = symbols
         self.depth = depth
         self._contract_values: Dict[str, float] = dict(contract_values or {})
         self._default_ct_val = float(default_contract_value)
+        self._ping_interval = ping_interval
         self._stop = asyncio.Event()
 
     def _ct_val(self, symbol: str) -> float:
@@ -193,7 +196,7 @@ class OKXWebSocketClient(ExchangeWebSocketClient):
     async def _keepalive(self, ws) -> None:
         try:
             while True:
-                await asyncio.sleep(25)
+                await asyncio.sleep(self._ping_interval)
                 await ws.send("ping")
         except asyncio.CancelledError:
             pass

@@ -4,9 +4,10 @@
 lifespan 中实例化一次并挂载到 ``app.state``；路由通过
 :mod:`app.api_service.deps` 拉取依赖。
 
-LLM-First 重构后这里**只**装配数据采集 / 因子聚合 / LLM Agent / 邮件
-通知 4 类组件，不再创建 RuleEngine / ICCalibrator / LifecycleTracker /
-SignalEvaluator —— 这些模块都被整体删除（plan 第 1.1 / 1.5 节）。
+Phase 2 重构后：
+- 使用各独立 Repo（TradeRepo / KlineRepo / ...）替代 Repositories facade
+- Worker（TradeBufferWorker / RestWatchdog / ...）由容器创建并注入 Runner
+- LLM 拆为 LLMClient + LLMThrottleManager + LLMAgent 门面
 """
 from __future__ import annotations
 
@@ -17,14 +18,25 @@ from typing import Dict, List, Optional
 from app.config import Settings
 from app.data_ingestion.okx_rest import OKXRestClient
 from app.data_ingestion.okx_ws import OKXWebSocketClient
-from app.data_ingestion.onchain_mock import MockOnchainProvider
 from app.data_ingestion.runner import IngestionRunner
+from app.data_ingestion.workers.trade_buffer import TradeBufferWorker
+from app.data_ingestion.workers.orderbook_writer import OrderbookWriter
+from app.data_ingestion.workers.rest_watchdog import RestWatchdog
+from app.data_ingestion.workers.retention import RetentionCleaner
 from app.data_storage.database import Database
+from app.data_storage.repos.trade_repo import TradeRepo
+from app.data_storage.repos.kline_repo import KlineRepo
+from app.data_storage.repos.orderbook_repo import OrderbookRepo
+from app.data_storage.repos.derivatives_repo import DerivativesRepo
+from app.data_storage.repos.signal_repo import SignalRepo
+from app.data_storage.repos.email_repo import EmailRepo
 from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
 from app.factor_engine.klines import KlineAggregator
 from app.logging_config import get_logger
 from app.notification.email_sender import EmailSender
+from app.signal_engine.llm_client import LLMClient
+from app.signal_engine.llm_throttle import LLMThrottleManager
 from app.signal_engine.llm_agent import LLMAgent
 from app.signal_engine.service import SignalService
 
@@ -36,103 +48,152 @@ _INSTRUMENT_REFRESH_INTERVAL_SECONDS = 5 * 60.0
 
 @dataclass
 class AppContainer:
-    """全局依赖容器。
-
-    说明：
-        - ``onchain`` 字段保留 :class:`MockOnchainProvider` 实例占位，
-          但**当前不再注入到 IngestionRunner**，因此不会真正写入
-          ``onchain_metrics`` 表，等接入真实链上数据源后再恢复。
-    """
+    """全局依赖容器。"""
 
     settings: Settings
     db: Database
+    # 独立 Repo
+    trade_repo: TradeRepo
+    kline_repo: KlineRepo
+    ob_repo: OrderbookRepo
+    deriv_repo: DerivativesRepo
+    signal_repo: SignalRepo
+    email_repo: EmailRepo
+    # 向后兼容 facade（aggregator / klines / service / routes 仍使用）
     repos: Repositories
+    # Ingestion
     okx_rest: OKXRestClient
-    onchain: Optional[MockOnchainProvider]
-    factor_aggregator: FactorAggregator
-    llm_agent: LLMAgent
-    email_sender: EmailSender
-    signal_service: SignalService
     ingestion_runner: Optional[IngestionRunner] = field(default=None)
-    # 启动后台周期刷新合约面值的任务句柄；shutdown 时一并取消，避免泄漏
-    instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
-    # 多周期 K 线增量聚合器（LLM-First 架构下永远启用）
+    # Factor
+    factor_aggregator: Optional[FactorAggregator] = field(default=None)
     kline_aggregator: Optional[KlineAggregator] = field(default=None)
+    # Signal
+    llm_agent: Optional[LLMAgent] = field(default=None)
+    email_sender: Optional[EmailSender] = field(default=None)
+    signal_service: Optional[SignalService] = field(default=None)
+    # Background
+    instrument_refresh_task: Optional[asyncio.Task] = field(default=None)
 
     @classmethod
     async def create(cls, settings: Settings) -> "AppContainer":
         # ---- Storage ----
         db = Database(
-            dsn=settings.database_url,
-            min_size=settings.db_pool_min_size,
-            max_size=settings.db_pool_max_size,
-            max_inactive_connection_lifetime=settings.db_max_inactive_connection_lifetime,
-            write_max_retries=settings.db_write_max_retries,
-            write_retry_backoff=settings.db_write_retry_backoff,
+            dsn=settings.db.database_url,
+            min_size=settings.db.db_pool_min_size,
+            max_size=settings.db.db_pool_max_size,
+            max_inactive_connection_lifetime=settings.db.db_max_inactive_connection_lifetime,
+            acquire_timeout=settings.db.db_pool_acquire_timeout,
+            write_max_retries=settings.db.db_write_max_retries,
+            write_retry_backoff=settings.db.db_write_retry_backoff,
         )
         await db.connect()
+
+        # 独立 Repo 实例
+        trade_repo = TradeRepo(db)
+        kline_repo = KlineRepo(db)
+        ob_repo = OrderbookRepo(db)
+        deriv_repo = DerivativesRepo(db)
+        signal_repo = SignalRepo(db)
+        email_repo = EmailRepo(db)
+        # 向后兼容 facade
         repos = Repositories(db)
 
         # ---- Ingestion clients ----
-        # 显式禁用系统代理（默认 trust_env=False）并加重试，避免因代理
-        # TLS 握手抖动导致 funding / OI 轮询反复抛 httpx.ConnectError。
         okx_rest = OKXRestClient(
-            base_url=settings.okx_rest_url,
-            timeout=settings.okx_rest_timeout,
-            max_retries=settings.okx_rest_max_retries,
-            retry_backoff=settings.okx_rest_retry_backoff,
-            trust_env=settings.okx_rest_trust_env,
-            proxy=settings.okx_rest_proxy or None,
+            base_url=settings.ingestion.okx_rest_url,
+            timeout=settings.ingestion.okx_rest_timeout,
+            max_retries=settings.ingestion.okx_rest_max_retries,
+            retry_backoff=settings.ingestion.okx_rest_retry_backoff,
+            trust_env=settings.ingestion.okx_rest_trust_env,
+            proxy=settings.ingestion.okx_rest_proxy or None,
+            breaker_base_cooldown=settings.ingestion.breaker_base_cooldown_seconds,
+            breaker_max_cooldown=settings.ingestion.breaker_max_cooldown_seconds,
         )
-        # 链上数据源暂时不启用：保留 mock 实例占位，便于将来切换到
-        # 真实 provider 后只需替换这里的实现，下方 runner 不再注入它。
-        onchain: Optional[MockOnchainProvider] = MockOnchainProvider()
 
-        # 合约面值（ctVal）启动策略：
-        # ----------------------------------------------------------------
-        # 之前是"启动时同步拉 instruments，最多重试 3 次"，在国内直连
-        # OKX 经常每次 ConnectTimeout，导致冷启动多花 ≈120s。
-        # 现在改成：先用 default_contract_value 占位让服务立刻起来，
-        # 同时启动一个后台任务异步拉真值并写回 OKXWebSocketClient。
         contract_values: Dict[str, float] = {
-            sym: settings.default_contract_value for sym in settings.symbols
+            sym: settings.ingestion.default_contract_value
+            for sym in settings.ingestion.symbols
         }
 
         ws_clients = [
             OKXWebSocketClient(
-                ws_url=settings.okx_ws_url,
-                symbols=settings.symbols,
-                depth=settings.orderbook_depth,
+                ws_url=settings.ingestion.okx_ws_url,
+                symbols=settings.ingestion.symbols,
+                depth=settings.ingestion.orderbook_depth,
                 contract_values=contract_values,
-                default_contract_value=settings.default_contract_value,
+                default_contract_value=settings.ingestion.default_contract_value,
+                ping_interval=settings.ingestion.ws_ping_interval_seconds,
             )
         ]
-        # 后台异步拉取真实 ctVal，能拿到就 hot-update 到 ws_client；
-        # 拿不到就周期重试，直到所有 symbol 都拿到为止（任务自然退出）。
+
         instrument_refresh_task = asyncio.create_task(
             cls._refresh_instruments_loop(
                 okx_rest=okx_rest,
-                symbols=list(settings.symbols),
+                symbols=list(settings.ingestion.symbols),
                 ws_clients=ws_clients,
-                fallback_value=settings.default_contract_value,
+                fallback_value=settings.ingestion.default_contract_value,
             ),
             name="instrument-refresh",
         )
-        # 注意：故意不传 onchain，停用 mock 链上指标的定时写入。
-        # 等接入真实链上数据源后再把 onchain=onchain 加回去。
-        runner = IngestionRunner(
+
+        # ---- Workers ----
+        stopping = asyncio.Event()
+        trade_buffer = TradeBufferWorker(
+            trade_repo=trade_repo,
+            deriv_repo=deriv_repo,
             settings=settings,
-            repos=repos,
-            ws_clients=ws_clients,
+            stopping=stopping,
+        )
+        ob_writer = OrderbookWriter(ob_repo=ob_repo, settings=settings)
+        watchdog = RestWatchdog(
+            deriv_repo=deriv_repo,
             rest_client=okx_rest,
+            settings=settings,
+            stopping=stopping,
+            # ws_event_at 将在 Runner 启动后由共享引用传入
+        )
+        retention = RetentionCleaner(
+            trade_repo=trade_repo,
+            ob_repo=ob_repo,
+            signal_repo=signal_repo,
+            deriv_repo=deriv_repo,
+            settings=settings,
+            stopping=stopping,
         )
 
-        # ---- Factor + signal（LLM-First 决策核心）----
+        # ---- Runner（精简编排器）----
+        runner = IngestionRunner(
+            settings=settings,
+            deriv_repo=deriv_repo,
+            ws_clients=ws_clients,
+            rest_client=okx_rest,
+            trade_buffer=trade_buffer,
+            ob_writer=ob_writer,
+            watchdog=watchdog,
+            retention=retention,
+        )
+        # 把 Runner 的 WS 健康状态引用注入 Watchdog
+        watchdog._ws_event_at = runner._last_ws_event_at
+
+        # ---- Factor ----
         factor_aggregator = FactorAggregator(repos=repos, settings=settings)
-        llm_agent = LLMAgent(settings=settings, repos=repos)
-        # 邮件通知发送器：当 LLM 给出明确方向时（long/short）异步给 notification_emails
-        # 表里所有 enabled=TRUE 的邮箱推送一封 HTML 提醒邮件。
-        # observe / 缓存命中不发；未配置 Resend 凭据时整体降级为 no-op。
+        kline_aggregator = KlineAggregator(
+            repos=repos,
+            settings=settings,
+            exchange="okx",
+        )
+
+        # ---- Signal（LLM-First 决策核心）----
+        llm_client = LLMClient(settings=settings)
+        llm_throttle = LLMThrottleManager(
+            signal_repo=signal_repo,
+            settings=settings,
+        )
+        llm_agent = LLMAgent(
+            llm_client=llm_client,
+            llm_throttle=llm_throttle,
+            settings=settings,
+        )
         email_sender = EmailSender(settings=settings)
         signal_service = SignalService(
             repos=repos,
@@ -141,28 +202,24 @@ class AppContainer:
             email_sender=email_sender,
         )
 
-        # ---- 多周期 K 线增量聚合器 ----
-        # LLM-First 架构下 MTF 因子永远开启（NarrativeRenderer 7 段叙事
-        # 全部依赖 by_timeframe）；不再有 enable_mtf_factors 灰度路径。
-        kline_aggregator = KlineAggregator(
-            repos=repos,
-            settings=settings,
-            exchange="okx",
-        )
-
         return cls(
             settings=settings,
             db=db,
+            trade_repo=trade_repo,
+            kline_repo=kline_repo,
+            ob_repo=ob_repo,
+            deriv_repo=deriv_repo,
+            signal_repo=signal_repo,
+            email_repo=email_repo,
             repos=repos,
             okx_rest=okx_rest,
-            onchain=onchain,
+            ingestion_runner=runner,
             factor_aggregator=factor_aggregator,
+            kline_aggregator=kline_aggregator,
             llm_agent=llm_agent,
             email_sender=email_sender,
             signal_service=signal_service,
-            ingestion_runner=runner,
             instrument_refresh_task=instrument_refresh_task,
-            kline_aggregator=kline_aggregator,
         )
 
     @staticmethod
@@ -172,21 +229,8 @@ class AppContainer:
         ws_clients: List[OKXWebSocketClient],
         fallback_value: float,
     ) -> None:
-        """
-        后台周期刷新合约面值的任务体
-        ---------------------------------------------------------------
-        参数：
-            okx_rest:       已经构造好的 REST 客户端（带熔断）
-            symbols:        需要刷新的 symbol 列表
-            ws_clients:     已经存在的 WS 客户端列表，成功拿到后会被热更新
-            fallback_value: 拉不到真值时使用的默认 ctVal（仅用于日志对比）
-        说明：
-            - 成功拿到的 symbol 从待办列表里移除，所有 symbol 都拿到后任务退出。
-            - 失败不打 warn（REST 客户端内部已经做了失败摘要日志）。
-            - 任何 sleep 都允许被取消（容器 shutdown 时一并清理）。
-        """
+        """后台周期刷新合约面值的任务体。"""
         pending: List[str] = list(symbols)
-        # 第一次立即试一次，避免冷启动后 5 分钟才有真值
         first_pass = True
         while pending:
             if not first_pass:
@@ -227,8 +271,6 @@ class AppContainer:
                 await self.instrument_refresh_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        # 先停 K 线聚合器再停采集，保证关闭时不会再有"读 trades / 写 klines"
-        # 的协程在飞，避免与连接池关闭竞态。
         if self.kline_aggregator is not None:
             await self.kline_aggregator.stop()
         if self.ingestion_runner is not None:

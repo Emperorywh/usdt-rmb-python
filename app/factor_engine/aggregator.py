@@ -44,6 +44,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -52,7 +53,6 @@ from app.data_storage.repositories import Repositories
 from app.factor_engine.capital_flow import compute_capital_flow_from_klines
 from app.factor_engine.derivatives import (
     compute_derivatives_per_timeframe,
-    compute_position_ratio_factors,
 )
 from app.factor_engine.liquidity import build_liquidity_map
 from app.factor_engine.market_structure import compute_market_structure_from_klines
@@ -95,12 +95,12 @@ class FactorAggregator:
     职责：
         按 MTF_TIMEFRAMES 拉取多周期 K 线表 + funding/OI + 最新订单簿
         + 最近 1h 爆仓，组合成多周期因子矩阵 + mtf_alignment 共振
-        + liquidations 滚动窗口 + regime + 流动性地图 + 持仓比。
+        + liquidations 滚动窗口 + regime + 流动性地图。
 
     LLM-First 重构：
         删除 ``_compute_legacy`` 回滚通道与 ``enable_mtf_factors`` /
-        ``enable_orderbook_timeseries`` / ``enable_position_ratios`` /
-        ``enable_regime`` 4 个灰度 flag。MTF / 订单簿时序 / 持仓比 /
+        ``enable_orderbook_timeseries`` /
+        ``enable_regime`` 3 个灰度 flag。MTF / 订单簿时序 /
         regime 全部永远开启。
     """
 
@@ -123,7 +123,7 @@ class FactorAggregator:
             symbol: 合约代码，例如 'ETH-USDT-SWAP'
         返回：
             模块顶部说明的 by_timeframe / mtf_alignment / liquidations /
-            regime / liquidity / position_ratios 完整结构。
+            regime / liquidity 完整结构。
         """
         return await self._compute_mtf(symbol)
 
@@ -139,90 +139,108 @@ class FactorAggregator:
         返回：
             完整的 P0 因子快照。
         """
+        # 连接池利用率监控：>80% 时打 warn，帮助提前发现池耗尽
+        stats = self.repos.db.pool_stats()
+        usage_pct = (stats["size"] - stats["idle"]) / stats["max"] if stats["max"] > 0 else 0
+        if usage_pct > 0.8:
+            logger.warning(
+                "连接池利用率偏高 symbol=%s：%d/%d 在用（空闲 %d）",
+                symbol,
+                stats["size"] - stats["idle"],
+                stats["max"],
+                stats["idle"],
+            )
+
         now = datetime.now(timezone.utc)
 
-        # ---- 共享数据：orderbook / funding / OI / 爆仓 ----
-        orderbook = await self.repos.fetch_latest_orderbook(symbol)
-        funding = await self.repos.fetch_latest_funding(symbol)
-        # OI 取近 24 小时，覆盖 1d 周期的起点
+        # ---- 第 1 组：共享数据并行拉取（6 个查询 → 1 次 gather）----
+        # 使用 return_exceptions=True 保证单个查询失败不阻塞其他查询。
         oi_since = now - timedelta(seconds=24 * 3600)
-        oi_history = await self.repos.fetch_recent_oi(
-            symbol, since=oi_since, limit=20000
-        )
-        # 爆仓最多算 1h 滚动窗口，但保留余量便于 cascade_signal 比较
         liq_since = now - timedelta(seconds=2 * 3600)
-        liquidations = await self.repos.fetch_liquidations_since(symbol, liq_since)
+        ob_metric_window = int(self.settings.factor.orderbook_metrics_baseline_seconds)
+        funding_window = int(self.settings.factor.funding_pct_rank_window_seconds)
 
-        # ---- 订单簿时序 / 持仓比 / 7 天 funding 历史（永远开启）----
-        recent_orderbook_metrics: List[Dict[str, Any]] = []
-        ob_metric_window = int(
-            getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
-        )
-        try:
-            recent_orderbook_metrics = await self.repos.fetch_orderbook_metrics_since(
+        (
+            orderbook_raw,
+            funding_raw,
+            oi_history_raw,
+            liquidations_raw,
+            ob_metrics_raw,
+            funding_history_raw,
+        ) = await asyncio.gather(
+            self.repos.fetch_latest_orderbook(symbol),
+            self.repos.fetch_latest_funding(symbol),
+            self.repos.fetch_recent_oi(symbol, since=oi_since, limit=20000),
+            self.repos.fetch_liquidations_since(symbol, liq_since),
+            self.repos.fetch_orderbook_metrics_since(
                 symbol=symbol,
                 since=now - timedelta(seconds=ob_metric_window),
-            )
-        except Exception:
+            ),
+            self.repos.fetch_funding_rates_since(
+                symbol=symbol, since=now - timedelta(seconds=funding_window)
+            ),
+            return_exceptions=True,
+        )
+
+        # 核心数据：失败必须显式 raise，还原"串行版直接抛异常"的行为
+        if isinstance(orderbook_raw, Exception):
+            raise orderbook_raw
+        if isinstance(funding_raw, Exception):
+            raise funding_raw
+        if isinstance(oi_history_raw, Exception):
+            raise oi_history_raw
+        if isinstance(liquidations_raw, Exception):
+            raise liquidations_raw
+
+        orderbook = orderbook_raw
+        funding = funding_raw
+        oi_history = oi_history_raw
+        liquidations = liquidations_raw
+
+        # 可降级数据：Exception → 空值，与当前逐个 try/except 行为一致
+        recent_orderbook_metrics = (
+            ob_metrics_raw if not isinstance(ob_metrics_raw, Exception) else []
+        )
+        if isinstance(ob_metrics_raw, Exception):
             logger.warning(
                 "拉取 orderbook_metrics 失败，退化为单快照模式 symbol=%s",
                 symbol,
-                exc_info=True,
+                exc_info=ob_metrics_raw,
             )
-            recent_orderbook_metrics = []
-
-        latest_position_ratios: Dict[str, Dict[str, Any]] = {}
-        try:
-            latest_position_ratios = await self.repos.fetch_latest_position_ratios(
-                symbol
-            )
-        except Exception:
-            logger.warning(
-                "拉取 position_ratios 失败，散户/精英多空比将为 None symbol=%s",
-                symbol,
-                exc_info=True,
-            )
-            latest_position_ratios = {}
-
-        funding_history: List[Dict[str, Any]] = []
-        try:
-            funding_window = int(
-                getattr(self.settings, "funding_pct_rank_window_seconds", 7 * 86400)
-            )
-            funding_history = await self.repos.fetch_funding_rates_since(
-                symbol=symbol, since=now - timedelta(seconds=funding_window)
-            )
-        except Exception:
+        funding_history = (
+            funding_history_raw if not isinstance(funding_history_raw, Exception) else []
+        )
+        if isinstance(funding_history_raw, Exception):
             logger.warning(
                 "拉取 funding_rates 历史失败，funding 分位数将为 None symbol=%s",
                 symbol,
-                exc_info=True,
+                exc_info=funding_history_raw,
             )
 
         ob_factors = compute_orderbook_factors_timeseries(
             latest_snapshot=orderbook,
             recent_metrics=recent_orderbook_metrics,
-            wall_multiplier=self.settings.liquidity_wall_multiplier,
+            wall_multiplier=self.settings.factor.liquidity_wall_multiplier,
             now=now,
-            window_seconds=int(
-                getattr(self.settings, "orderbook_metrics_window_seconds", 900)
-            ),
-            baseline_seconds=int(
-                getattr(self.settings, "orderbook_metrics_baseline_seconds", 3600)
-            ),
+            window_seconds=int(self.settings.factor.orderbook_metrics_window_seconds),
+            baseline_seconds=int(self.settings.factor.orderbook_metrics_baseline_seconds),
         )
 
-        lookback = int(self.settings.mtf_lookback_bars)
+        lookback = int(self.settings.factor.mtf_lookback_bars)
+
+        # ---- 第 2 组：5 周期 K 线并行拉取 ----
+        klines_map = await asyncio.gather(*[
+            self.repos.fetch_recent_klines(timeframe=tf, symbol=symbol, limit=lookback)
+            for tf in MTF_TIMEFRAMES
+        ])
 
         by_timeframe: Dict[str, Dict[str, Any]] = {}
-        for tf in MTF_TIMEFRAMES:
-            klines = await self.repos.fetch_recent_klines(
-                timeframe=tf, symbol=symbol, limit=lookback
-            )
+        for idx, tf in enumerate(MTF_TIMEFRAMES):
+            klines = klines_map[idx]
             cap = compute_capital_flow_from_klines(
                 klines,
-                volume_zscore_window=int(self.settings.mtf_volume_zscore_window),
-                divergence_lookback=int(self.settings.mtf_divergence_lookback),
+                volume_zscore_window=int(self.settings.factor.mtf_volume_zscore_window),
+                divergence_lookback=int(self.settings.factor.mtf_divergence_lookback),
             )
             deriv = compute_derivatives_per_timeframe(
                 funding=funding,
@@ -241,15 +259,6 @@ class FactorAggregator:
                 "market_structure": struct,
             }
 
-        # P1：把持仓比因子合并到顶层"derivatives 维度"（同时挂在 1h block，
-        # 让规则引擎 _extract_layers 也能拿到，便于后续阈值化）
-        position_ratio_factors = compute_position_ratio_factors(latest_position_ratios)
-        if "1h" in by_timeframe:
-            by_timeframe["1h"]["derivatives"] = {
-                **by_timeframe["1h"].get("derivatives", {}),
-                **position_ratio_factors,
-            }
-
         mtf_alignment = self._compute_alignment(by_timeframe)
         liquidation_summary = self._summarize_liquidations(
             liquidations=liquidations, now=now,
@@ -262,12 +271,8 @@ class FactorAggregator:
                 by_timeframe=by_timeframe,
                 bb_width_history_4h=self._collect_bb_width_history(by_timeframe, "4h"),
                 bb_width_history_15m=self._collect_bb_width_history(by_timeframe, "15m"),
-                adx_trending_threshold=float(
-                    getattr(self.settings, "regime_adx_trending_threshold", 25.0)
-                ),
-                adx_ranging_threshold=float(
-                    getattr(self.settings, "regime_adx_ranging_threshold", 18.0)
-                ),
+                adx_trending_threshold=float(self.settings.factor.regime_adx_trending_threshold),
+                adx_ranging_threshold=float(self.settings.factor.regime_adx_ranging_threshold),
             )
         except Exception:
             logger.warning(
@@ -279,12 +284,8 @@ class FactorAggregator:
         try:
             liquidity = build_liquidity_map(
                 by_timeframe=by_timeframe,
-                round_step_usd=float(
-                    getattr(self.settings, "liquidity_round_level_step_usd", 50.0)
-                ),
-                max_levels_per_side=int(
-                    getattr(self.settings, "liquidity_max_levels_per_side", 5)
-                ),
+                round_step_usd=float(self.settings.factor.liquidity_round_level_step_usd),
+                max_levels_per_side=int(self.settings.factor.liquidity_max_levels_per_side),
             )
         except Exception:
             logger.warning(
@@ -307,7 +308,6 @@ class FactorAggregator:
             # P1 根节点新增字段
             "regime": regime,
             "liquidity": liquidity,
-            "position_ratios": position_ratio_factors,
         }
 
     @staticmethod
@@ -411,7 +411,7 @@ class FactorAggregator:
               内每分钟均值"比较，> N 倍即 True。
             - 性能：单次遍历事件，线性时间，事件数 1 小时上限 ~10 万即可。
         """
-        windows_min = list(self.settings.liquidation_windows_minutes or [5, 15, 60])
+        windows_min = list(self.settings.factor.liquidation_windows_minutes or [5, 15, 60])
         out: Dict[str, Any] = {}
         # 预先把每条事件的 (epoch_seconds, side, size) 转成简单元组，
         # 避免后面循环里反复访问 dict 字段
@@ -457,7 +457,7 @@ class FactorAggregator:
         )
         # 每分钟均值；不足 60 分钟样本时仍按 60 估算（保守）
         per_min_avg = last_hour_size / 60.0 if last_hour_size > 0 else 0.0
-        threshold = per_min_avg * float(self.settings.liquidation_cascade_multiplier)
+        threshold = per_min_avg * float(self.settings.factor.liquidation_cascade_multiplier)
         cascade = bool(per_min_avg > 0 and last_minute_size > threshold)
         out["cascade_signal"] = cascade
         out["last_minute_size"] = round(last_minute_size, 6)

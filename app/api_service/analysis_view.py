@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional
 
+from app.utils import safe_float as _to_float
+
 
 # ----------------------------------------------------------------------
 # 字面量映射表
@@ -55,24 +57,7 @@ _SOURCE_LABEL: Dict[str, str] = {
 }
 
 
-# ----------------------------------------------------------------------
-# 通用类型转换
-# ----------------------------------------------------------------------
-def _to_float(v: Any) -> Optional[float]:
-    """把 Decimal / int / str 等数值类型安全转成 float"""
-    if v is None:
-        return None
-    if isinstance(v, Decimal):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
+# _to_float 已由 from app.utils import safe_float as _to_float 提供
 
 
 def _to_iso(v: Any) -> Optional[str]:

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from app.utils import safe_float as _to_float
+
 
 # strength → 排序权重；越大越优先
 _STRENGTH_WEIGHT = {"strong": 3, "medium": 2, "weak": 1}
@@ -217,13 +219,3 @@ def _resolve_current_price(
         if v is not None and v > 0:
             return v
     return None
-
-
-def _to_float(v: Any) -> Optional[float]:
-    """容错 float 转换。"""
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None

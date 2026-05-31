@@ -5,9 +5,9 @@
 LLM 100% 拥有方向判断权；本服务只做 3 件事：
 
 1. **数据准备**：调用 FactorAggregator 拿多周期因子矩阵；
-2. **极端风控底线**：当 15m ATR 占比低于 ``decision_min_atr_pct_15m``
-   （默认 0.25%）时跳过 LLM 调用直接 neutral —— 这是**唯一**的服务端
-   "干预"，理由是"数学上不可交易"（任何 SL 都是高频陷阱）；
+2. **ATR 软提示**：当 15m ATR 占比低于 ``decision_min_atr_pct_15m``
+   （默认 0.25%）时，将 ATR 偏低警告注入 prompt（而非硬跳过 LLM），
+   让 LLM 自行判断是否影响方向决策；
 3. **持久化 + 邮件通知**：仅当 LLM 真正发起调用并落库时（``from_cache=False``）
    才向 ``notification_emails`` 表里所有启用的邮箱推送 HTML 提醒。
 
@@ -28,8 +28,9 @@ from app.data_storage.repositories import Repositories
 from app.factor_engine.aggregator import FactorAggregator
 from app.logging_config import get_logger
 from app.notification.email_sender import EmailSender
-from app.signal_engine.llm_agent import LLMAgent, LLMAnalysisResult
-from app.signal_engine.schemas import TradingSignal
+from app.utils import safe_float
+from app.signal_engine.llm_agent import LLMAgent
+from app.signal_engine.schemas import LLMAnalysisResult, TradingSignal
 
 logger = get_logger(__name__)
 
@@ -56,12 +57,6 @@ class SignalService:
         # 后台邮件发送任务集合：仅作"防 GC"强引用，避免 asyncio.create_task
         # 创建的任务在 loop 还没调度前被垃圾回收掉。任务结束后从集合中移除。
         self._email_tasks: set[asyncio.Task[Any]] = set()
-        # 上一轮 ATR floor 状态（按 symbol 维度记忆），用于"边沿触发"日志：
-        # - None：上一轮未触发（或还没跑过）
-        # - "atr_too_low" 等 reason：上一轮已触发
-        # 仅在状态变化（进入 / 切换 reason / 退出）时打 INFO，持续命中走 DEBUG，
-        # 避免长时间低波动行情下反复刷屏。
-        self._last_atr_floor_reason: Dict[str, Optional[str]] = {}
         self._stopping = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -78,9 +73,9 @@ class SignalService:
             reasoning_content 等供 API 接口透出。
         流程：
             1) factors = factor_aggregator.compute(symbol)
-            2) ATR floor 极端风控：15m ATR 占比 < threshold → 跳过 LLM，
-               构造一条 neutral 占位信号（不入库）；
-            3) llm_agent.analyze(symbol, factors)
+            2) ATR floor 软提示：15m ATR 占比 < threshold → 注入警告到 prompt，
+               不再硬跳过 LLM；
+            3) llm_agent.analyze(symbol, factors, atr_floor_warning=...)
                - 返回 None：LLM 未启用 / 调用失败 → 不入库；
                - 返回 from_cache=True：节流命中 → 不入库（避免重复行）；
                - 返回 from_cache=False：真实 LLM 调用 → 入库 + 触发邮件。
@@ -88,47 +83,18 @@ class SignalService:
         factors = await self.factor_aggregator.compute(symbol)
 
         # ----------------------------------------------------------------
-        # 唯一的服务端"干预"：ATR floor
+        # ATR floor 软提示：低波动时注入警告到 prompt，不再硬跳过 LLM
         # ----------------------------------------------------------------
-        # 当 15m ATR 占比低于阈值时，市场处于无可交易波动状态——任何 SL 都
-        # 是高频陷阱。这是数学上的不可交易性，不是主观规则；阈值（默认
-        # 0.25%）由 settings.decision_min_atr_pct_15m 控制，置 0 / 负数
-        # 即可完全关闭该底线（不推荐）。
-        atr_floor_reason = self._atr_floor_check(factors)
-        # 边沿触发日志：与上一轮相同（持续触发 / 持续未触发）时不打 INFO，
-        # 仅在状态变化（进入 / 切换 reason / 退出）那一轮打 INFO。
-        # 持续命中时降级到 DEBUG，开 DEBUG 日志仍可追踪每轮的拦截记录。
-        prev_atr_floor_reason = self._last_atr_floor_reason.get(symbol)
-        self._last_atr_floor_reason[symbol] = atr_floor_reason
-        if atr_floor_reason is not None:
-            is_atr_state_change = prev_atr_floor_reason != atr_floor_reason
-            log_method = logger.info if is_atr_state_change else logger.debug
-            log_method(
-                "ATR floor 触发：symbol=%s 跳过 LLM 调用（reason=%s）",
-                symbol, atr_floor_reason,
-            )
-            final = self._make_atr_floor_neutral_signal(atr_floor_reason)
-            return {
-                "id": None,
-                "symbol": symbol,
-                "source": f"atr_floor:{atr_floor_reason}",
-                "persisted": False,
-                "signal": final.model_dump(),
-                "factors": factors,
-                "reasoning_content": None,
-            }
-        if prev_atr_floor_reason is not None:
-            # 退出边沿：上一轮还在 ATR floor 拦截，这一轮已恢复正常波动率。
-            # 打一条 INFO 让运维 / 日志读者清楚"观望状态已解除"。
-            logger.info(
-                "ATR floor 解除：symbol=%s 波动率恢复正常（prev_reason=%s）",
-                symbol, prev_atr_floor_reason,
+        atr_floor_warning = self._atr_floor_check(factors)
+        if atr_floor_warning is not None:
+            logger.debug(
+                "ATR floor warning 注入 prompt：symbol=%s", symbol,
             )
 
         # llm_agent.analyze 返回 LLMAnalysisResult（包装了 TradingSignal +
         # 思考模式下的 reasoning_content）；调用失败 / 未启用时返回 None。
         llm_result: Optional[LLMAnalysisResult] = await self.llm_agent.analyze(
-            symbol=symbol, factors=factors,
+            symbol=symbol, factors=factors, atr_floor_warning=atr_floor_warning,
         )
 
         if llm_result is None:
@@ -239,18 +205,6 @@ class SignalService:
     # ==================================================================
     # ATR floor（唯一的服务端"极端风控"，不叫"闸门"）
     # ==================================================================
-    @staticmethod
-    def _safe_float(v: Any) -> Optional[float]:
-        """把任意输入转 float，失败 / NaN / Inf 返回 None"""
-        if v is None:
-            return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-        if f != f or f in (float("inf"), float("-inf")):
-            return None
-        return f
 
     def _atr_floor_check(self, factors: Dict[str, Any]) -> Optional[str]:
         """
@@ -259,27 +213,24 @@ class SignalService:
         参数：
             factors: FactorAggregator.compute 输出
         返回：
-            触发时返回 "atr_too_low"，未触发返回 None。
+            触发时返回格式化的中文警告字符串，未触发返回 None。
         说明：
             atr_pct_15m = atr_14 / last_close。当此比例低于
             ``decision_min_atr_pct_15m``（默认 0.0025 = 0.25%）时，
-            视为"数学上不可交易"（任何 SL 都是高频陷阱），跳过 LLM。
-            数据缺失时（atr_14 / last_close 任一为 None）保守起见**不**触发，
-            让 LLM 仍有机会基于其它信号判断——而不是因为单条因子缺失就不交易。
+            返回 ATR 偏低警告注入 prompt（不再硬跳过 LLM）。
+            数据缺失时（atr_14 / last_close 任一为 None）保守起见**不**触发。
             把 ``decision_min_atr_pct_15m`` 设为 0 或负数可完全关闭该底线。
         """
         settings = self.factor_aggregator.settings
-        threshold = self._safe_float(
-            getattr(settings, "decision_min_atr_pct_15m", None)
-        )
+        threshold = safe_float(settings.signal.decision_min_atr_pct_15m)
         if threshold is None or threshold <= 0:
             return None
         if not isinstance(factors, dict):
             return None
         by_tf = factors.get("by_timeframe") or {}
         ms_15m = ((by_tf.get("15m") or {}).get("market_structure")) or {}
-        atr_14 = self._safe_float(ms_15m.get("atr_14"))
-        last_close = self._safe_float(ms_15m.get("last_close"))
+        atr_14 = safe_float(ms_15m.get("atr_14"))
+        last_close = safe_float(ms_15m.get("last_close"))
         if atr_14 is None or last_close is None or last_close <= 0:
             return None
         atr_pct = atr_14 / last_close
@@ -288,38 +239,11 @@ class SignalService:
                 "ATR floor 触发：atr_pct_15m=%.5f < threshold=%.5f",
                 atr_pct, threshold,
             )
-            return "atr_too_low"
+            return (
+                f"⚠️ 当前 ATR(15m) 占比极低（{atr_pct * 100:.3f}%），"
+                "波动率处于不可交易区间。请考虑这是否影响你的方向判断。"
+            )
         return None
-
-    @staticmethod
-    def _make_atr_floor_neutral_signal(reason: str) -> TradingSignal:
-        """
-        构造一条"ATR floor 拦截"的 neutral 信号
-        --------------------------------------------------------------
-        参数：
-            reason: 触发原因（当前只有 "atr_too_low" 一种）
-        返回：
-            干净的 neutral TradingSignal（plan 字段全部为 None）。
-        说明：
-            confidence 一律置 0.0：这条 signal 是被极端风控拦下的，不入库，
-            仅用于本轮 API 响应 / 日志展示。
-        """
-        zh_map = {
-            "atr_too_low": "ATR(15m) 占比低于阈值（< 0.25%），市场无可交易波动",
-        }
-        zh_reason = zh_map.get(reason, reason)
-        return TradingSignal(
-            bias="neutral",
-            confidence=0.0,
-            reason=f"[ATR floor:{reason}] {zh_reason}",
-            risk=f"极端风控底线触发：{zh_reason}（数学上不可交易，跳过 LLM 调用）",
-            suggestion=(
-                "本周期建议观望，等待波动率恢复正常水平后再做判断。"
-                "仅供参考，不构成交易指令"
-            ),
-            timeframe_alignment={},
-            invalidation_conditions=[],
-        )
 
     # ==================================================================
     # 邮件提醒（fire-and-forget）
@@ -449,7 +373,7 @@ class SignalService:
             - 最新 orderbook_snapshot 不为空（WS 接入后秒级即可拿到）
         """
         settings = self.factor_aggregator.settings
-        min_bars = max(6, int(getattr(settings, "mtf_lookback_bars", 80)) // 4)
+        min_bars = max(6, int(settings.factor.mtf_lookback_bars) // 4)
         check_interval = 5.0
         started_at = time.monotonic()
         deadline = started_at + max(0.0, float(hard_timeout))
@@ -475,7 +399,11 @@ class SignalService:
                 funding = await self.repos.fetch_latest_funding(symbol)
                 orderbook = await self.repos.fetch_latest_orderbook(symbol)
             except Exception:
-                logger.exception("信号循环 %s warmup 探测失败，稍后重试", symbol)
+                logger.warning(
+                    "信号循环 %s warmup 探测失败，稍后重试",
+                    symbol,
+                    exc_info=True,
+                )
                 klines_5m, funding, orderbook = [], None, None
 
             last_status = {
@@ -528,7 +456,7 @@ class SignalService:
     async def _run_loop(self, symbol: str, interval: int) -> None:
         # 冷启动 warmup：探测式等到关键三件套（5m 线 / funding / orderbook）就位再开跑
         hard_timeout = (
-            max(interval, int(self.factor_aggregator.settings.factor_window_seconds))
+            max(interval, int(self.factor_aggregator.settings.factor.factor_window_seconds))
             + 60
         )
 
@@ -547,10 +475,6 @@ class SignalService:
                 symbol,
             )
 
-        # 上一轮 source，用于"边沿触发"日志：当 source 以 "atr_floor:" 开头
-        # 且与上一轮完全一致时，说明 ATR floor 状态未变化，本轮日志降级到
-        # DEBUG，与 generate() 内的 ATR floor 边沿日志保持一致，避免刷屏。
-        last_source: Optional[str] = None
         while not self._stopping.is_set():
             try:
                 result = await self.generate(symbol)
@@ -559,13 +483,8 @@ class SignalService:
                 # 日志级别决策：
                 # - source=="llm(cache)"：命中 LLM 节流缓存，每轮都会出现，
                 #   按 INFO 打会刷屏，走 DEBUG。
-                # - source 以 "atr_floor:" 开头且与上一轮相同：ATR floor 持续
-                #   触发，状态未变，走 DEBUG（与 generate() 边沿日志对齐）。
-                # - 其它情况（真实 LLM 调用 / ATR floor 进入或切换 reason /
-                #   LLM 不可用 等）走 INFO。
+                # - 其它情况（真实 LLM 调用 / LLM 不可用 等）走 INFO。
                 if source == "llm(cache)":
-                    log_method = logger.debug
-                elif source.startswith("atr_floor:") and source == last_source:
                     log_method = logger.debug
                 else:
                     log_method = logger.info
@@ -576,7 +495,6 @@ class SignalService:
                     float(signal_payload.get("confidence") or 0.0),
                     source,
                 )
-                last_source = source
             except Exception:
                 logger.exception("信号生成失败 %s", symbol)
             try:

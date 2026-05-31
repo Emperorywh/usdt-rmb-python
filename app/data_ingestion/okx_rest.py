@@ -49,9 +49,6 @@ _RETRYABLE_EXC = (
     httpx.RemoteProtocolError,
 )
 
-# 熔断打开后第一次冷却时长（秒）；后续每次 trip 都会翻倍直到 _BREAKER_MAX_COOLDOWN
-_BREAKER_BASE_COOLDOWN = 60.0
-_BREAKER_MAX_COOLDOWN = 15 * 60.0
 # 连续失败多少次后跳闸
 _BREAKER_FAIL_THRESHOLD = 3
 # 失败摘要日志的最小输出间隔（秒）
@@ -88,7 +85,7 @@ class _BreakerState:
     consecutive_failures: int = 0
     opened_at: Optional[float] = None
     cooldown_until: float = 0.0
-    next_cooldown: float = _BREAKER_BASE_COOLDOWN
+    next_cooldown: float = 60.0  # 初始值，在 _get_breaker 中会被覆盖
     total_failures: int = 0
     last_summary_at: float = 0.0
     last_error_class: str = ""
@@ -155,21 +152,27 @@ class OKXRestClient(ExchangeRestClient):
         retry_backoff: float = 0.8,
         trust_env: bool = False,
         proxy: Optional[str] = None,
+        breaker_base_cooldown: float = 60.0,
+        breaker_max_cooldown: float = 900.0,
     ):
         """
         构造函数
         ---------------------------------------------------------------
         参数：
-            base_url:       OKX 公共 REST 基础 URL
-            timeout:        单次 HTTP 请求超时（秒）
-            max_retries:    最大重试次数（总请求数 = 1 + max_retries）
-            retry_backoff:  指数退避基数，第 n 次重试等待 backoff * 2**n 秒
-            trust_env:      是否让 httpx 读取系统代理/证书环境变量
-            proxy:          显式代理 URL，优先级高于 trust_env
+            base_url:               OKX 公共 REST 基础 URL
+            timeout:                单次 HTTP 请求超时（秒）
+            max_retries:            最大重试次数（总请求数 = 1 + max_retries）
+            retry_backoff:          指数退避基数，第 n 次重试等待 backoff * 2**n 秒
+            trust_env:              是否让 httpx 读取系统代理/证书环境变量
+            proxy:                  显式代理 URL，优先级高于 trust_env
+            breaker_base_cooldown:  熔断器首次冷却时长（秒）
+            breaker_max_cooldown:   熔断器最大冷却时长（秒）
         """
         self.base_url = base_url.rstrip("/")
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff = float(retry_backoff)
+        self._breaker_base_cooldown = breaker_base_cooldown
+        self._breaker_max_cooldown = breaker_max_cooldown
 
         client_kwargs: Dict[str, Any] = {
             "base_url": self.base_url,
@@ -280,7 +283,7 @@ class OKXRestClient(ExchangeRestClient):
         breaker.consecutive_failures = 0
         breaker.opened_at = None
         breaker.cooldown_until = 0.0
-        breaker.next_cooldown = _BREAKER_BASE_COOLDOWN
+        breaker.next_cooldown = self._breaker_base_cooldown
         breaker.total_failures = 0
         breaker.last_summary_at = 0.0
         breaker.last_error_class = ""
@@ -335,7 +338,7 @@ class OKXRestClient(ExchangeRestClient):
             breaker.cooldown_until = now + breaker.next_cooldown
             cooldown_used = breaker.next_cooldown
             breaker.next_cooldown = min(
-                breaker.next_cooldown * 2.0, _BREAKER_MAX_COOLDOWN
+                breaker.next_cooldown * 2.0, self._breaker_max_cooldown
             )
             logger.warning(
                 "OKX REST %s 熔断打开：连续失败 %d 次，冷却 %.0fs",
@@ -528,201 +531,6 @@ class OKXRestClient(ExchangeRestClient):
             }
 
         return await self._request_with_retry(f"instruments[{symbol}]", _do)
-
-    # ------------------------------------------------------------------
-    # P1 升级：rubik 持仓比接口（散户多空 / 精英持仓比）
-    # ------------------------------------------------------------------
-    # OKX rubik 接口家族（路径以 OKX 官方 v5 当前版本为准）：
-    #   1) /api/v5/rubik/stat/contracts/long-short-account-ratio
-    #        - 按 ccy 聚合的"散户层多空账户比"（反指）
-    #        - 入参：ccy=ETH&period=5m
-    #   2) /api/v5/rubik/stat/contracts/long-short-account-ratio-contract
-    #        - 按 instId 聚合的"合约级散户多空账户比"（反指，更精确）
-    #        - 入参：instId=ETH-USDT-SWAP&period=5m
-    #   3) /api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader
-    #        - 按 instId 聚合的"精英大户持仓量多空比"（顺指）
-    #        - 入参：instId=ETH-USDT-SWAP&period=5m
-    #        - 注意：旧路径 `/api/v5/rubik/stat/contracts/long-short-position-ratio`
-    #          已被 OKX 移除（直接 404），不要再用。
-    # 这些接口返回结构：data 是 [[ts, longShortRatio], ...] 字符串数组。
-    # 部分接口返回 [ts, longRatio, shortRatio]；本类做了多种返回兼容。
-    @staticmethod
-    def _ccy_from_symbol(symbol: str) -> str:
-        """
-        从合约 symbol 推导基础币种（ccy），如 ETH-USDT-SWAP → ETH
-        --------------------------------------------------------------
-        参数：
-            symbol: 合约代码
-        返回：
-            基础币种字符串，截取第一个 '-' 之前的部分。
-        """
-        return symbol.split("-")[0]
-
-    @staticmethod
-    def _parse_rubik_rows(
-        data: List[List[Any]],
-        symbol: str,
-        exchange: str,
-        ratio_type: str,
-    ) -> List[Dict[str, Any]]:
-        """
-        把 rubik 接口原始 data 列表解析成 position_ratios 行
-        --------------------------------------------------------------
-        参数：
-            data:       OKX 原始 data 数组
-            symbol:     合约代码
-            exchange:   交易所标识
-            ratio_type: 与 SQL CHECK 约束对齐的维度名
-        返回：
-            可直接喂给 repos.insert_position_ratios 的 dict 列表。
-        说明：
-            兼容 OKX 两种返回格式：
-              - 2 元素：[ts, longShortRatio]
-              - 3 元素：[ts, longRatio, shortRatio]
-            前者只填 ratio；后者算出 ratio = long / short 一并填入。
-            过滤掉无法解析的行，保证下游入库不抛 ValueError。
-        """
-        out: List[Dict[str, Any]] = []
-        for row in data or []:
-            if not row or len(row) < 2:
-                continue
-            try:
-                ts = _ms_to_dt(row[0])
-            except (TypeError, ValueError):
-                continue
-            if ts is None:
-                continue
-            long_r: Optional[float] = None
-            short_r: Optional[float] = None
-            ratio: Optional[float] = None
-            try:
-                if len(row) >= 3:
-                    long_r = float(row[1])
-                    short_r = float(row[2])
-                    if short_r and short_r > 0:
-                        ratio = long_r / short_r
-                else:
-                    ratio = float(row[1])
-            except (TypeError, ValueError):
-                continue
-            out.append(
-                {
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "ts": ts,
-                    "ratio_type": ratio_type,
-                    "long_ratio": long_r,
-                    "short_ratio": short_r,
-                    "ratio": ratio,
-                }
-            )
-        return out
-
-    async def fetch_long_short_account_ratio(
-        self, symbol: str, period: str = "5m", limit: int = 24
-    ) -> List[Dict[str, Any]]:
-        """
-        散户多空账户比（按 ccy）—— 反指
-        --------------------------------------------------------------
-        参数：
-            symbol: 合约代码（用于推导 ccy 与下游入库 symbol 字段）
-            period: OKX 接口周期，'5m' / '15m' / '1h' / '1d'
-            limit:  期望返回的样本上限，OKX 默认/最大值 100
-        返回：
-            可直接 insert_position_ratios 的行列表；失败时抛出网络异常或
-            CircuitOpenError，由调用方决定是否吞掉。
-        """
-        ccy = self._ccy_from_symbol(symbol)
-
-        async def _do() -> List[Dict[str, Any]]:
-            resp = await self._client.get(
-                "/api/v5/rubik/stat/contracts/long-short-account-ratio",
-                params={"ccy": ccy, "period": period, "limit": limit},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            if body.get("code") != "0":
-                raise RuntimeError(f"OKX long-short-account-ratio error: {body}")
-            return self._parse_rubik_rows(
-                body.get("data") or [], symbol, self.name, "account"
-            )
-
-        return await self._request_with_retry(
-            f"long-short-account-ratio[{ccy}]", _do
-        )
-
-    async def fetch_long_short_account_ratio_contract(
-        self, symbol: str, period: str = "5m", limit: int = 24
-    ) -> List[Dict[str, Any]]:
-        """
-        合约级散户多空账户比（按 instId）—— 反指，更精确
-        --------------------------------------------------------------
-        参数同 :meth:`fetch_long_short_account_ratio`。
-        说明：
-            该接口比 long-short-account-ratio 更细，能区分同币种下不同合约
-            的散户行为差异，在多合约部署时更适合做反指信号。
-        """
-
-        async def _do() -> List[Dict[str, Any]]:
-            resp = await self._client.get(
-                "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
-                params={"instId": symbol, "period": period, "limit": limit},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            if body.get("code") != "0":
-                raise RuntimeError(
-                    f"OKX long-short-account-ratio-contract error: {body}"
-                )
-            return self._parse_rubik_rows(
-                body.get("data") or [], symbol, self.name, "account_contract"
-            )
-
-        return await self._request_with_retry(
-            f"long-short-account-ratio-contract[{symbol}]", _do
-        )
-
-    async def fetch_top_trader_position_ratio(
-        self, symbol: str, period: str = "5m", limit: int = 24
-    ) -> List[Dict[str, Any]]:
-        """
-        精英大户持仓量多空比（按 instId）—— 顺指
-        --------------------------------------------------------------
-        参数同上。
-        说明：
-            - OKX 把"精英 / 大户"定义为持仓金额 / 持仓量 top 5% 的账户。
-            - 该接口返回的是"持仓量"维度的多空比，比"账户数"维度更顺指
-              （账户数维度容易被批量小号稀释）。
-            - 与散户接口的 divergence 是 P1 prompt 里 retail_vs_smart_divergence
-              因子的来源。
-            - 当前 OKX v5 路径为 long-short-position-ratio-contract-top-trader；
-              旧的 long-short-position-ratio 端点已下线（直接 404）。
-        """
-
-        # OKX v5 当前精英大户持仓比接口路径（按合约维度）
-        endpoint = (
-            "/api/v5/rubik/stat/contracts/"
-            "long-short-position-ratio-contract-top-trader"
-        )
-
-        async def _do() -> List[Dict[str, Any]]:
-            resp = await self._client.get(
-                endpoint,
-                params={"instId": symbol, "period": period, "limit": limit},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            if body.get("code") != "0":
-                raise RuntimeError(
-                    f"OKX long-short-position-ratio-contract-top-trader error: {body}"
-                )
-            return self._parse_rubik_rows(
-                body.get("data") or [], symbol, self.name, "top_trader_position"
-            )
-
-        return await self._request_with_retry(
-            f"long-short-position-ratio-contract-top-trader[{symbol}]", _do
-        )
 
     async def fetch_liquidation_orders(self, symbol: str) -> List[Dict[str, Any]]:
         """

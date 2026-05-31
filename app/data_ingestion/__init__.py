@@ -1,1 +1,1 @@
-"""Data ingestion layer: exchange WS/REST clients and onchain providers."""
+"""Data ingestion layer: exchange WS/REST clients."""

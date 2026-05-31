@@ -28,11 +28,34 @@ LLM-First 重构后：
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple  # noqa: F401 — Optional used by LLMAnalysisResult
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# LLMAnalysisResult — 从 llm_agent.py 移入，打破 llm_agent ↔ llm_throttle 循环导入
+# ------------------------------------------------------------------
+# 使用 dataclass 而非 pydantic，因为它只是内部结果包装，不需要校验。
+# 必须在 TradingSignal 之前定义（dataclass 不依赖 pydantic），
+# 但 Python 允许前向引用，顺序无关。
+from dataclasses import dataclass as _dc
+
+@_dc(frozen=True)
+class LLMAnalysisResult:
+    """LLM 分析结果的轻量包装。
+
+    字段：
+        signal             : 解析后的结构化 TradingSignal
+        reasoning_content  : DeepSeek 思考模式下的"思维链"原文文本；
+                             未启用思考模式 / 模型未返回时为 None。
+        from_cache         : 本次结果是否来自节流缓存。
+    """
+    signal: "TradingSignal"
+    reasoning_content: Optional[str] = None
+    from_cache: bool = False
 
 
 class TradingSignal(BaseModel):
@@ -88,7 +111,7 @@ class TradingSignal(BaseModel):
     )
     invalidation_conditions: List[str] = Field(
         default_factory=list,
-        description="量化失效条件（≥ 2 条），中文短句。",
+        description="量化失效条件，中文短句。",
     )
 
     model_config = {"extra": "forbid"}
@@ -172,14 +195,10 @@ class TradingSignal(BaseModel):
 
         if rr is None or rr <= 0:
             logger.warning(
-                "TradingSignal RR=%s 数学不自洽（risk=0 或负值），降级为 neutral", rr,
+                "TradingSignal RR=%s 数学不自洽（risk=0 或负值），保留 bias=%s 但 RR 设为 None",
+                rr, self.bias,
             )
-            object.__setattr__(self, "bias", "neutral")
-            object.__setattr__(self, "entry_zone", None)
-            object.__setattr__(self, "stop_loss", None)
-            object.__setattr__(self, "take_profit", [])
             object.__setattr__(self, "risk_reward_ratio", None)
-            object.__setattr__(self, "position_size_pct", None)
             return self
 
         if self.position_size_pct is not None:

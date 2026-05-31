@@ -131,12 +131,12 @@ class KlineAggregator:
         if self._tasks:
             return
         tick_map: Dict[str, float] = {
-            "1m": float(self.settings.kline_tick_seconds_1m),
-            "5m": float(self.settings.kline_tick_seconds_5m),
-            "15m": float(self.settings.kline_tick_seconds_15m),
-            "1h": float(self.settings.kline_tick_seconds_1h),
-            "4h": float(self.settings.kline_tick_seconds_4h),
-            "1d": float(self.settings.kline_tick_seconds_1d),
+            "1m": float(self.settings.factor.kline_tick_seconds_1m),
+            "5m": float(self.settings.factor.kline_tick_seconds_5m),
+            "15m": float(self.settings.factor.kline_tick_seconds_15m),
+            "1h": float(self.settings.factor.kline_tick_seconds_1h),
+            "4h": float(self.settings.factor.kline_tick_seconds_4h),
+            "1d": float(self.settings.factor.kline_tick_seconds_1d),
         }
         for symbol in symbols:
             await self._warmup_last_cvd(symbol)

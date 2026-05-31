@@ -103,7 +103,7 @@ PostgreSQL with asyncpg. Schema in `schema.sql`. Key tables:
 
 - `trades`, `orderbook_snapshots`, `orderbook_metrics` — high-frequency raw data (retained 24h)
 - `klines_{1m,5m,15m,1h,4h,1d}` — per-timeframe OHLCV bars (one table per period for index efficiency)
-- `funding_rates`, `open_interest`, `liquidations`, `position_ratios` — derivatives data
+- `funding_rates`, `open_interest`, `liquidations` — derivatives data
 - `signals` — LLM outputs with structured trading plan fields (retained 30 days)
 - `notification_emails` — email recipients CRUD
 
@@ -117,7 +117,7 @@ PostgreSQL with asyncpg. Schema in `schema.sql`. Key tables:
 
 - **Language**: All comments, docstrings, log messages, and LLM output (reason/risk/suggestion) are in **Simplified Chinese**. Variable names and code identifiers are in English.
 - **Async everywhere**: asyncpg, httpx, websockets, LangChain `ainvoke`. No blocking calls on the event loop.
-- **Logging**: `structlog` via `get_logger(__name__)`. Configured in `app/logging_config.py`.
+- **Logging**: Python stdlib `logging` via `get_logger(__name__)`. Configured in `app/logging_config.py`.
 - **No setup.py/pyproject.toml**: The project runs as a flat `app/` package. Dependencies are in `requirements.txt` only.
 - **DI pattern**: `AppContainer` dataclass created in lifespan. Routes access services via `Depends(get_container)` / `Depends(get_signal_service)`.
 - **Idempotent writes**: All INSERT statements use `ON CONFLICT DO NOTHING` or `ON CONFLICT DO UPDATE`.

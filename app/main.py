@@ -2,7 +2,7 @@
 
 Lifespan:
 * Build :class:`AppContainer` (DB pool + clients + services).
-* Start ingestion runner (WebSocket + REST + on-chain pollers).
+* Start ingestion runner (WebSocket + REST pollers).
 * Start periodic signal generation loop.
 * Tear everything down cleanly on shutdown.
 """
@@ -32,12 +32,12 @@ async def lifespan(app: FastAPI):
         await container.ingestion_runner.start()
     # 启动多周期 K 线增量聚合器：1m/5m 每秒一次，15m/1h 每 10 秒，4h/1d 每分钟。
     if container.kline_aggregator is not None:
-        await container.kline_aggregator.start(symbols=list(settings.symbols))
+        await container.kline_aggregator.start(symbols=list(settings.ingestion.symbols))
     # LLM-First 架构下不再启动 IC 校准 / 生命周期跟踪 / 信号评估后台任务——
     # 这三个模块整体删除（plan 第 1.1 / 1.5 节）。
     await container.signal_service.start_periodic(
-        symbols=settings.symbols,
-        interval_seconds=settings.signal_interval_seconds,
+        symbols=settings.ingestion.symbols,
+        interval_seconds=settings.signal.signal_interval_seconds,
     )
 
     try:

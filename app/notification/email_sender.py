@@ -35,6 +35,7 @@ import resend
 from app.config import Settings
 from app.logging_config import get_logger
 from app.signal_engine.schemas import TradingSignal
+from app.utils import safe_float
 
 logger = get_logger(__name__)
 
@@ -125,12 +126,10 @@ def _fmt_price(v: Any, digits: int = 4) -> str:
     返回：
         格式化后的字符串；None / 不可转时返回 '-'。
     """
-    if v is None:
+    f = safe_float(v)
+    if f is None:
         return "-"
-    try:
-        return f"{float(v):.{digits}f}"
-    except (TypeError, ValueError):
-        return str(v)
+    return f"{f:.{digits}f}"
 
 
 def _fmt_pct(v: Any, digits: int = 2) -> str:
@@ -522,7 +521,7 @@ class EmailSender:
               为 no-op（``enabled`` 返回 False）。
         """
         self.settings = settings
-        api_key = (getattr(settings, "resend_api_key", "") or "").strip()
+        api_key = (settings.email.resend_api_key or "").strip()
         if api_key:
             resend.api_key = api_key
 
@@ -538,9 +537,9 @@ class EmailSender:
         三者满足才视为启用，否则整个通知链路降级为 no-op。
         """
         return (
-            bool(getattr(self.settings, "enable_email_notification", False))
-            and bool((getattr(self.settings, "resend_api_key", "") or "").strip())
-            and bool((getattr(self.settings, "resend_from", "") or "").strip())
+            bool(self.settings.email.enable_email_notification)
+            and bool((self.settings.email.resend_api_key or "").strip())
+            and bool((self.settings.email.resend_from or "").strip())
         )
 
     def _send_one_blocking(
@@ -572,7 +571,7 @@ class EmailSender:
             - SDK 的同步接口会内部调用 ``requests``，不需要自己再起会话；
               当前发送频率 ≤ 每 15 分钟一次，不需要长连接复用。
         """
-        from_addr = (self.settings.resend_from or "").strip()
+        from_addr = (self.settings.email.resend_from or "").strip()
         params: resend.Emails.SendParams = {
             "from": from_addr,
             "to": [recipient],
@@ -659,7 +658,7 @@ class EmailSender:
             generated_at=generated_at,
         )
 
-        from_addr = (self.settings.resend_from or "").strip()
+        from_addr = (self.settings.email.resend_from or "").strip()
         for recipient in clean_recipients:
             try:
                 resp = await asyncio.to_thread(

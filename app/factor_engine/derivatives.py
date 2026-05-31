@@ -1,18 +1,9 @@
-"""衍生品因子（P1 升级：funding 分位数 + OI/价散度 + 持仓比）。
-
-P0 老接口 ``compute_derivatives_factors`` 与 ``compute_derivatives_per_timeframe``
-全部保留并继续填充原字段，仅在末尾追加 P1 新字段。
+"""衍生品因子（funding 分位数 + OI/价散度）。
 
 P1 新增字段（每周期 derivatives 块）：
     funding_rate_pct_rank_7d : 当前 funding 在 7 天历史中的分位数（0~1）
     funding_extreme          : 'long_squeeze_risk' / 'short_squeeze_risk' / 'neutral'
     oi_price_divergence      : 'potential_top' / 'potential_bottom' / 'none'
-
-P1 新增字段（顶层 derivatives 维度，全周期共享）：
-    account_long_short_ratio       : 散户多空账户比（反指）
-    account_contract_ratio         : 合约级散户多空（反指，更精确）
-    top_trader_position_ratio      : 精英持仓比（顺指）
-    retail_vs_smart_divergence     : 'bearish_warning' / 'bullish_warning' / 'aligned' / 'unknown'
 
 OI/价 散度规则
 ============
@@ -24,55 +15,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.utils import safe_float
 
-# ----------------------------------------------------------------------
-# 老接口（保留兼容）
-# ----------------------------------------------------------------------
-def compute_derivatives_factors(
-    funding: Optional[Dict[str, Any]],
-    oi_history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    老版衍生品因子：funding 取最新，OI 用窗口首尾差
-    -----------------------------------------------------------------
-    参数：
-        funding:    funding_rates 表里最近一条记录，可空
-        oi_history: 按 ts 升序的 OI 样本列表
-    返回：
-        funding_rate / next_settlement_at / oi_first / oi_last /
-        oi_change_pct / oi_samples
-    说明：
-        在 enable_mtf_factors=False 时由老聚合器使用。
-    """
-    funding_rate: Optional[float] = None
-    next_settlement_at = None
-    if funding:
-        funding_rate = float(funding.get("funding_rate") or 0.0)
-        next_settlement_at = funding.get("next_funding_ts")
-
-    oi_first: Optional[float] = None
-    oi_last: Optional[float] = None
-    oi_change_pct: Optional[float] = None
-    if oi_history:
-        oi_first = float(oi_history[0]["oi"]) if oi_history[0].get("oi") is not None else None
-        oi_last = float(oi_history[-1]["oi"]) if oi_history[-1].get("oi") is not None else None
-        if oi_first and oi_last and oi_first > 0:
-            oi_change_pct = round((oi_last - oi_first) / oi_first, 6)
-
-    return {
-        "funding_rate": funding_rate,
-        "next_settlement_at": (
-            next_settlement_at.isoformat() if next_settlement_at else None
-        ),
-        "oi_first": oi_first,
-        "oi_last": oi_last,
-        "oi_change_pct": oi_change_pct,
-        "oi_samples": len(oi_history),
-    }
+import bisect
 
 
 # ----------------------------------------------------------------------
-# 多周期版（P0 主接口）
+# 多周期版（主接口）
 # ----------------------------------------------------------------------
 def compute_derivatives_per_timeframe(
     funding: Optional[Dict[str, Any]],
@@ -165,73 +114,6 @@ def compute_derivatives_per_timeframe(
 
 
 # ----------------------------------------------------------------------
-# P1：持仓比因子（顶层 derivatives 维度，全周期共享）
-# ----------------------------------------------------------------------
-def compute_position_ratio_factors(
-    latest_ratios: Dict[str, Dict[str, Any]],
-    bearish_account_threshold: float = 1.5,
-    bullish_account_threshold: float = 0.7,
-    smart_threshold: float = 1.0,
-) -> Dict[str, Any]:
-    """
-    把 fetch_latest_position_ratios 的结果聚合成因子层
-    -----------------------------------------------------------------
-    参数：
-        latest_ratios:             repos.fetch_latest_position_ratios 返回
-        bearish_account_threshold: 散户多空比 ≥ 此值时视为"散户狂多"
-        bullish_account_threshold: 散户多空比 ≤ 此值时视为"散户狂空"
-        smart_threshold:           精英多空比 ≥ 此值视为"精英偏多"
-    返回：
-        含 account_long_short_ratio / account_contract_ratio /
-        top_trader_position_ratio / retail_vs_smart_divergence 的 dict
-    说明：
-        - 任意维度数据缺失时该字段保持 None；divergence 当散户或精英任一
-          缺失时返回 'unknown'。
-        - 反指逻辑：散户狂多 + 精英反向 → 'bearish_warning'；
-                    散户狂空 + 精英反向 → 'bullish_warning'；
-                    其他 → 'aligned'（不一定是看多看空，只表示无显著反向）。
-        - 阈值宽容性：bearish/bullish 用对称阈值，避免边界抖动。
-    """
-    def _ratio(key: str) -> Optional[float]:
-        row = latest_ratios.get(key)
-        if not row:
-            return None
-        v = row.get("ratio")
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    account = _ratio("account")
-    account_contract = _ratio("account_contract")
-    top_trader = _ratio("top_trader_position")
-
-    # 散户优先用合约级（更精确），缺失时退化到币种级
-    retail_signal = account_contract if account_contract is not None else account
-    divergence = "unknown"
-    if retail_signal is not None and top_trader is not None:
-        if (
-            retail_signal >= bearish_account_threshold
-            and top_trader < smart_threshold
-        ):
-            divergence = "bearish_warning"
-        elif (
-            retail_signal <= bullish_account_threshold
-            and top_trader > smart_threshold
-        ):
-            divergence = "bullish_warning"
-        else:
-            divergence = "aligned"
-
-    return {
-        "account_long_short_ratio": account,
-        "account_contract_ratio": account_contract,
-        "top_trader_position_ratio": top_trader,
-        "retail_vs_smart_divergence": divergence,
-    }
-
-
-# ----------------------------------------------------------------------
 # P1：funding 分位数 + 极值标签
 # ----------------------------------------------------------------------
 def _funding_pct_rank_and_extreme(
@@ -239,7 +121,7 @@ def _funding_pct_rank_and_extreme(
     history: Optional[List[Dict[str, Any]]],
 ) -> tuple[Optional[float], str]:
     """
-    计算 current 在 history 中的百分位 + 极值标签
+    计算 current 在 history 中的百分位 + 极值标签（bisect 二分查找）
     -----------------------------------------------------------------
     参数：
         current: 当前 funding_rate
@@ -249,7 +131,7 @@ def _funding_pct_rank_and_extreme(
             pct_rank ∈ [0, 1]，None 表示样本不足或 current 缺失
             extreme_label ∈ {'long_squeeze_risk', 'short_squeeze_risk', 'neutral'}
     说明：
-        - 取 ≤ current 的样本数 / 总样本数（含 current 自身）作为分位。
+        - 先将 history 排序，再用 bisect_left 做 O(log n) 查找。
         - rank > 0.95：funding 接近 7 天最高 → 多头拥挤，潜在 long squeeze。
         - rank < 0.05：funding 接近 7 天最低 → 空头拥挤，潜在 short squeeze。
         - 样本 < 50 时不打极值标签（噪声太大），返回 'neutral'。
@@ -267,8 +149,10 @@ def _funding_pct_rank_and_extreme(
             continue
     if len(vals) < 5:
         return None, "neutral"
-    le_count = sum(1 for v in vals if v <= current)
-    rank = round(le_count / len(vals), 4)
+    # 排序后 bisect 二分查找，O(n log n) 排序 + O(log n) 查找
+    vals.sort()
+    pos = bisect.bisect_right(vals, current)
+    rank = round(pos / len(vals), 4)
 
     if len(vals) >= 50:
         if rank > 0.95:
@@ -386,13 +270,5 @@ def _classify_oi_price(
     return "long_cover"
 
 
-def _safe_float(v: Any) -> float:
-    """
-    安全 float 转换，None 或异常时返回 0.0
-    """
-    if v is None:
-        return 0.0
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
+# _safe_float 已迁移到 app.utils.safe_float（此处保留别名以兼容内部调用）
+_safe_float = lambda v: safe_float(v, default=0.0)
