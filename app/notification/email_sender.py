@@ -535,12 +535,28 @@ class EmailSender:
             - ``resend_api_key`` 已配置；
             - ``resend_from`` 已配置（Resend 强制要求 from 字段）。
         三者满足才视为启用，否则整个通知链路降级为 no-op。
+        首次调用时如发现主开关已开但缺少 key/from，打印一次 WARNING 日志，
+        避免配置误缺失时运维从日志里完全看不到蛛丝马迹。
         """
-        return (
+        is_enabled = (
             bool(self.settings.email.enable_email_notification)
             and bool((self.settings.email.resend_api_key or "").strip())
             and bool((self.settings.email.resend_from or "").strip())
         )
+        # 主开关已开但实际无法发送时，打印一次诊断日志
+        if not is_enabled and self.settings.email.enable_email_notification:
+            if not getattr(self, "_logged_disabled_reason", False):
+                missing: list[str] = []
+                if not (self.settings.email.resend_api_key or "").strip():
+                    missing.append("RESEND_API_KEY")
+                if not (self.settings.email.resend_from or "").strip():
+                    missing.append("RESEND_FROM")
+                logger.warning(
+                    "邮件通知主开关已启用，但 %s 未配置，邮件发送降级为 no-op",
+                    "、".join(missing),
+                )
+                self._logged_disabled_reason = True  # type: ignore[attr-defined]
+        return is_enabled
 
     def _send_one_blocking(
         self,
